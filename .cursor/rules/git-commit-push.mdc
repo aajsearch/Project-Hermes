@@ -1,0 +1,11 @@
+---
+description: Commit and push changes to Project Hermes (aajsearch) after making code changes
+alwaysApply: true
+---
+
+# Git: Commit and push after changes
+
+- **Default push remote**: The project pushes to **hermes** (`https://github.com/aajsearch/Project-Hermes.git`). Use it for commit-and-push.
+- **After completing a task** that modifies code or config: stage changes, commit with a clear message, and push to **hermes** (e.g. `git push hermes <branch>` or `git push` if `remote.pushDefault` is set to hermes).
+- **Do not** commit secrets, `.env`, or binary assets. Respect `.gitignore`.
+- If the user asks to "commit and push" or "save and push", run: `git add` (appropriate files), `git commit -m "..."`, `git push hermes <current-branch>`.

@@ -21,6 +21,7 @@ from bot.pipeline.data_layer import DataLayer
 from bot.pipeline.executor import PipelineExecutor
 from bot.pipeline.registry import OrderRegistry, init_v2_db
 from bot.pipeline.run_unified import run_pipeline_cycle
+from bot.pipeline.tick_logger import TickLogger
 from bot.pipeline.strategies.atm_breakout import AtmBreakoutStrategy
 from bot.pipeline.strategies.last_90s import Last90sStrategy
 from bot.v2_config_loader import load_v2_config
@@ -64,8 +65,16 @@ def main() -> None:
     kalshi_client = KalshiClient()
     registry = OrderRegistry()
     data_layer = DataLayer(kalshi_client=kalshi_client)
+
+    # Start Kraken + Coinbase WebSocket oracles so pipeline can use spot=WS when data is fresh
+    try:
+        from bot.oracle_ws_manager import start_ws_oracles
+        start_ws_oracles()
+    except Exception as e:
+        logger.debug("Oracle WS oracles not started: %s", e)
     aggregator = OrderAggregator()
     executor = PipelineExecutor(registry, dry_run=dry_run, kalshi_client=kalshi_client)
+    tick_logger = TickLogger()
 
     strat_last90s = Last90sStrategy(config)
     strat_atm = AtmBreakoutStrategy(config)
@@ -87,6 +96,7 @@ def main() -> None:
                     executor,
                     registry,
                     kalshi_client=kalshi_client,
+                    tick_logger=tick_logger,
                 )
             except Exception as e:
                 logger.exception("[%s] Pipeline cycle error: %s", interval, e)

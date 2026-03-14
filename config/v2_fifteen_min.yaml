@@ -16,12 +16,12 @@ fifteen_min:
       side: auto
       stop_loss_pct: 15
       # Use 0.8 to ignore fake-outs on big coins, but 1.0 (always active) on tight coins
-      stop_loss_distance_factor: { btc: 0.8, eth: 0.8, sol: 0.8, xrp: 0.8 }
+      stop_loss_distance_factor: { btc: 0.85, eth: 0.85, sol: 0.85, xrp: 0.85 }
       max_cost_cents: 80000      # $6 total limit per window/asset
-      min_distance_at_placement: { btc: 38.0, eth: 1.5, sol: 0.10, xrp: 0.001 }
+      min_distance_at_placement: { btc: 45.0, eth: 1.5, sol: 0.10, xrp: 0.0015 }
 
     atm_breakout_strategy:
-      enabled: true
+      enabled: false
       min_seconds_to_close: 120    # Still stops looking for NEW trades 2 mins before expiry
       max_seconds_to_close: 840    # Starts looking 10 mins before expiry
       # Require minimum distance from strike at placement (same units as spot/strike; per asset)

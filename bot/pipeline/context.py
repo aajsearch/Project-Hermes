@@ -32,6 +32,9 @@ class WindowContext:
     quote: Dict[str, int] = field(default_factory=_default_quote)  # yes_bid, yes_ask, no_bid, no_ask (cents)
     spot_kraken: float | None = None
     spot_coinbase: float | None = None
+    spot_source: str = "?"  # "WS" (oracle WebSocket) or "REST" (Kraken/Coinbase REST)
+    spot_kraken_age_s: float | None = None  # seconds since last WS update (only set when spot_source=WS)
+    spot_coinbase_age_s: float | None = None
     strike: float | None = None
     strike_source: str | None = None  # "api_fields", "subtitle", "title", or "ticker"
     distance_kraken: float | None = None

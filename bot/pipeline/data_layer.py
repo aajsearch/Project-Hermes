@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from bot.pipeline.context import WindowContext
@@ -229,6 +230,8 @@ class DataLayer:
     _strike_cache: Dict[str, float] = {}  # window_id -> strike (class-level, shared across instances)
     _strike_source_cache: Dict[str, str] = {}  # window_id -> source (only when strike is cached)
     _last_spot_source: str = "?"  # "WS" or "REST" after last _get_spot_prices call
+    _last_spot_kraken_age_s: Optional[float] = None
+    _last_spot_cb_age_s: Optional[float] = None
     _last_window_id: Optional[str] = None  # for transition detection in run_unified
 
     def __init__(self, kalshi_client: Any = None) -> None:
@@ -301,13 +304,34 @@ class DataLayer:
         try:
             from bot.oracle_ws_manager import get_safe_spot_prices_sync, is_ws_running
             if is_ws_running():
-                data = get_safe_spot_prices_sync(asset, max_age_seconds=5.0, require_both=False)
-                if data:
-                    kraken_price = data.get("kraken")
-                    coinbase_price = data.get("cb")
+                ws_spot = get_safe_spot_prices_sync(asset, max_age_seconds=6.0, require_both=True)
+                if ws_spot:
+                    kraken_price = ws_spot.get("kraken")
+                    coinbase_price = ws_spot.get("cb")
                     if kraken_price is not None or coinbase_price is not None:
                         self._last_spot_source = "WS"
+                        now = time.time()
+                        k_ts = ws_spot.get("kraken_ts")
+                        cb_ts = ws_spot.get("cb_ts")
+                        k_age = (now - k_ts) if k_ts is not None else None
+                        cb_age = (now - cb_ts) if cb_ts is not None else None
+                        self._last_spot_kraken_age_s = k_age
+                        self._last_spot_cb_age_s = cb_age
+                        logger.debug(
+                            "[spot] WS available for %s: K=%s (age=%.1fs), CB=%s (age=%.1fs)",
+                            asset, kraken_price, k_age or 999.0, coinbase_price, cb_age or 999.0,
+                        )
+                else:
+                    self._last_spot_kraken_age_s = None
+                    self._last_spot_cb_age_s = None
+                    logger.info("[spot] WS miss for %s (need both K and CB <6s) — using REST", asset)
+            else:
+                self._last_spot_kraken_age_s = None
+                self._last_spot_cb_age_s = None
+                logger.info("[spot] Oracle WS not running for %s — using REST", asset)
         except Exception as e:
+            self._last_spot_kraken_age_s = None
+            self._last_spot_cb_age_s = None
             logger.debug("Oracle WS spot read failed for %s: %s", asset, e)
         if kraken_price is None or coinbase_price is None:
             try:
@@ -403,6 +427,9 @@ class DataLayer:
             quote=quote_normalized,
             spot_kraken=kraken_price,
             spot_coinbase=coinbase_price,
+            spot_source=self._last_spot_source,
+            spot_kraken_age_s=self._last_spot_kraken_age_s,
+            spot_coinbase_age_s=self._last_spot_cb_age_s,
             strike=strike,
             strike_source=strike_source,
             distance_kraken=distance_kraken,
