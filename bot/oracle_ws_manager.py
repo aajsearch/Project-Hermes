@@ -100,31 +100,33 @@ def _ensure_asset_entry(asset_key: str) -> None:
 
 
 def _set_kraken_price(asset_key: str, price: float) -> None:
+    key = (asset_key or "").strip().lower() or "btc"
     with _lock:
-        _ensure_asset_entry(asset_key)
-        _global_spot_prices[asset_key]["kraken"] = price
-        _global_spot_prices[asset_key]["kraken_ts"] = time.time()
-        if asset_key not in _first_kraken_logged:
-            _first_kraken_logged.add(asset_key)
-            logger.info("[oracle_ws] First Kraken price received for %s: %s", asset_key, price)
+        _ensure_asset_entry(key)
+        _global_spot_prices[key]["kraken"] = price
+        _global_spot_prices[key]["kraken_ts"] = time.time()
+        if key not in _first_kraken_logged:
+            _first_kraken_logged.add(key)
+            logger.info("[oracle_ws] First Kraken price received for %s: %s", key, price)
     try:
         import bot.data_bus as data_bus
-        data_bus.write_spot(asset_key, price)
+        data_bus.write_spot(key, price)
     except Exception:
         pass
 
 
 def _set_cb_price(asset_key: str, price: float) -> None:
+    key = (asset_key or "").strip().lower() or "btc"
     with _lock:
-        _ensure_asset_entry(asset_key)
-        _global_spot_prices[asset_key]["cb"] = price
-        _global_spot_prices[asset_key]["cb_ts"] = time.time()
-        if asset_key not in _first_cb_logged:
-            _first_cb_logged.add(asset_key)
-            logger.info("[oracle_ws] First Coinbase price received for %s: %s", asset_key, price)
+        _ensure_asset_entry(key)
+        _global_spot_prices[key]["cb"] = price
+        _global_spot_prices[key]["cb_ts"] = time.time()
+        if key not in _first_cb_logged:
+            _first_cb_logged.add(key)
+            logger.info("[oracle_ws] First Coinbase price received for %s: %s", key, price)
     try:
         import bot.data_bus as data_bus
-        data_bus.write_spot(asset_key, price)
+        data_bus.write_spot(key, price)
     except Exception:
         pass
 
@@ -142,7 +144,7 @@ def get_safe_spot_prices_sync(
       or the single available distance). Reduces no-oracle-data skips when one feed
       is slow or disconnected.
     """
-    asset_key = (asset or "").strip().upper() or "BTC"
+    asset_key = (asset or "").strip().lower() or "btc"
     with _lock:
         entry = _global_spot_prices.get(asset_key)
     if not entry:

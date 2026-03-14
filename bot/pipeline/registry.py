@@ -67,6 +67,14 @@ def init_v2_db(db_path: Optional[Path] = None) -> None:
                 resolved_at REAL
             );
             CREATE INDEX IF NOT EXISTS idx_reports_strategy_interval ON {REPORTS_TABLE}(strategy_id, interval);
+
+            CREATE TABLE IF NOT EXISTS v2_tick_log (
+                window_id TEXT NOT NULL,
+                asset TEXT NOT NULL,
+                tick_history_json TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (window_id, asset)
+            );
             """
         )
         conn.commit()

@@ -5,6 +5,7 @@ Builds context per asset, evaluates strategies, aggregates intents, executes exi
 from __future__ import annotations
 
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -26,6 +27,16 @@ if TYPE_CHECKING:
     from bot.pipeline.strategies.base import BaseV2Strategy
 
 logger = logging.getLogger(__name__)
+
+# Log WS→REST fallback reason once per (market_id, "market"|"quote") per window; cleared on window transition
+_ws_fallback_logged: set = set()
+
+
+def _logical_window_slot(market_id: str) -> str:
+    """Extract time-slot part from market_id so all assets share the same window key (e.g. KXBTC15M-26MAR131530 -> 26MAR131530)."""
+    if not market_id:
+        return market_id or ""
+    return market_id.split("-")[-1].strip() if "-" in market_id else market_id
 
 
 def _close_ts_from_market(market: Dict[str, Any]) -> Optional[int]:
@@ -92,6 +103,7 @@ def run_pipeline_cycle(
     executor: "PipelineExecutor",
     registry: "OrderRegistry",
     kalshi_client: Any = None,
+    tick_logger: Any = None,
 ) -> None:
     """
     Run one cycle of the unified pipeline for the given interval.
@@ -107,6 +119,57 @@ def run_pipeline_cycle(
     if not isinstance(assets, (list, tuple)):
         assets = []
 
+    # Optional: disable Kalshi WS and use REST only (config use_kalshi_ws or env KALSHI_USE_WS=0)
+    use_kalshi_ws = config.get("use_kalshi_ws", True)
+    env_ws = os.getenv("KALSHI_USE_WS", "").strip().lower()
+    if env_ws in ("0", "false", "no", "off"):
+        use_kalshi_ws = False
+    elif env_ws in ("1", "true", "yes", "on"):
+        use_kalshi_ws = True
+
+    if not use_kalshi_ws:
+        logger.info(
+            "[%s] Kalshi WS disabled (use_kalshi_ws=false or KALSHI_USE_WS=0); using REST for market and quote.",
+            interval,
+        )
+    else:
+        # Start Kalshi WebSocket and subscribe to current tickers so market/quote use WS when available
+        try:
+            from bot.kalshi_ws_manager import start_kalshi_ws, subscribe_to_tickers
+            start_kalshi_ws()
+            tickers_this_interval = []
+            for a in assets:
+                a = str(a).strip().lower()
+                if interval == "fifteen_min":
+                    tickers_this_interval.append(get_current_15min_market_id(asset=a))
+                else:
+                    tickers_this_interval.append(get_current_hour_market_id(asset=a))
+            if tickers_this_interval:
+                subscribe_to_tickers(tickers_this_interval)
+                try:
+                    from bot.kalshi_ws_manager import seed_market_cache
+                    markets_to_seed: Dict[str, Any] = {}
+                    for market_id in tickers_this_interval:
+                        if interval == "fifteen_min":
+                            m = fetch_15min_market(market_id)
+                        else:
+                            markets_list, _ = fetch_markets_for_event(market_id)
+                            m = markets_list[0] if markets_list else None
+                        if m and isinstance(m, dict):
+                            t = m.get("ticker") or market_id
+                            markets_to_seed[t] = m
+                    if markets_to_seed:
+                        seed_market_cache(markets_to_seed)
+                except Exception as seed_e:
+                    logger.debug("[%s] Kalshi WS seed market cache skipped: %s", interval, seed_e)
+            # First cycle: give WS time to receive orderbook_snapshot before we read (avoids quote=REST on first run)
+            last_window_id = getattr(data_layer, "_last_window_id", None)
+            if last_window_id is None and tickers_this_interval:
+                logger.info("[%s] Waiting 2s for Kalshi WS orderbook snapshots...", interval)
+                time.sleep(2)
+        except Exception as e:
+            logger.debug("[%s] Kalshi WS start/subscribe skipped: %s", interval, e)
+
     # Detect window transition: current_window_id changed from last cycle
     first_asset = str(assets[0]).strip().lower() if assets else None
     if first_asset:
@@ -116,10 +179,21 @@ def run_pipeline_cycle(
             current_window_id = get_current_hour_market_id(asset=first_asset)
         last_window_id = getattr(data_layer, "_last_window_id", None)
         if last_window_id is not None and current_window_id != last_window_id:
+            _ws_fallback_logged.clear()
+            flush_key = f"{interval}_{_logical_window_slot(last_window_id)}"
+            if tick_logger is not None:
+                logger.info("[TICK_LOG] End of window: flushing window_id=%s (market_id=%s)", flush_key, last_window_id)
+                tick_logger.flush_window(flush_key)
+            else:
+                logger.info("[TICK_LOG] End of window: window_id=%s (market_id=%s), no tick_logger", flush_key, last_window_id)
             logger.info("[TRANSITION] Window expired. Initiating 20s cooldown and cache purge...")
             data_layer.clear_caches()
             time.sleep(20)
         data_layer._last_window_id = current_window_id
+        # Log start of window only when we actually enter a new window (first run or after transition)
+        if last_window_id is None or last_window_id != current_window_id:
+            window_key = f"{interval}_{_logical_window_slot(current_window_id)}"
+            logger.info("[TICK_LOG] Start of window: window_id=%s (market_id=%s)", window_key, current_window_id)
 
     for asset in assets:
         asset = str(asset).strip().lower()
@@ -127,13 +201,40 @@ def run_pipeline_cycle(
             logger.warning("[%s] [%s] No Kalshi client, skipping asset", interval, asset.upper())
             continue
         try:
+            market_source = "REST"
             if interval == "fifteen_min":
                 market_id = get_current_15min_market_id(asset=asset)
+                # Short-lived 15m markets: market_lifecycle_v2 often fires before we connect; rely on REST for market metadata.
                 market = fetch_15min_market(market_id)
             else:
                 market_id = get_current_hour_market_id(asset=asset)
-                markets, _ = fetch_markets_for_event(market_id)
-                market = markets[0] if markets else None
+                if use_kalshi_ws:
+                    try:
+                        from bot.kalshi_ws_manager import get_safe_market
+                        market = get_safe_market(market_id)
+                        if market and isinstance(market, dict) and market.get("ticker") and market.get("close_time") is not None:
+                            market_source = "WS"
+                        else:
+                            markets, _ = fetch_markets_for_event(market_id)
+                            market = markets[0] if markets else None
+                            key = (market_id, "market")
+                            if key not in _ws_fallback_logged:
+                                _ws_fallback_logged.add(key)
+                                reason = "no cache" if not market or not isinstance(market, dict) else "cached market missing ticker or close_time"
+                                logger.warning(
+                                    "[%s] [%s] WS market miss: %s for market_id=%s (market_lifecycle_v2 not received or incomplete); using REST.",
+                                    interval, asset.upper(), reason, market_id,
+                                )
+                    except Exception as e:
+                        markets, _ = fetch_markets_for_event(market_id)
+                        market = markets[0] if markets else None
+                        key = (market_id, "market")
+                        if key not in _ws_fallback_logged:
+                            _ws_fallback_logged.add(key)
+                            logger.warning("[%s] [%s] WS market error for market_id=%s; using REST: %s", interval, asset.upper(), market_id, e)
+                else:
+                    markets, _ = fetch_markets_for_event(market_id)
+                    market = markets[0] if markets else None
             if not market or not isinstance(market, dict):
                 logger.warning("[%s] [%s] No active market, skipping asset", interval, asset.upper())
                 continue
@@ -155,14 +256,31 @@ def run_pipeline_cycle(
                 logger.warning("[%s] [%s] Invalid seconds_to_close=%s, skipping asset", interval, asset.upper(), seconds_to_close)
                 continue
             quote_source = "REST"
-            try:
-                from bot.kalshi_ws_manager import get_safe_orderbook
-                top = get_safe_orderbook(ticker)
-                if top and isinstance(top, dict) and (top.get("yes_bid") is not None or top.get("no_bid") is not None):
-                    quote_source = "WS"
-                else:
+            if use_kalshi_ws:
+                try:
+                    from bot.kalshi_ws_manager import get_safe_orderbook
+                    top = get_safe_orderbook(market_id)
+                    if top is not None:
+                        quote_source = "WS"
+                        if top.get("yes_bid") is None and top.get("no_bid") is None:
+                            logger.debug("[%s] WS orderbook empty for %s (no liquidity), using REST for quote", interval, market_id)
+                            top = kalshi_client.get_top_of_book(ticker)
+                    else:
+                        top = kalshi_client.get_top_of_book(ticker)
+                        key = (market_id, "quote")
+                        if key not in _ws_fallback_logged:
+                            _ws_fallback_logged.add(key)
+                            logger.warning(
+                                "[%s] [%s] WS orderbook miss: no cache for market_id=%s; using REST.",
+                                interval, asset.upper(), market_id,
+                            )
+                except Exception as e:
                     top = kalshi_client.get_top_of_book(ticker)
-            except Exception:
+                    key = (market_id, "quote")
+                    if key not in _ws_fallback_logged:
+                        _ws_fallback_logged.add(key)
+                        logger.warning("[%s] [%s] WS orderbook error for market_id=%s; using REST: %s", interval, asset.upper(), market_id, e)
+            else:
                 top = kalshi_client.get_top_of_book(ticker)
             if not top or not isinstance(top, dict):
                 logger.warning("[%s] [%s] Orderbook fetch failed, skipping asset", interval, asset.upper())
@@ -210,6 +328,20 @@ def run_pipeline_cycle(
                 interval, asset.upper(), ctx.strike, ctx.spot_kraken, ctx.spot_coinbase,
             )
             continue
+
+        # Tick logger: one row per asset per window (tick history as JSON). Use logical slot so all assets share same window key.
+        if tick_logger is not None:
+            window_id = f"{interval}_{_logical_window_slot(market_id)}"
+            tick_logger.record_tick(
+                window_id=window_id,
+                asset=asset,
+                sec=float(ctx.seconds_to_close),
+                yes_bid=int(ctx.quote.get("yes_bid") or 0),
+                no_bid=int(ctx.quote.get("no_bid") or 0),
+                strike=float(ctx.strike) if ctx.strike is not None else None,
+                k_spot=float(ctx.spot_kraken) if ctx.spot_kraken is not None else None,
+                cb_spot=float(ctx.spot_coinbase) if ctx.spot_coinbase is not None else None,
+            )
         # Dynamic float precision by asset: BTC/ETH 2, SOL 3, XRP 5
         _ndp = 2 if asset in ("btc", "eth") else 3 if asset == "sol" else 5 if asset == "xrp" else 2
         def _fmt(v: Any) -> str:
@@ -227,9 +359,20 @@ def run_pipeline_cycle(
         else:
             dist_dir = ""
         dist_str = f"{_fmt(ctx.distance)} ({dist_dir})" if dist_dir else _fmt(ctx.distance)
+        spot_str = ctx.spot_source
+        if ctx.spot_source == "WS" and (ctx.spot_kraken_age_s is not None or ctx.spot_coinbase_age_s is not None):
+            parts = []
+            if ctx.spot_kraken_age_s is not None:
+                parts.append("K:%.1fs" % ctx.spot_kraken_age_s)
+            if ctx.spot_coinbase_age_s is not None:
+                parts.append("CB:%.1fs" % ctx.spot_coinbase_age_s)
+            spot_str = "WS (" + " ".join(parts) + ")" if parts else "WS"
         logger.info(
-            "[V2 DATA] %s | Strike: %s (%s) | K: %s | CB: %s | Dist: %s",
+            "[V2 DATA] %s | market=%s quote=%s spot=%s | Strike: %s (%s) | K: %s | CB: %s | Dist: %s",
             asset.upper(),
+            market_source,
+            quote_source,
+            spot_str,
             _fmt(ctx.strike),
             strike_src,
             _fmt(ctx.spot_kraken),

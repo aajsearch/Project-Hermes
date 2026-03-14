@@ -2,6 +2,10 @@
 mode: TRADE
 run_mode: both
 
+# Use Kalshi WebSocket for market + orderbook when true; when false, pipeline uses REST only.
+# Override with env: KALSHI_USE_WS=0 or KALSHI_USE_WS=false to disable WS.
+use_kalshi_ws: true
+
 # When true, pipeline runs and strategies fire but no real Kalshi orders are placed.
 # Set to false for live trading. Can override with env V2_DRY_RUN=false.
 dry_run: false
