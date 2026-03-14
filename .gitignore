@@ -1,15 +1,25 @@
-kalshi_private_key
-*.db
+# --- Secrets and credentials (never commit) ---
 .env
 .env.local
+.env.*
+!.env.example
+kalshi_private_key
+kalshi_private_key.*
+*.pem
 cdp_api_key.json
 cdp_api_key-*.json
+*credentials*.json
+*secrets*.json
+
+# --- Runtime and local data ---
+*.db
 logs/
 .venv/
 data/
 reports/
 console.log
-# Local exports and temp files (optional: remove if you want these in repo)
+
+# --- Optional: uncomment to ignore local exports ---
 # *.csv
 # *.txt
 # *.sql
