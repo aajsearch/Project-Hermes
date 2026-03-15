@@ -46,7 +46,8 @@ def init_v2_db(db_path: Optional[Path] = None) -> None:
                 count INTEGER NOT NULL,
                 limit_price_cents INTEGER,
                 placed_at REAL NOT NULL,
-                client_order_id TEXT
+                client_order_id TEXT,
+                placement_bid_cents INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_registry_strategy_interval_market_asset
                 ON {REGISTRY_TABLE}(strategy_id, interval, market_id, asset);
@@ -78,6 +79,14 @@ def init_v2_db(db_path: Optional[Path] = None) -> None:
             """
         )
         conn.commit()
+        # Migration: add placement_bid_cents if missing (existing DBs)
+        try:
+            conn.execute(f"ALTER TABLE {REGISTRY_TABLE} ADD COLUMN placement_bid_cents INTEGER")
+            conn.commit()
+            logger.info("V2 DB: added placement_bid_cents to %s", REGISTRY_TABLE)
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                logger.warning("V2 DB migration placement_bid_cents: %s", e)
         logger.info("V2 DB initialized at %s", path)
     finally:
         conn.close()
@@ -109,13 +118,14 @@ class OrderRegistry:
         placed_at: float,
         limit_price_cents: Optional[int] = None,
         client_order_id: Optional[str] = None,
+        placement_bid_cents: Optional[int] = None,
     ) -> None:
         """Insert a new order into v2_order_registry (status=resting, filled_count=0)."""
         self._conn.execute(
             f"""
             INSERT INTO {REGISTRY_TABLE}
-            (order_id, strategy_id, interval, market_id, asset, ticker, side, status, filled_count, count, limit_price_cents, placed_at, client_order_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'resting', 0, ?, ?, ?, ?)
+            (order_id, strategy_id, interval, market_id, asset, ticker, side, status, filled_count, count, limit_price_cents, placed_at, client_order_id, placement_bid_cents)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'resting', 0, ?, ?, ?, ?, ?)
             """,
             (
                 order_id,
@@ -129,6 +139,7 @@ class OrderRegistry:
                 limit_price_cents,
                 placed_at,
                 client_order_id,
+                placement_bid_cents,
             ),
         )
         self._conn.commit()
@@ -165,7 +176,7 @@ class OrderRegistry:
         """Return OrderRecords for the given strategy/interval, optionally filtered by market_id/asset."""
         query = f"""
             SELECT order_id, strategy_id, interval, market_id, asset, ticker, side, status,
-                   filled_count, count, limit_price_cents, placed_at
+                   filled_count, count, limit_price_cents, placed_at, placement_bid_cents
             FROM {REGISTRY_TABLE}
             WHERE strategy_id = ? AND interval = ?
             """
@@ -194,7 +205,7 @@ class OrderRegistry:
         """
         query = f"""
             SELECT order_id, strategy_id, interval, market_id, asset, ticker, side, status,
-                   filled_count, count, limit_price_cents, placed_at
+                   filled_count, count, limit_price_cents, placed_at, placement_bid_cents
             FROM {REGISTRY_TABLE}
             WHERE interval = ? AND status = 'resting'
             """
@@ -261,6 +272,7 @@ class OrderRegistry:
             count=row["count"] or 0,
             limit_price_cents=row.get("limit_price_cents"),
             placed_at=row["placed_at"],
+            placement_bid_cents=row.get("placement_bid_cents"),
         )
 
     def close(self) -> None:

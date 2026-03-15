@@ -1,48 +1,47 @@
 # V2 fifteen_min: pipeline + strategies (strict schema)
+# continuous_alpha_limit_99: 300s horizon (5 min → 0), absolute buffer stop-loss
 fifteen_min:
   pipeline:
     run_interval_seconds: 1
-    strategy_priority: [last_90s_limit_99, atm_breakout_strategy]
+    strategy_priority: [continuous_alpha_limit_99, atm_breakout_strategy]
 
   strategies:
-    last_90s_limit_99:
+    continuous_alpha_limit_99:
       enabled: true
-      window_seconds: { btc: 85, eth: 85, sol: 85, xrp: 85 }
+      # Hunt from 300s (5 min) down to 0; bot evaluates every tick in this window
+      window_seconds: { btc: 300, eth: 300, sol: 300, xrp: 300 }
       limit_price_cents: 99
-      min_bid_cents: { btc: 85, eth: 80, sol: 88, xrp: 75 }
-      # contracts per placement; scalar = same for all assets, or per-asset override
-      order_count: { btc: 250, eth: 250, sol: 100, xrp: 100 }  # ~$2 per order (2 * 99¢)
-      # side can be: "no", "yes", or "auto" (picks whichever side meets min_bid_cents)
+      # Kept BTC/ETH tight, loosened SOL to 85 to capture more early 300s volume
+      min_bid_cents: { btc: 85, eth: 80, sol: 85, xrp: 75 }
+      order_count: { btc: 10, eth: 10, sol: 10, xrp: 10 }
+      max_cost_cents: 10000
       side: auto
       stop_loss_pct: 15
-      # The "Glitch Filter": 0.70 gives BTC/ETH room to breathe, 0.85 keeps SOL/XRP tight
-      stop_loss_distance_factor: { btc: 0.70, eth: 0.70, sol: 0.85, xrp: 0.85 }
-      max_cost_cents: 80000      # $6 total limit per window/asset
-     # The Iron Walls: Raised ETH to 2.5 to absorb the 50-cent CB desyncs
-      min_distance_at_placement: { btc: 45.0, eth: 2.5, sol: 0.10, xrp: 0.0015 }
+      # Catastrophic override: if loss_pct >= catastrophic_loss_pct, fire stop-loss immediately (ignore distance).
+      catastrophic_loss_pct: 25
+      # NEW BUFFERS: Widened SOL and XRP to absorb their normal 300s background noise
+      stop_loss_absolute_buffer: { btc: 15.0, eth: 1.0, sol: 0.10, xrp: 0.0015 }
+      # NEW WALLS: Raised SOL and XRP so the buffer subtraction creates a mathematically safe Iron Floor
+      min_distance_at_placement: { btc: 45.0, eth: 2.5, sol: 0.18, xrp: 0.0025 }
+
+    # Legacy key (optional): strategy also reads last_90s_limit_99 if continuous_alpha_limit_99 missing
+    # last_90s_limit_99:
+    #   enabled: false
+    #   window_seconds: { btc: 85, eth: 85, sol: 85, xrp: 85 }
+    #   ...
 
     atm_breakout_strategy:
       enabled: false
-      min_seconds_to_close: 120    # Still stops looking for NEW trades 2 mins before expiry
-      max_seconds_to_close: 840    # Starts looking 10 mins before expiry
-      # Require minimum distance from strike at placement (same units as spot/strike; per asset)
+      min_seconds_to_close: 120
+      max_seconds_to_close: 840
       min_distance_at_placement: { btc: 60, eth: 3, sol: 0.25, xrp: 0.003 }
-
-      # Breakout Confirmation Pricing (ITM entries after spot crosses strike)
-      min_entry_price: 55          # Minimum price we’re willing to pay for ITM confirmation
-      max_entry_price: 70          # Maximum price we’re willing to pay (e.g. 45–70c band)
-      # Optional: tighten/relax side-specific spread guard for entries
-      max_entry_spread_cents: 10   # Reject if ask - bid on chosen side > 10c
-
-      # Momentum entry: required $ move over the lookback window (same units as spot/strike).
-      momentum_window_seconds: 90  # Look back 30s for sustained move; ref_spot = spot from >= 30s ago
-      momentum_trigger_3s: { btc: 60.0, eth: 3, sol: 0.25, xrp: 0.003 } # Min $ move over that window; larger = tighter
-
-      # Adjusted Asymmetric Exits for ITM entries
-      take_profit_cents: 85        # Target 88c. (If bought at 60c, gain = +28c)
-      stop_loss_cents: 35          # Stop out at 35c. (If bought at 60c, loss = -25c)
-
-      # Sizing and Risk
-      order_count: 10              # contracts per order
-      max_cost_cents: 1000         # total limit per window/asset
+      min_entry_price: 55
+      max_entry_price: 70
+      max_entry_spread_cents: 10
+      momentum_window_seconds: 90
+      momentum_trigger_3s: { btc: 60.0, eth: 3, sol: 0.25, xrp: 0.003 }
+      take_profit_cents: 85
+      stop_loss_cents: 35
+      order_count: 10
+      max_cost_cents: 1000
       contracts: 10

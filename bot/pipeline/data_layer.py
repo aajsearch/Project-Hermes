@@ -304,7 +304,7 @@ class DataLayer:
         try:
             from bot.oracle_ws_manager import get_safe_spot_prices_sync, is_ws_running
             if is_ws_running():
-                ws_spot = get_safe_spot_prices_sync(asset, max_age_seconds=6.0, require_both=True)
+                ws_spot = get_safe_spot_prices_sync(asset, max_age_seconds=3.0, require_both=True)
                 if ws_spot:
                     kraken_price = ws_spot.get("kraken")
                     coinbase_price = ws_spot.get("cb")
@@ -324,7 +324,7 @@ class DataLayer:
                 else:
                     self._last_spot_kraken_age_s = None
                     self._last_spot_cb_age_s = None
-                    logger.info("[spot] WS miss for %s (need both K and CB <6s) — using REST", asset)
+                    logger.info("[spot] WS miss for %s (need both K and CB <3s) — using REST", asset)
             else:
                 self._last_spot_kraken_age_s = None
                 self._last_spot_cb_age_s = None

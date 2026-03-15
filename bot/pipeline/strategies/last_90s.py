@@ -67,14 +67,25 @@ def _min_spot_distance(ctx: WindowContext) -> Optional[float]:
     return ctx.distance
 
 
+def _resolve_strategy_id(config: dict) -> str:
+    """Use continuous_alpha_limit_99 if that block exists in any interval, else last_90s_limit_99."""
+    for interval in ("fifteen_min", "hourly"):
+        strategies = (config.get(interval) or {}).get("strategies") or {}
+        if strategies.get("continuous_alpha_limit_99") is not None:
+            return "continuous_alpha_limit_99"
+    return "last_90s_limit_99"
+
+
 class Last90sStrategy(BaseV2Strategy):
     """
-    Last-90s limit-99 strategy: places a limit order in the final window_seconds when
-    distance and bid floor pass; exits with stop_loss when loss exceeds threshold in danger zone.
+    Limit-at-99 strategy: places a limit order when seconds_to_close <= window_seconds and
+    distance/bid pass; exits with stop_loss using absolute distance buffer (entry_distance - buffer).
+    Supports both config keys: continuous_alpha_limit_99 (300s horizon) and last_90s_limit_99.
     """
 
     def __init__(self, config: dict) -> None:
-        super().__init__("last_90s_limit_99", config)
+        strategy_id = _resolve_strategy_id(config)
+        super().__init__(strategy_id, config)
         path = _v2_db_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(path), check_same_thread=False)
@@ -82,6 +93,19 @@ class Last90sStrategy(BaseV2Strategy):
             _ensure_telemetry_table(conn)
         finally:
             conn.close()
+
+    def _get_strategy_config(self, ctx: WindowContext) -> dict:
+        """Try continuous_alpha_limit_99 then last_90s_limit_99 so either YAML key works."""
+        if not ctx.config or not ctx.interval:
+            return {}
+        interval_block = ctx.config.get(ctx.interval)
+        if not isinstance(interval_block, dict):
+            return {}
+        strategies = interval_block.get("strategies")
+        if not isinstance(strategies, dict):
+            return {}
+        out = strategies.get("continuous_alpha_limit_99") or strategies.get("last_90s_limit_99")
+        return out if isinstance(out, dict) else {}
 
     def _record_telemetry(self, ctx: WindowContext, placed: int, reason: str) -> None:
         """
@@ -98,8 +122,7 @@ class Last90sStrategy(BaseV2Strategy):
         seconds_to_close_raw = ctx.seconds_to_close
         seconds_to_close = float(seconds_to_close_raw) if seconds_to_close_raw is not None else -1.0
         # Bid from ctx.quote by configured side (yes|no|auto) for telemetry.
-        interval_cfg = (ctx.config or {}).get(ctx.interval or "") or {}
-        strat_cfg = (interval_cfg.get("strategies") or {}).get("last_90s_limit_99") or {}
+        strat_cfg = self._get_strategy_config(ctx) or {}
         side_cfg = (str(strat_cfg.get("side", "no")).strip().lower() or "no")
         yes_bid_q = int(ctx.quote.get("yes_bid", 0) or 0)
         no_bid_q = int(ctx.quote.get("no_bid", 0) or 0)
@@ -239,12 +262,14 @@ class Last90sStrategy(BaseV2Strategy):
 
         self._record_telemetry(ctx, 1, "intent_fired")
         client_order_id = f"last90s:{uuid.uuid4().hex[:12]}"
+        # placement_bid_cents = bid at placement; used as entry cost for stop-loss (avoids phantom loss vs limit 99¢).
         return OrderIntent(
             side=side,
             price_cents=limit_price_cents,
             count=count,
             order_type="limit",
             client_order_id=client_order_id,
+            placement_bid_cents=bid_cents,
         )
 
     def evaluate_exit(self, ctx: WindowContext, my_orders: List[OrderRecord]) -> List[ExitAction]:
@@ -258,19 +283,30 @@ class Last90sStrategy(BaseV2Strategy):
             sl_pct = float(stop_loss_pct) / 100.0
         except (TypeError, ValueError):
             sl_pct = 0.30
+        catastrophic_loss_pct = _get_asset_config(cfg.get("catastrophic_loss_pct"), asset, 25)
+        try:
+            catastrophic_pct = float(catastrophic_loss_pct) / 100.0
+        except (TypeError, ValueError):
+            catastrophic_pct = 0.25
+        # Reference distance at placement (we required distance >= min_distance_at_placement when placing).
         min_dist_placement = _get_asset_config(cfg.get("min_distance_at_placement"), asset, 0.0)
         try:
-            min_d = float(min_dist_placement) if min_dist_placement is not None else 0.0
+            initial_placement_distance = float(min_dist_placement) if min_dist_placement is not None else 0.0
         except (TypeError, ValueError):
-            min_d = 0.0
-        factor = _get_asset_config(cfg.get("stop_loss_distance_factor"), asset, 0.8)
+            initial_placement_distance = 0.0
+        # Absolute buffer: danger_threshold = initial_placement_distance - stop_loss_absolute_buffer.
+        # Stop-loss fires ONLY if current_min_distance < danger_threshold AND current_loss_pct > stop_loss_pct.
+        buffer_raw = _get_asset_config(cfg.get("stop_loss_absolute_buffer"), asset, None)
         try:
-            factor_f = float(factor)
+            buffer_f = float(buffer_raw) if buffer_raw is not None else None
         except (TypeError, ValueError):
-            factor_f = 0.8
-        # Use MIN distance from both oracles for exit logic.
+            buffer_f = None
+        if buffer_f is not None and initial_placement_distance is not None:
+            danger_threshold = initial_placement_distance - buffer_f
+        else:
+            # Fallback if stop_loss_absolute_buffer not set (e.g. old config): no distance gate.
+            danger_threshold = None
         distance_min = _min_spot_distance(ctx)
-        danger_threshold = min_d * factor_f if min_d else None
         yes_bid = int(ctx.quote.get("yes_bid", 0) or 0)
         no_bid = int(ctx.quote.get("no_bid", 0) or 0)
 
@@ -282,34 +318,34 @@ class Last90sStrategy(BaseV2Strategy):
             filled = order.status == "filled" or (order.filled_count or 0) > 0
             if not filled:
                 continue
-            entry_cents = order.limit_price_cents or 99
+            # Use placement bid as entry cost so loss_pct reflects true drawdown (fix phantom loss from using limit 99¢).
+            entry_cents = (
+                order.placement_bid_cents
+                if getattr(order, "placement_bid_cents", None) is not None
+                else (order.limit_price_cents or 99)
+            )
             if entry_cents <= 0:
                 continue
-            # Use bid for the side we hold: YES position -> yes_bid, NO position -> no_bid.
             current_bid = yes_bid if side == "yes" else no_bid
             loss_pct = (entry_cents - current_bid) / float(entry_cents) if current_bid is not None else 0.0
 
-            # Panic stop-loss: if either spot feed has effectively reached the strike (distance very small),
-            # close immediately regardless of the normal distance threshold.
-            panic_eps_map = {"btc": 1.0, "eth": 0.1, "sol": 0.01, "xrp": 0.0005}
-            panic_eps = panic_eps_map.get(asset, 0.0)
-            if distance_min is not None and panic_eps > 0 and distance_min <= panic_eps and loss_pct > 0:
+            # Catastrophic bid collapse override: if loss >= catastrophic_loss_pct, fire immediately (ignore distance).
+            if loss_pct >= catastrophic_pct:
                 actions.append(ExitAction(order_id=order.order_id, action="stop_loss"))
                 logger.info(
-                    "[last_90s] PANIC stop-loss: order_id=%s side=%s entry=%sc bid=%s loss_pct=%.2f "
-                    "distance_min=%.4f panic_eps=%.4f",
-                    order.order_id, side, entry_cents, current_bid, loss_pct, distance_min, panic_eps,
+                    "[last_90s] Stop-loss (catastrophic override): order_id=%s side=%s entry=%sc bid=%s loss_pct=%.2f >= %.0f%%",
+                    order.order_id, side, entry_cents, current_bid, loss_pct, catastrophic_pct * 100,
                 )
                 continue
-
+            # Normal dual-condition: loss >= stop_loss_pct AND distance < danger_threshold.
             if loss_pct < sl_pct:
                 continue
             if danger_threshold is not None and distance_min is not None:
-                if distance_min > danger_threshold:
+                if distance_min >= danger_threshold:
                     continue
             actions.append(ExitAction(order_id=order.order_id, action="stop_loss"))
             logger.info(
-                "[last_90s] Stop-loss: order_id=%s side=%s entry=%sc bid=%s loss_pct=%.2f distance=%s threshold=%s",
+                "[last_90s] Stop-loss: order_id=%s side=%s entry=%sc bid=%s loss_pct=%.2f distance_min=%s danger_threshold=%s",
                 order.order_id, side, entry_cents, current_bid, loss_pct, distance_min, danger_threshold,
             )
         return actions

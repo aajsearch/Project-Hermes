@@ -21,6 +21,8 @@ class OrderIntent:
     count: int
     order_type: str  # e.g. "limit" | "market"
     client_order_id: str
+    # Bid at placement time (yes_bid or no_bid for chosen side). Used as entry cost for stop-loss.
+    placement_bid_cents: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.side not in ("yes", "no"):
@@ -76,6 +78,8 @@ class OrderRecord:
     count: int
     limit_price_cents: Optional[int]
     placed_at: float
+    # Bid at placement (ctx.quote). Used for stop-loss loss_pct so we don't use limit_price (99¢) as entry.
+    placement_bid_cents: Optional[int] = None
 
     def is_active(self) -> bool:
         """True if order is still resting (not filled/canceled)."""

@@ -603,6 +603,7 @@ class PipelineExecutor:
                 placed_at=time.time(),
                 limit_price_cents=intent.price_cents if intent.order_type == "limit" else None,
                 client_order_id=intent.client_order_id,
+                placement_bid_cents=getattr(intent, "placement_bid_cents", None),
             )
             logger.info(
                 "[EXECUTION] Order PLACED on Kalshi — order_id=%s ticker=%s side=%s count=%s price_cents=%s (check Kalshi app/website to verify)",
