@@ -11,14 +11,15 @@ fifteen_min:
       limit_price_cents: 99
       min_bid_cents: { btc: 85, eth: 80, sol: 88, xrp: 75 }
       # contracts per placement; scalar = same for all assets, or per-asset override
-      order_count: { btc: 50, eth: 50, sol: 50, xrp: 50 }  # ~$2 per order (2 * 99¢)
+      order_count: { btc: 250, eth: 250, sol: 100, xrp: 100 }  # ~$2 per order (2 * 99¢)
       # side can be: "no", "yes", or "auto" (picks whichever side meets min_bid_cents)
       side: auto
       stop_loss_pct: 15
-      # Use 0.8 to ignore fake-outs on big coins, but 1.0 (always active) on tight coins
-      stop_loss_distance_factor: { btc: 0.85, eth: 0.85, sol: 0.85, xrp: 0.85 }
+      # The "Glitch Filter": 0.70 gives BTC/ETH room to breathe, 0.85 keeps SOL/XRP tight
+      stop_loss_distance_factor: { btc: 0.70, eth: 0.70, sol: 0.85, xrp: 0.85 }
       max_cost_cents: 80000      # $6 total limit per window/asset
-      min_distance_at_placement: { btc: 45.0, eth: 1.5, sol: 0.10, xrp: 0.0015 }
+     # The Iron Walls: Raised ETH to 2.5 to absorb the 50-cent CB desyncs
+      min_distance_at_placement: { btc: 45.0, eth: 2.5, sol: 0.10, xrp: 0.0015 }
 
     atm_breakout_strategy:
       enabled: false

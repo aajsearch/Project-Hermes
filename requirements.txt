@@ -1,29 +1,33 @@
 # Project Hermes - Python dependencies
 # Python 3.11+
 
-# HTTP and Kalshi API
+# --- HTTP & API ---
 requests>=2.28.0,<3
 
-# Kalshi request signing (RSA-PSS)
+# --- Kalshi request signing (RSA-PSS) ---
 cryptography>=41.0.0
 
-# Config and environment
+# --- Config & environment ---
 python-dotenv>=1.0.0
 PyYAML>=6.0
 
-# Optional: API server / dashboard (legacy or future)
-fastapi>=0.100.0
-uvicorn>=0.20.0
+# --- Time & TLS ---
+pytz>=2023.3
+certifi>=2023.7.22
 
-# Time and TLS
-pytz>=2023.0
-certifi>=2023.0
-
-# Data and tooling (telemetry export, reports)
-pandas>=1.5.0
-
-# WebSocket (Kalshi WS, oracle feeds if enabled)
+# --- WebSocket (Kalshi WS, Kraken/Coinbase oracle feeds) ---
 websockets>=12.0
 
-# Tests
+# --- Data & tooling (telemetry export, audit scripts) ---
+pandas>=1.5.0
+
+# --- Optional: API server / dashboard (src/api.py) ---
+fastapi>=0.100.0
+uvicorn>=0.20.0
+pydantic>=2.0
+
+# --- Optional: Coinbase Advanced Trade (coinbase_grid_bot) ---
+coinbase-advanced-py>=1.8.0
+
+# --- Tests ---
 pytest>=7.0
