@@ -3,33 +3,73 @@
 fifteen_min:
   pipeline:
     run_interval_seconds: 1
-    strategy_priority: [continuous_alpha_limit_99, atm_breakout_strategy]
+    strategy_priority: [continuous_alpha_limit_99, knife_catcher, atm_breakout_strategy]
 
   strategies:
     continuous_alpha_limit_99:
       enabled: true
-      # Hunt from 300s (5 min) down to 0; bot evaluates every tick in this window
       window_seconds: { btc: 300, eth: 300, sol: 300, xrp: 300 }
-      limit_price_cents: 99
-      # Kept BTC/ETH tight, loosened SOL to 85 to capture more early 300s volume
-      min_bid_cents: { btc: 85, eth: 80, sol: 85, xrp: 75 }
-      order_count: { btc: 10, eth: 10, sol: 10, xrp: 10 }
-      max_cost_cents: 10000
+      
+      # --- 1. ENTRY CONSTRAINTS (The 85-95 Sweet Spot) ---
+      limit_price_cents: 95
+      min_bid_cents: { btc: 85, eth: 85, sol: 85, xrp: 85 }
+      
+      order_count: { btc: 30, eth: 30, sol: 30, xrp: 30 }
+      max_cost_cents: 4000
       side: auto
+      
+      # --- 2. RISK BUFFERS & WALLS ---
       stop_loss_pct: 15
-      # Catastrophic override: if loss_pct >= catastrophic_loss_pct, fire stop-loss immediately (ignore distance).
-      catastrophic_loss_pct: 25
-      # NEW BUFFERS: Widened SOL and XRP to absorb their normal 300s background noise
-      stop_loss_absolute_buffer: { btc: 15.0, eth: 1.0, sol: 0.10, xrp: 0.0015 }
-      # NEW WALLS: Raised SOL and XRP so the buffer subtraction creates a mathematically safe Iron Floor
-      min_distance_at_placement: { btc: 45.0, eth: 2.5, sol: 0.18, xrp: 0.0025 }
+      catastrophic_loss_pct: 45
+      
+      stop_loss_absolute_buffer: { btc: 15.0, eth: 1.0, sol: 0.25, xrp: 0.0010 }
+      min_distance_at_placement: { btc: 45.0, eth: 2.5, sol: 0.45, xrp: 0.0020 }
+
+      # --- 3. THE NEW TRAILING STOP ---
+      distance_decay_pct: 0.80
+
+      # --- 4. STATE TIMERS ---
+      global_cooldown_seconds: 60
+      danger_persistence_seconds: 8.0
 
     # Legacy key (optional): strategy also reads last_90s_limit_99 if continuous_alpha_limit_99 missing
     # last_90s_limit_99:
     #   enabled: false
     #   window_seconds: { btc: 85, eth: 85, sol: 85, xrp: 85 }
     #   ...
+    knife_catcher:
+      enabled: false # this strategy is not working as expected so disable it for now
+      # Operate in the same 5-minute window as our main strategy
+      window_seconds: { btc: 300, eth: 300, sol: 300, xrp: 300 }
+      
+      # THE CRASH DETECTION (Sliding Window parameters)
+      historic_high_bid: 80
+      lookback_seconds: 60
+      
+      # THE ENTRY ZONE (Buy the MM panic)
+      min_entry_cents: 20
+      max_entry_cents: 45
+      # Dynamic limit: place at bid + spread (avoids crossing a blown-out spread)
+      max_entry_spread_cents: 5
+      # Wash-trade safeguard: only fire after crash has sustained this long (lets continuous_alpha clear first)
+      execution_delay_seconds: 3
+      
+      # DISTANCE GATE (Must pierce the Iron Floor to be a true flash crash)
+      # Notice we use the calculated Iron Floors from our previous analysis
+      min_distance_at_placement: { btc: 30.0, eth: 1.5, sol: 0.08, xrp: 0.0010 }
+      # THE DEATH FLOOR: Do not catch the knife if the spot has crossed the strike by MORE than this amount.
+      max_negative_distance_at_placement: { btc: -10.0, eth: -0.25, sol: -0.05, xrp: -0.00010 }
+      # THE RESOLUTION (Exit Rules)
+      take_profit_cents: 80
+      stop_loss_cents: 10
+      max_hold_seconds: 60
+      
+      # RISK SIZING (Start small to validate the wick dynamics)
+      order_count: 1
+      max_cost_cents: 100
+      side: auto
 
+   #! TO DO: Add atm_breakout_strategy   
     atm_breakout_strategy:
       enabled: false
       min_seconds_to_close: 120

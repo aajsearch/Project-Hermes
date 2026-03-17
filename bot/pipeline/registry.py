@@ -194,6 +194,22 @@ class OrderRegistry:
         rows = cur.fetchall()
         return [self._row_to_order_record(dict(r)) for r in rows]
 
+    def get_order_by_id(self, order_id: str) -> Optional[OrderRecord]:
+        """Return the OrderRecord for the given order_id, or None if not in registry."""
+        cur = self._conn.execute(
+            f"""
+            SELECT order_id, strategy_id, interval, market_id, asset, ticker, side, status,
+                   filled_count, count, limit_price_cents, placed_at, placement_bid_cents
+            FROM {REGISTRY_TABLE}
+            WHERE order_id = ?
+            """,
+            (order_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return self._row_to_order_record(dict(row))
+
     def get_all_active_orders_for_cap_check(
         self,
         interval: str,
@@ -256,6 +272,32 @@ class OrderRegistry:
         )
         self._conn.commit()
         logger.debug("Recorded trade outcome for order %s: outcome=%s pnl_cents=%s", order_id, outcome, pnl_cents)
+
+    def get_reports_by_strategy(
+        self,
+        strategy_id: str,
+        interval: Optional[str] = None,
+        asset: Optional[str] = None,
+        limit: int = 500,
+    ) -> List[dict]:
+        """
+        Return closed-trade rows from v2_strategy_reports for the given strategy.
+        Each row has: order_id, strategy_id, interval, window_id, asset, side,
+        entry_price_cents, exit_price_cents, outcome, is_stop_loss, pnl_cents, resolved_at.
+        """
+        query = f"SELECT * FROM {REPORTS_TABLE} WHERE strategy_id = ?"
+        params: List[object] = [strategy_id]
+        if interval is not None:
+            query += " AND interval = ?"
+            params.append(interval)
+        if asset is not None:
+            query += " AND LOWER(asset) = LOWER(?)"
+            params.append(asset)
+        query += " ORDER BY resolved_at DESC LIMIT ?"
+        params.append(limit)
+        cur = self._conn.execute(query, params)
+        rows = cur.fetchall()
+        return [dict(r) for r in rows]
 
     @staticmethod
     def _row_to_order_record(row: dict) -> OrderRecord:

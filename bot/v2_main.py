@@ -23,6 +23,7 @@ from bot.pipeline.registry import OrderRegistry, init_v2_db
 from bot.pipeline.run_unified import run_pipeline_cycle
 from bot.pipeline.tick_logger import TickLogger
 from bot.pipeline.strategies.atm_breakout import AtmBreakoutStrategy
+from bot.pipeline.strategies.knife_catcher import KnifeCatcherStrategy
 from bot.pipeline.strategies.last_90s import Last90sStrategy
 from bot.v2_config_loader import load_v2_config
 
@@ -78,8 +79,9 @@ def main() -> None:
 
     strat_last90s = Last90sStrategy(config)
     strat_atm = AtmBreakoutStrategy(config)
+    strat_knife_catcher = KnifeCatcherStrategy(config)
 
-    fifteen_min_strats = [strat_last90s, strat_atm]
+    fifteen_min_strats = [strat_last90s, strat_knife_catcher, strat_atm]
     hourly_strats: list = []
 
     def run_interval_loop(interval: str, strategies: list, kalshi_client: KalshiClient) -> None:

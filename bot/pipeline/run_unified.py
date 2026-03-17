@@ -429,6 +429,8 @@ def run_pipeline_cycle(
         final_intents = aggregator.resolve_intents(
             asset_intents, interval_slice, active_orders, current_cost_by_strategy
         )
+        # Exits run first inside execute_cycle; global cooldown (e.g. after stop-loss) is updated there,
+        # so the next asset's evaluate_entry in a subsequent tick or the next market cycle will see it.
         executor.execute_cycle(
             final_intents,
             asset_exits,

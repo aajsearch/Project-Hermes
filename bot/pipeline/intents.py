@@ -48,6 +48,8 @@ class ExitAction:
 
     order_id: str
     action: str  # "stop_loss" | "take_profit" | "market_sell" | "cancel_only"
+    # Optional sub-reason for stop-loss / exit attribution (e.g. sl_catastrophic, sl_normal_persistence).
+    reason: Optional[str] = None
     # For take_profit: price at which to place a resting limit sell (provide liquidity).
     # Executor uses this to avoid market-selling and to dedupe existing limit sells.
     limit_price_cents: Optional[int] = None

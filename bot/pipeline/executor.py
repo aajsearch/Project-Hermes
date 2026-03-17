@@ -18,6 +18,32 @@ from src.client.kalshi_client import KalshiClient
 logger = logging.getLogger(__name__)
 
 
+def _exit_price_cents_from_sell_order(sell_order: Optional[dict], side: str) -> Optional[int]:
+    """
+    Extract exit (fill) price in cents from a Kalshi sell-order response.
+    Tries yes_price, no_price, average_fill_price, and dollar variants.
+    """
+    if not sell_order or not isinstance(sell_order, dict):
+        return None
+    # Integer cents (Kalshi often returns limit price or fill in cents)
+    for key in ("yes_price", "no_price", "average_fill_price", "avg_fill_price"):
+        v = sell_order.get(key)
+        if v is not None:
+            try:
+                return int(round(float(v)))
+            except (TypeError, ValueError):
+                pass
+    # Dollar fields (V2 API)
+    for key in ("yes_price_dollars", "no_price_dollars", "average_fill_price_dollars"):
+        v = sell_order.get(key)
+        if v is not None:
+            try:
+                return int(round(float(v) * 100))
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
 def _sl_audit_db_path() -> Path:
     """
     Shared v2 state DB used for telemetry; reuse it for SL execution audit.
@@ -114,6 +140,78 @@ def _record_sl_execution_audit(
             conn.close()
     except Exception as e:
         logger.debug("[SL_AUDIT] Failed to record SL execution audit for order_id=%s: %s", order_id, e)
+
+
+# SQLite timeout (seconds) for cooldown table; avoids hard crash when DB is locked during volatile events.
+SQLITE_COOLDOWN_TIMEOUT = 10.0
+
+
+def _ensure_global_cooldown_table() -> None:
+    """
+    Create v2_global_cooldown table if it does not exist.
+    One row per strategy_id: last_stop_loss_timestamp (real seconds since epoch).
+    Used to enforce global macro cool-down after any stop-loss / catastrophic override.
+    Best-effort; uses timeout to handle concurrent writes (e.g. multiple assets hitting SL at once).
+    """
+    path = _sl_audit_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        conn = sqlite3.connect(str(path), check_same_thread=False, timeout=SQLITE_COOLDOWN_TIMEOUT)
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS v2_global_cooldown (
+                    strategy_id TEXT PRIMARY KEY,
+                    last_stop_loss_timestamp REAL NOT NULL
+                )
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e).lower() or "busy" in str(e).lower():
+            logger.warning("[COOLDOWN] Database locked while ensuring v2_global_cooldown table; skipping (no crash). %s", e)
+        else:
+            logger.debug("[COOLDOWN] Failed to ensure v2_global_cooldown table: %s", e)
+    except Exception as e:
+        logger.debug("[COOLDOWN] Failed to ensure v2_global_cooldown table: %s", e)
+
+
+def _update_global_cooldown(strategy_id: str) -> None:
+    """
+    Set last_stop_loss_timestamp = now for the given strategy_id.
+    Call after any successful stop-loss or catastrophic override market sell.
+    Best-effort only; never raises. Uses timeout and handles database is locked gracefully.
+    """
+    if not (strategy_id or "").strip():
+        return
+    _ensure_global_cooldown_table()
+    path = _sl_audit_db_path()
+    try:
+        conn = sqlite3.connect(str(path), check_same_thread=False, timeout=SQLITE_COOLDOWN_TIMEOUT)
+        try:
+            conn.execute(
+                """
+                INSERT INTO v2_global_cooldown (strategy_id, last_stop_loss_timestamp)
+                VALUES (?, ?)
+                ON CONFLICT(strategy_id) DO UPDATE SET last_stop_loss_timestamp = excluded.last_stop_loss_timestamp
+                """,
+                (str(strategy_id).strip(), time.time()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e).lower() or "busy" in str(e).lower():
+            logger.warning(
+                "[COOLDOWN] Database locked while updating global cooldown for strategy_id=%s; skipping (no crash). %s",
+                strategy_id, e,
+            )
+        else:
+            logger.debug("[COOLDOWN] Failed to update global cooldown for strategy_id=%s: %s", strategy_id, e)
+    except Exception as e:
+        logger.debug("[COOLDOWN] Failed to update global cooldown for strategy_id=%s: %s", strategy_id, e)
 
 
 class PipelineExecutor:
@@ -299,15 +397,18 @@ class PipelineExecutor:
                         count=sell_count,
                     )
                     sell_order_id = (resp or {}).get("order", {}).get("order_id") or (resp or {}).get("order_id")
+                    so_d: Optional[dict] = None  # sell order dict for exit price / fill
                     reason = "take_profit" if exit_action.action == EXIT_ACTION_TAKE_PROFIT else "stop_loss/market_sell"
                     logger.info(
                         "[EXECUTION] %s: market sell ORDER PLACED (entry_order_id=%s sell_order_id=%s) ticker=%s side=%s count=%s attempt=%d",
                         reason, exit_action.order_id, sell_order_id, ticker_sell, side, sell_count, attempt,
                     )
                     # Record successful attempt in SL execution audit table.
+                    # Use ExitAction.reason when provided so telemetry can distinguish specific SL sub-reasons.
+                    exit_reason_tag = getattr(exit_action, "reason", None) or exit_action.action
                     _record_sl_execution_audit(
                         order_id=exit_action.order_id,
-                        exit_action=exit_action.action,
+                        exit_action=exit_reason_tag,
                         ticker=ticker_sell,
                         side=side,
                         sell_count=sell_count,
@@ -337,6 +438,44 @@ class PipelineExecutor:
                         self._registry.update_order_status(exit_action.order_id, "exited", sell_count)
                     except Exception:
                         pass
+                    # Log trade outcome to v2_strategy_reports for telemetry (entry, TP/SL, PnL).
+                    try:
+                        entry_record = self._registry.get_order_by_id(exit_action.order_id)
+                        if entry_record is not None:
+                            entry_price = (
+                                entry_record.placement_bid_cents
+                                if getattr(entry_record, "placement_bid_cents", None) is not None
+                                else (entry_record.limit_price_cents or 99)
+                            )
+                            exit_price_cents = _exit_price_cents_from_sell_order(so_d, side)
+                            pnl_cents: Optional[int] = None
+                            if exit_price_cents is not None:
+                                pnl_cents = (exit_price_cents - entry_price) * sell_count
+                            outcome = "win" if exit_action.action == EXIT_ACTION_TAKE_PROFIT else "loss"
+                            is_stop_loss = 0 if exit_action.action == EXIT_ACTION_TAKE_PROFIT else 1
+                            window_id = f"{entry_record.interval}_{entry_record.market_id}"
+                            self._registry.record_trade_outcome(
+                                order_id=exit_action.order_id,
+                                strategy_id=entry_record.strategy_id,
+                                interval=entry_record.interval,
+                                window_id=window_id,
+                                asset=entry_record.asset,
+                                side=entry_record.side,
+                                entry_price_cents=entry_price,
+                                exit_price_cents=exit_price_cents,
+                                outcome=outcome,
+                                is_stop_loss=bool(is_stop_loss),
+                                pnl_cents=pnl_cents,
+                                resolved_at=time.time(),
+                            )
+                            logger.info(
+                                "[EXECUTION] Recorded trade outcome order_id=%s strategy_id=%s outcome=%s is_stop_loss=%s pnl_cents=%s",
+                                exit_action.order_id, entry_record.strategy_id, outcome, is_stop_loss, pnl_cents,
+                            )
+                            if is_stop_loss:
+                                _update_global_cooldown(entry_record.strategy_id)
+                    except Exception as e:
+                        logger.warning("[EXECUTION] record_trade_outcome failed order_id=%s: %s", exit_action.order_id, e)
                     break
                 except Exception as e:
                     last_error = e

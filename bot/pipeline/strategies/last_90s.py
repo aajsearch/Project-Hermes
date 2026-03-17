@@ -26,6 +26,41 @@ def _v2_db_path() -> Path:
     return Path(__file__).resolve().parents[2].parent / "data" / "v2_state.db"
 
 
+# SQLite timeout (seconds) for cooldown read; avoid blocking when DB is locked during volatile events.
+_SQLITE_COOLDOWN_READ_TIMEOUT = 5.0
+
+
+def _get_last_stop_loss_timestamp(strategy_id: str) -> Optional[float]:
+    """
+    Read last_stop_loss_timestamp for strategy from v2_global_cooldown.
+    Returns None if table/row missing or on error. Uses timeout and handles database locked.
+    """
+    if not (strategy_id or "").strip():
+        return None
+    path = _v2_db_path()
+    if not path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(str(path), check_same_thread=False, timeout=_SQLITE_COOLDOWN_READ_TIMEOUT)
+        try:
+            row = conn.execute(
+                "SELECT last_stop_loss_timestamp FROM v2_global_cooldown WHERE strategy_id = ?",
+                (str(strategy_id).strip(),),
+            ).fetchone()
+            if row is not None:
+                return float(row[0])
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e).lower() or "busy" in str(e).lower():
+            logger.debug("[last_90s] Cooldown read skipped (DB locked); treating as no cooldown. %s", e)
+        else:
+            logger.debug("[last_90s] global cooldown read failed strategy_id=%s: %s", strategy_id, e)
+    except Exception as e:
+        logger.debug("[last_90s] global cooldown read failed strategy_id=%s: %s", strategy_id, e)
+    return None
+
+
 def _ensure_telemetry_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         f"""
@@ -86,6 +121,8 @@ class Last90sStrategy(BaseV2Strategy):
     def __init__(self, config: dict) -> None:
         strategy_id = _resolve_strategy_id(config)
         super().__init__(strategy_id, config)
+        # Stateful persistence filter: asset -> first time stop-loss condition was detected (for wick/flash-crash protection).
+        self.danger_timestamps: Dict[str, float] = {}
         path = _v2_db_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(path), check_same_thread=False)
@@ -217,7 +254,25 @@ class Last90sStrategy(BaseV2Strategy):
         if not cfg or not cfg.get("enabled", False):
             return None
 
+        # Global macro cool-down: after any asset stop-loss/catastrophic override, refuse new entries for cooldown_seconds.
+        cooldown_sec = int(cfg.get("global_cooldown_seconds", 0) or 0)
+        if cooldown_sec > 0:
+            last_ts = _get_last_stop_loss_timestamp(self.strategy_id)
+            if last_ts is not None:
+                elapsed = time.time() - last_ts
+                if elapsed < cooldown_sec:
+                    remaining = cooldown_sec - elapsed
+                    logger.info(
+                        "[last_90s] Entry skipped: %s is in global cooldown (%.0fs remaining); no new trades until cooldown expires.",
+                        self.strategy_id, remaining,
+                    )
+                    return None
+
         asset = (ctx.asset or "").strip().lower()
+        # Single bullet: at most one order per (window, asset). Do not average up.
+        if my_orders and len(my_orders) > 0:
+            return None
+
         window_seconds = float(_get_asset_config(cfg.get("window_seconds"), asset, 90))
         if ctx.seconds_to_close is None or ctx.seconds_to_close > window_seconds:
             return None
@@ -309,6 +364,12 @@ class Last90sStrategy(BaseV2Strategy):
         distance_min = _min_spot_distance(ctx)
         yes_bid = int(ctx.quote.get("yes_bid", 0) or 0)
         no_bid = int(ctx.quote.get("no_bid", 0) or 0)
+        # Configurable persistence: require normal (non-catastrophic) danger to persist this many seconds before firing (except in last 60s).
+        persistence_sec = float(cfg.get("danger_persistence_seconds", 5.0) or 5.0)
+        # Distance decay trailing stop: fire earlier if current distance has given up a fraction of the initial safety cushion.
+        distance_decay_pct = float(cfg.get("distance_decay_pct", 0.75) or 0.75)
+        sec_to_close = float(ctx.seconds_to_close) if ctx.seconds_to_close is not None else None
+        current_time = time.time()
 
         actions: List[ExitAction] = []
         for order in my_orders:
@@ -329,23 +390,87 @@ class Last90sStrategy(BaseV2Strategy):
             current_bid = yes_bid if side == "yes" else no_bid
             loss_pct = (entry_cents - current_bid) / float(entry_cents) if current_bid is not None else 0.0
 
-            # Catastrophic bid collapse override: if loss >= catastrophic_loss_pct, fire immediately (ignore distance).
+            # --- 1. Hard circuit breaker (catastrophic): bypass all timers and window checks ---
             if loss_pct >= catastrophic_pct:
-                actions.append(ExitAction(order_id=order.order_id, action="stop_loss"))
+                self.danger_timestamps.pop(asset, None)
+                actions.append(ExitAction(order_id=order.order_id, action="stop_loss", reason="sl_catastrophic"))
                 logger.info(
-                    "[last_90s] Stop-loss (catastrophic override): order_id=%s side=%s entry=%sc bid=%s loss_pct=%.2f >= %.0f%%",
-                    order.order_id, side, entry_cents, current_bid, loss_pct, catastrophic_pct * 100,
+                    "[last_90s] Stop-loss (CATASTROPHIC override): asset=%s order_id=%s loss_pct=%.2f",
+                    asset, order.order_id, loss_pct,
                 )
                 continue
-            # Normal dual-condition: loss >= stop_loss_pct AND distance < danger_threshold.
-            if loss_pct < sl_pct:
-                continue
-            if danger_threshold is not None and distance_min is not None:
-                if distance_min >= danger_threshold:
-                    continue
-            actions.append(ExitAction(order_id=order.order_id, action="stop_loss"))
-            logger.info(
-                "[last_90s] Stop-loss: order_id=%s side=%s entry=%sc bid=%s loss_pct=%.2f distance_min=%s danger_threshold=%s",
-                order.order_id, side, entry_cents, current_bid, loss_pct, distance_min, danger_threshold,
+
+            # --- 2. Wick filter (normal SL + distance) + distance-decay trailing stop ---
+            # Normal SL condition: loss_pct >= stop_loss_pct AND distance beyond danger_threshold.
+            normal_sl_met = (
+                loss_pct >= sl_pct
+                and (danger_threshold is None or (distance_min is not None and distance_min < danger_threshold))
             )
+            # Distance decay condition: current distance has decayed to distance_decay_pct of initial cushion AND we are in loss.
+            is_distance_decayed = False
+            if (
+                distance_min is not None
+                and initial_placement_distance is not None
+                and initial_placement_distance > 0.0
+            ):
+                try:
+                    decay_threshold = abs(initial_placement_distance) * distance_decay_pct
+                    is_distance_decayed = distance_min <= decay_threshold and loss_pct > 0.0
+                except (TypeError, ValueError):
+                    is_distance_decayed = False
+
+            is_in_danger = normal_sl_met or is_distance_decayed
+
+            if is_in_danger:
+                # Rule A (Late-Window Panic): last minute — fire immediately.
+                if sec_to_close is not None and sec_to_close <= 60:
+                    self.danger_timestamps.pop(asset, None)
+                    reason_tag = "sl_decay_late_window" if is_distance_decayed else "sl_normal_late_window"
+                    actions.append(ExitAction(order_id=order.order_id, action="stop_loss", reason=reason_tag))
+                    logger.info(
+                        "[last_90s] Stop-loss (late-window override, <=60s to close): order_id=%s asset=%s side=%s entry=%sc bid=%s loss_pct=%.2f",
+                        order.order_id, asset, side, entry_cents, current_bid, loss_pct,
+                    )
+                    continue
+                # Rule B (Persistence check): seconds_to_close > 60.
+                if asset not in self.danger_timestamps:
+                    self.danger_timestamps[asset] = current_time
+                    if is_distance_decayed and not normal_sl_met:
+                        reason = f'Distance Decay (curr_dist <= {distance_decay_pct:.2f} * init_dist)'
+                    elif is_distance_decayed and normal_sl_met:
+                        reason = f'Normal SL + Distance Decay (<= {distance_decay_pct:.2f} * init_dist)'
+                    else:
+                        reason = "Normal SL"
+                    logger.debug(
+                        "[last_90s] Danger zone entered: asset=%s reason=\"%s\" waiting %.1fs",
+                        asset, reason, persistence_sec,
+                    )
+                    continue
+                if (current_time - self.danger_timestamps[asset]) >= persistence_sec:
+                    self.danger_timestamps.pop(asset, None)
+                    reason_tag = "sl_decay_persistence" if is_distance_decayed else "sl_normal_persistence"
+                    actions.append(ExitAction(order_id=order.order_id, action="stop_loss", reason=reason_tag))
+                    logger.info(
+                        "[last_90s] Stop-loss (persistence confirmed %.1fs): order_id=%s asset=%s side=%s entry=%sc bid=%s loss_pct=%.2f distance_min=%s danger_threshold=%s",
+                        persistence_sec, order.order_id, asset, side, entry_cents, current_bid, loss_pct, distance_min, danger_threshold,
+                    )
+                    continue
+                # Still in danger but < persistence_sec — wait longer (do not exit).
+                continue
+
+            # --- 3. Recovery: neither catastrophic nor normal SL met — clear danger state if present ---
+            if asset in self.danger_timestamps:
+                del self.danger_timestamps[asset]
+                logger.debug("[last_90s] Danger cleared (recovery): asset=%s", asset)
+            # No stop-loss for this order; continue with normal evaluation (e.g. take-profit handled elsewhere if added).
+
+        # Cleanup: no filled orders for this asset (window closed or position finalized) — avoid leaking stale danger state.
+        has_filled = any(
+            (o.status == "filled" or (o.filled_count or 0) > 0)
+            for o in my_orders
+            if (o.side or "").strip().lower() in ("yes", "no")
+        )
+        if not has_filled:
+            self.danger_timestamps.pop(asset, None)
+
         return actions
