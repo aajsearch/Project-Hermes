@@ -8,29 +8,30 @@ fifteen_min:
   strategies:
     continuous_alpha_limit_99:
       enabled: true
-      window_seconds: { btc: 300, eth: 300, sol: 300, xrp: 300 }
+      window_seconds: { btc: 150, eth: 150, sol: 150, xrp: 150 }
       
       # --- 1. ENTRY CONSTRAINTS (The 85-95 Sweet Spot) ---
-      limit_price_cents: 95
-      min_bid_cents: { btc: 85, eth: 85, sol: 85, xrp: 85 }
+      limit_price_cents: 97
+      min_bid_cents: { btc: 95, eth: 95, sol: 95, xrp: 95 }
       
-      order_count: { btc: 30, eth: 30, sol: 30, xrp: 30 }
-      max_cost_cents: 4000
+      order_count: { btc: 10, eth: 10, sol: 10, xrp: 10 }
+      max_cost_cents: 5000
       side: auto
       
-      # --- 2. RISK BUFFERS & WALLS ---
-      stop_loss_pct: 15
+      # --- EARLY EXIT TRIGGERS (Accounting for 8% Slippage) ---
+      stop_loss_pct: 15  
+      distance_decay_pct: 0.70
       catastrophic_loss_pct: 45
       
-      stop_loss_absolute_buffer: { btc: 15.0, eth: 1.0, sol: 0.25, xrp: 0.0010 }
-      min_distance_at_placement: { btc: 45.0, eth: 2.5, sol: 0.45, xrp: 0.0020 }
-
-      # --- 3. THE NEW TRAILING STOP ---
-      distance_decay_pct: 0.80
+      stop_loss_absolute_buffer: { btc: 25.0, eth: 1.5, sol: 0.10, xrp: 0.0010 }
+      # --- ENTRY PREVENTION (Filtering out the noise) ---
+      min_distance_at_placement: { btc: 65.0, eth: 3.5, sol: 0.20, xrp: 0.0035 }
+      # Cancel resting entry if distance decays too much before fill (pre-fill adverse selection protection)
+      resting_cancel_decay_pct: 0.35
 
       # --- 4. STATE TIMERS ---
       global_cooldown_seconds: 60
-      danger_persistence_seconds: 8.0
+      danger_persistence_seconds: 6.0
 
     # Legacy key (optional): strategy also reads last_90s_limit_99 if continuous_alpha_limit_99 missing
     # last_90s_limit_99:
