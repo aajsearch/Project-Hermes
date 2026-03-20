@@ -1,0 +1,112 @@
+{
+  "positions": {
+    "SOXL": {
+      "asset_type": "EQUITY",
+      "key": "SOXL",
+      "symbol": "SOXL",
+      "qty": 28.0,
+      "entry_price": 63.675,
+      "entry_time": "2026-02-09T10:21:44",
+      "underlying": null,
+      "contract": null
+    },
+    "ETHU": {
+      "asset_type": "EQUITY",
+      "key": "ETHU",
+      "symbol": "ETHU",
+      "qty": 24.0,
+      "entry_price": 24.77,
+      "entry_time": "2026-02-09T10:21:44",
+      "underlying": null,
+      "contract": null
+    },
+    "BITX": {
+      "asset_type": "EQUITY",
+      "key": "BITX",
+      "symbol": "BITX",
+      "qty": 18.0,
+      "entry_price": 16.665,
+      "entry_time": "2026-02-09T10:23:26",
+      "underlying": null,
+      "contract": null
+    },
+    "MSTU": {
+      "asset_type": "EQUITY",
+      "key": "MSTU",
+      "symbol": "MSTU",
+      "qty": 52.0,
+      "entry_price": 5.675,
+      "entry_time": "2026-02-09T12:38:02",
+      "underlying": null,
+      "contract": null
+    },
+    "OPT:AMZN": {
+      "asset_type": "OPTION",
+      "key": "OPT:AMZN",
+      "symbol": "AMZN260515C00220000",
+      "qty": 3.0,
+      "entry_price": 12.666667,
+      "entry_time": "2026-02-09T12:38:03",
+      "underlying": "AMZN",
+      "contract": "AMZN260515C00220000"
+    },
+    "FNGU": {
+      "asset_type": "EQUITY",
+      "key": "FNGU",
+      "symbol": "FNGU",
+      "qty": 74.0,
+      "entry_price": 19.81,
+      "entry_time": "2026-02-09T16:44:12",
+      "underlying": null,
+      "contract": null
+    }
+  },
+  "pending_orders": {
+    "SOXL": {
+      "order_id": "5815f6f4-c14d-4cb0-9b66-6d64de579138",
+      "side": "SELL",
+      "time": "2026-02-09T16:38:14"
+    },
+    "ETHU": {
+      "order_id": "305fe7b9-b418-4cb7-86be-18645a73a34e",
+      "side": "SELL",
+      "time": "2026-02-09T16:44:12"
+    },
+    "BITX": {
+      "order_id": "a73701da-605b-4389-ae46-8aa91dfd65cf",
+      "side": "SELL",
+      "time": "2026-02-09T16:44:12"
+    },
+    "MSTU": {
+      "order_id": "8601d627-b176-4bd9-bc98-90bbca677d86",
+      "side": "SELL",
+      "time": "2026-02-09T16:44:12"
+    }
+  },
+  "cooldowns": {
+    "MSTU": {
+      "until": "2026-02-09T12:05:05",
+      "reason": "exit: take_profit hit pnl_pct=0.0302"
+    },
+    "OKLL": {
+      "until": "2026-02-09T13:17:58",
+      "reason": "exit: take_profit hit pnl_pct=0.0403"
+    },
+    "OPT:AMZN": {
+      "until": "2026-02-09T13:11:39",
+      "reason": "exit: underlying_sell_signal"
+    },
+    "NVDL": {
+      "until": "2026-02-09T14:15:07",
+      "reason": "exit: trend weakening (ema20<50), rsi=24.1"
+    },
+    "FNGU": {
+      "until": "2026-02-09T17:39:18",
+      "reason": "portfolio_exit_all"
+    }
+  },
+  "option_recos": {},
+  "portfolio_cooldown_until": "2026-02-09T17:45:17",
+  "mfe_mae_tracker": {},
+  "buys_last_hour": []
+}

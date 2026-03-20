@@ -1,0 +1,42 @@
+mode: paper
+cadence_minutes: 5
+
+equities:
+  # Leveraged ETFs / ETPs
+  - symbol: OKLL
+    profile: lev_etf_trend_v1
+  - symbol: FNGU
+    profile: lev_etf_trend_v1
+  - symbol: SOXL
+    profile: lev_etf_trend_v1
+  - symbol: MSTU
+    profile: lev_etf_trend_v1
+  - symbol: NVDL
+    profile: lev_etf_trend_v1
+  - symbol: BITX
+    profile: lev_etf_trend_v1
+  - symbol: ETHU
+    profile: lev_etf_trend_v1
+  - symbol: TQQQ
+    profile: lev_etf_trend_v1
+  - symbol: TSLL
+    profile: lev_etf_trend_v1
+
+options:
+  # Underlyings for options selection/signal overlay (no execution yet)
+  - underlying: AAPL
+    profile: options_call_overlay_v1
+  - underlying: AMZN
+    profile: options_call_overlay_v1
+  - underlying: QQQ
+    profile: options_call_overlay_v1
+  - underlying: SPY
+    profile: options_call_overlay_v1
+  - underlying: NVDA
+    profile: options_call_overlay_v1
+  - underlying: TSLA
+    profile: options_call_overlay_v1
+  - underlying: AMD
+    profile: options_call_overlay_v1
+  - underlying: META
+    profile: options_call_overlay_v1

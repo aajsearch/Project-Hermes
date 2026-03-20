@@ -1,0 +1,43 @@
+profiles:
+  lev_etf_trend_v1:
+    timeframe: "5Min"
+    lookback_bars: 200
+    ema_fast: 20
+    ema_slow: 50
+    rsi_len: 14
+    entry_rsi_min: 50
+    entry_rsi_max: 70
+    # stronger trend required to enter (reduces chop entries)
+    min_trend_gap_pct: 0.002
+    trade_notional_usd: 300
+    no_trade_first_minutes: 10
+    stop_loss_pct: 0.018
+    take_profit_pct: 0.03
+    # breakeven trail: once up this much, exit if price falls back to entry
+    trail_trigger_pct: 0.012
+    trail_to_entry: true
+    cooldown_minutes: 90
+    max_hold_minutes: 180
+    min_hold_minutes: 5          # don't allow strategy SELL until held this long (stops still immediate)
+    exit_rsi_max: 48.0           # strategy SELL when trend_down and rsi < this (tune for giveback vs early exit)
+    # atr_stop_k: 2.0            # optional: stop = entry - k*ATR (uncomment to use)
+
+  options_call_overlay_v1:
+    timeframe: "5Min"
+    lookback_bars: 200
+    ema_fast: 20
+    ema_slow: 50
+    rsi_len: 14
+    entry_rsi_min: 50
+    entry_rsi_max: 70
+    bear_rsi_max: 45              # when trend down and rsi <= this -> BUY PUT (bearish)
+    put_delta_min: 0.40           # put delta bounds (abs); effective put delta in [-put_delta_max, -put_delta_min]
+    put_delta_max: 0.55
+
+    # option selection constraints (calls and puts)
+    dte_min: 60
+    dte_max: 120
+    delta_min: 0.40
+    delta_max: 0.55
+    spread_pct_max: 0.05
+    iv_max: 0.50
