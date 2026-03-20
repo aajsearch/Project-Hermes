@@ -29,23 +29,13 @@ def _get_asset_config(value: Any, asset: str, default: Any) -> Any:
 
 
 def _min_spot_distance(ctx: WindowContext) -> Optional[float]:
-    """
-    Minimum spot-to-strike distance from available oracles.
-    Used to require distance < threshold (spot in danger zone) for entry.
-    """
-    candidates = [d for d in (ctx.distance_kraken, ctx.distance_coinbase) if d is not None]
-    if candidates:
-        return min(candidates)
+    """Spot-to-strike distance from the single oracle."""
     return ctx.distance
 
 
 def _spot_for_signed_distance(ctx: WindowContext) -> Optional[float]:
-    """Single spot value for signed-distance: Kraken, else Coinbase, else average if both."""
-    k = ctx.spot_kraken
-    cb = ctx.spot_coinbase
-    if k is not None and cb is not None:
-        return (k + cb) / 2.0
-    return k if k is not None else cb
+    """Single spot value for signed-distance (from sole oracle)."""
+    return ctx.spot
 
 
 def _signed_distance(ctx: WindowContext, side: str) -> Optional[float]:

@@ -18,6 +18,7 @@ from bot.market import (
     get_minutes_to_close,
     get_minutes_to_close_15min,
 )
+from bot.pipeline.window_utils import logical_window_slot as _logical_window_slot
 
 if TYPE_CHECKING:
     from bot.pipeline.aggregator import OrderAggregator
@@ -30,13 +31,6 @@ logger = logging.getLogger(__name__)
 
 # Log WS→REST fallback reason once per (market_id, "market"|"quote") per window; cleared on window transition
 _ws_fallback_logged: set = set()
-
-
-def _logical_window_slot(market_id: str) -> str:
-    """Extract time-slot part from market_id so all assets share the same window key (e.g. KXBTC15M-26MAR131530 -> 26MAR131530)."""
-    if not market_id:
-        return market_id or ""
-    return market_id.split("-")[-1].strip() if "-" in market_id else market_id
 
 
 def _close_ts_from_market(market: Dict[str, Any]) -> Optional[int]:
@@ -324,8 +318,8 @@ def run_pipeline_cycle(
         )
         if ctx.distance is None:
             logger.warning(
-                "[%s] [%s] Distance is None (no strike or spot), skipping asset — strike=%s spot_kraken=%s spot_coinbase=%s",
-                interval, asset.upper(), ctx.strike, ctx.spot_kraken, ctx.spot_coinbase,
+                "[%s] [%s] Distance is None (no strike or spot), skipping asset — strike=%s spot=%s",
+                interval, asset.upper(), ctx.strike, ctx.spot,
             )
             continue
 
@@ -339,8 +333,7 @@ def run_pipeline_cycle(
                 yes_bid=int(ctx.quote.get("yes_bid") or 0),
                 no_bid=int(ctx.quote.get("no_bid") or 0),
                 strike=float(ctx.strike) if ctx.strike is not None else None,
-                k_spot=float(ctx.spot_kraken) if ctx.spot_kraken is not None else None,
-                cb_spot=float(ctx.spot_coinbase) if ctx.spot_coinbase is not None else None,
+                spot=float(ctx.spot) if ctx.spot is not None else None,
             )
         # Dynamic float precision by asset: BTC/ETH 2, SOL 3, XRP 5
         _ndp = 2 if asset in ("btc", "eth") else 3 if asset == "sol" else 5 if asset == "xrp" else 2
@@ -351,32 +344,22 @@ def run_pipeline_cycle(
                 return f"{float(v):.{_ndp}f}"
             return str(v)
         strike_src = ctx.strike_source or "?"
-        # Spot vs strike for UP/DOWN: use average of K and CB when both present, else whichever is present.
-        _k, _cb, _strike = ctx.spot_kraken, ctx.spot_coinbase, ctx.strike
-        if _strike is not None and (_k is not None or _cb is not None):
-            spot_for_dir = (_k + _cb) / 2.0 if (_k is not None and _cb is not None) else (_k if _k is not None else _cb)
-            dist_dir = "UP" if spot_for_dir > _strike else "DOWN"
-        else:
-            dist_dir = ""
+        dist_dir = ""
+        if ctx.strike is not None and ctx.spot is not None:
+            dist_dir = "UP" if ctx.spot > ctx.strike else "DOWN"
         dist_str = f"{_fmt(ctx.distance)} ({dist_dir})" if dist_dir else _fmt(ctx.distance)
         spot_str = ctx.spot_source
-        if ctx.spot_source == "WS" and (ctx.spot_kraken_age_s is not None or ctx.spot_coinbase_age_s is not None):
-            parts = []
-            if ctx.spot_kraken_age_s is not None:
-                parts.append("K:%.1fs" % ctx.spot_kraken_age_s)
-            if ctx.spot_coinbase_age_s is not None:
-                parts.append("CB:%.1fs" % ctx.spot_coinbase_age_s)
-            spot_str = "WS (" + " ".join(parts) + ")" if parts else "WS"
+        if ctx.spot_source == "WS" and ctx.spot_age_s is not None:
+            spot_str = "WS (%.1fs)" % ctx.spot_age_s
         logger.info(
-            "[V2 DATA] %s | market=%s quote=%s spot=%s | Strike: %s (%s) | K: %s | CB: %s | Dist: %s",
+            "[V2 DATA] %s | market=%s quote=%s spot_src=%s | Strike: %s (%s) | Spot: %s | Dist: %s",
             asset.upper(),
             market_source,
             quote_source,
             spot_str,
             _fmt(ctx.strike),
             strike_src,
-            _fmt(ctx.spot_kraken),
-            _fmt(ctx.spot_coinbase),
+            _fmt(ctx.spot),
             dist_str,
         )
 
@@ -393,15 +376,139 @@ def run_pipeline_cycle(
         asset_intents: List[tuple] = []
         asset_exits: List[Any] = []
         for strat in strategies:
+            # --- Pre-fill adverse selection protection (cancel resting orders) ---
+            # If a resting entry order sits unfilled and spot distance decays too much, cancel it
+            # to avoid getting filled by toxic flow during a fast move toward strike.
+            try:
+                strat_cfg = strat._get_strategy_config(ctx) if hasattr(strat, "_get_strategy_config") else {}
+            except Exception:
+                strat_cfg = {}
+            cancel_decay_pct_raw = None if not isinstance(strat_cfg, dict) else strat_cfg.get("resting_cancel_decay_pct")
+            try:
+                cancel_decay_pct = float(cancel_decay_pct_raw) if cancel_decay_pct_raw is not None else 0.0
+            except (TypeError, ValueError):
+                cancel_decay_pct = 0.0
+
             # If an order was previously registered as 'resting' but no longer appears in open_orders,
             # treat it as filled (best-effort) so exits can manage it.
             resting = registry.get_orders_by_strategy(
                 strat.strategy_id, interval, market_id=market_id, asset=asset, active_only=True
             )
             for o in resting:
+                # Cancel resting order if distance has decayed beyond threshold before it fills.
+                if cancel_decay_pct > 0.0 and ctx.distance is not None and getattr(o, "entry_distance", None) is not None:
+                    try:
+                        placement_dist = float(getattr(o, "entry_distance"))
+                        current_dist = float(ctx.distance)
+                        if placement_dist > 0:
+                            cancel_threshold = placement_dist * (1.0 - cancel_decay_pct)
+                            if current_dist <= cancel_threshold:
+                                if kalshi_client is not None:
+                                    try:
+                                        kalshi_client.cancel_order(str(o.order_id))
+                                    except Exception as e:
+                                        # If cancel fails because it already filled, we'll detect fill below.
+                                        logger.warning(
+                                            "[EXECUTION] Cancel resting order failed (may already be filled): order_id=%s ticker=%s: %s",
+                                            o.order_id,
+                                            o.ticker,
+                                            e,
+                                        )
+                                    else:
+                                        try:
+                                            registry.update_order_status(str(o.order_id), "canceled", 0)
+                                        except Exception:
+                                            pass
+                                        logger.info(
+                                            "[EXECUTION] Order CANCELED (pre-fill decay) — order_id=%s strategy_id=%s ticker=%s side=%s "
+                                            "placement_distance=%.4f current_distance=%.4f threshold=%.4f decay_pct=%.2f",
+                                            o.order_id,
+                                            o.strategy_id,
+                                            o.ticker,
+                                            o.side,
+                                            placement_dist,
+                                            current_dist,
+                                            cancel_threshold,
+                                            cancel_decay_pct,
+                                        )
+                                        continue
+                    except Exception:
+                        pass
+
                 if o.order_id and o.order_id not in open_order_ids:
                     try:
-                        registry.update_order_status(o.order_id, "filled", int(o.count or 0))
+                        # Capture reference distance at the moment we learn the order is filled.
+                        # This is used for distance-decay trailing stop so it's based on actual entry.
+                        fill_dist = float(ctx.distance) if ctx.distance is not None else None
+                        registry.update_order_status(
+                            o.order_id,
+                            "filled",
+                            int(o.count or 0),
+                            entry_distance_at_fill=fill_dist,
+                        )
+                        # Mirror the "Order PLACED" logging style so we can correlate placed->filled->SL/TP.
+                        logger.info(
+                            "[EXECUTION] Order FILLED (inferred) — order_id=%s strategy_id=%s ticker=%s side=%s count=%s "
+                            "spot=%s spot_src=%s spot_age_s=%s entry_distance_at_fill=%s",
+                            o.order_id,
+                            o.strategy_id,
+                            o.ticker,
+                            o.side,
+                            int(o.count or 0),
+                            _fmt(ctx.spot),
+                            ctx.spot_source,
+                            _fmt(ctx.spot_age_s),
+                            _fmt(fill_dist),
+                        )
+                        # --- Bad-fill immediate exit (post-fill adverse selection protection) ---
+                        # If the order only got filled after distance decayed materially vs placement_distance,
+                        # treat it as toxic flow and exit immediately (market_sell) rather than waiting for full SL.
+                        if cancel_decay_pct > 0.0 and fill_dist is not None and getattr(o, "entry_distance", None) is not None:
+                            try:
+                                placement_dist = float(getattr(o, "entry_distance"))
+                                if placement_dist > 0.0:
+                                    bad_fill_threshold = placement_dist * (1.0 - cancel_decay_pct)
+                                    # Guardrail: if the fill-distance is still ABOVE our configured min_distance_at_placement,
+                                    # don't treat it as an adverse fill; let normal exit logic decide.
+                                    min_dist_setting = strat_cfg.get("min_distance_at_placement") if isinstance(strat_cfg, dict) else None
+                                    min_dist_at_placement = None
+                                    if isinstance(min_dist_setting, dict):
+                                        min_dist_at_placement = min_dist_setting.get(asset) or min_dist_setting.get(asset.upper())
+                                    else:
+                                        min_dist_at_placement = min_dist_setting
+                                    try:
+                                        if min_dist_at_placement is not None:
+                                            min_dist_at_placement = float(min_dist_at_placement)
+                                    except (TypeError, ValueError):
+                                        min_dist_at_placement = None
+
+                                    should_bad_exit = float(fill_dist) <= bad_fill_threshold
+                                    if min_dist_at_placement is not None:
+                                        should_bad_exit = should_bad_exit and (float(fill_dist) <= min_dist_at_placement)
+
+                                    if should_bad_exit:
+                                        from bot.pipeline.intents import ExitAction
+                                        asset_exits.append(
+                                            ExitAction(
+                                                order_id=str(o.order_id),
+                                                action="stop_loss",
+                                                reason="bad_fill_decay",
+                                            )
+                                        )
+                                        logger.info(
+                                            "[EXECUTION] Bad fill detected → immediate exit — order_id=%s strategy_id=%s ticker=%s side=%s "
+                                            "placement_distance=%.4f fill_distance=%.4f threshold=%.4f decay_pct=%.2f",
+                                            o.order_id,
+                                            o.strategy_id,
+                                            o.ticker,
+                                            o.side,
+                                            placement_dist,
+                                            float(fill_dist),
+                                            bad_fill_threshold,
+                                            cancel_decay_pct,
+                                        )
+                            except Exception:
+                                pass
                     except Exception:
                         pass
 

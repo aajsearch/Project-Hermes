@@ -47,7 +47,9 @@ def init_v2_db(db_path: Optional[Path] = None) -> None:
                 limit_price_cents INTEGER,
                 placed_at REAL NOT NULL,
                 client_order_id TEXT,
-                placement_bid_cents INTEGER
+                placement_bid_cents INTEGER,
+                entry_distance REAL,
+                entry_distance_at_fill REAL
             );
             CREATE INDEX IF NOT EXISTS idx_registry_strategy_interval_market_asset
                 ON {REGISTRY_TABLE}(strategy_id, interval, market_id, asset);
@@ -87,6 +89,20 @@ def init_v2_db(db_path: Optional[Path] = None) -> None:
         except sqlite3.OperationalError as e:
             if "duplicate column" not in str(e).lower():
                 logger.warning("V2 DB migration placement_bid_cents: %s", e)
+        try:
+            conn.execute(f"ALTER TABLE {REGISTRY_TABLE} ADD COLUMN entry_distance REAL")
+            conn.commit()
+            logger.info("V2 DB: added entry_distance to %s", REGISTRY_TABLE)
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                logger.warning("V2 DB migration entry_distance: %s", e)
+        try:
+            conn.execute(f"ALTER TABLE {REGISTRY_TABLE} ADD COLUMN entry_distance_at_fill REAL")
+            conn.commit()
+            logger.info("V2 DB: added entry_distance_at_fill to %s", REGISTRY_TABLE)
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                logger.warning("V2 DB migration entry_distance_at_fill: %s", e)
         logger.info("V2 DB initialized at %s", path)
     finally:
         conn.close()
@@ -119,13 +135,14 @@ class OrderRegistry:
         limit_price_cents: Optional[int] = None,
         client_order_id: Optional[str] = None,
         placement_bid_cents: Optional[int] = None,
+        entry_distance: Optional[float] = None,
     ) -> None:
         """Insert a new order into v2_order_registry (status=resting, filled_count=0)."""
         self._conn.execute(
             f"""
             INSERT INTO {REGISTRY_TABLE}
-            (order_id, strategy_id, interval, market_id, asset, ticker, side, status, filled_count, count, limit_price_cents, placed_at, client_order_id, placement_bid_cents)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'resting', 0, ?, ?, ?, ?, ?)
+            (order_id, strategy_id, interval, market_id, asset, ticker, side, status, filled_count, count, limit_price_cents, placed_at, client_order_id, placement_bid_cents, entry_distance)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'resting', 0, ?, ?, ?, ?, ?, ?)
             """,
             (
                 order_id,
@@ -140,6 +157,7 @@ class OrderRegistry:
                 placed_at,
                 client_order_id,
                 placement_bid_cents,
+                entry_distance,
             ),
         )
         self._conn.commit()
@@ -150,12 +168,23 @@ class OrderRegistry:
         order_id: str,
         status: str,
         filled_count: Optional[int] = None,
+        entry_distance_at_fill: Optional[float] = None,
     ) -> None:
-        """Update status and optionally filled_count for an order."""
-        if filled_count is not None:
+        """Update status and optionally filled_count and/or entry_distance_at_fill for an order."""
+        if filled_count is not None and entry_distance_at_fill is not None:
+            self._conn.execute(
+                f"UPDATE {REGISTRY_TABLE} SET status = ?, filled_count = ?, entry_distance_at_fill = ? WHERE order_id = ?",
+                (status, filled_count, entry_distance_at_fill, order_id),
+            )
+        elif filled_count is not None:
             self._conn.execute(
                 f"UPDATE {REGISTRY_TABLE} SET status = ?, filled_count = ? WHERE order_id = ?",
                 (status, filled_count, order_id),
+            )
+        elif entry_distance_at_fill is not None:
+            self._conn.execute(
+                f"UPDATE {REGISTRY_TABLE} SET status = ?, entry_distance_at_fill = ? WHERE order_id = ?",
+                (status, entry_distance_at_fill, order_id),
             )
         else:
             self._conn.execute(
@@ -176,7 +205,7 @@ class OrderRegistry:
         """Return OrderRecords for the given strategy/interval, optionally filtered by market_id/asset."""
         query = f"""
             SELECT order_id, strategy_id, interval, market_id, asset, ticker, side, status,
-                   filled_count, count, limit_price_cents, placed_at, placement_bid_cents
+                   filled_count, count, limit_price_cents, placed_at, placement_bid_cents, entry_distance, entry_distance_at_fill
             FROM {REGISTRY_TABLE}
             WHERE strategy_id = ? AND interval = ?
             """
@@ -199,7 +228,7 @@ class OrderRegistry:
         cur = self._conn.execute(
             f"""
             SELECT order_id, strategy_id, interval, market_id, asset, ticker, side, status,
-                   filled_count, count, limit_price_cents, placed_at, placement_bid_cents
+                   filled_count, count, limit_price_cents, placed_at, placement_bid_cents, entry_distance, entry_distance_at_fill
             FROM {REGISTRY_TABLE}
             WHERE order_id = ?
             """,
@@ -221,7 +250,7 @@ class OrderRegistry:
         """
         query = f"""
             SELECT order_id, strategy_id, interval, market_id, asset, ticker, side, status,
-                   filled_count, count, limit_price_cents, placed_at, placement_bid_cents
+                   filled_count, count, limit_price_cents, placed_at, placement_bid_cents, entry_distance, entry_distance_at_fill
             FROM {REGISTRY_TABLE}
             WHERE interval = ? AND status = 'resting'
             """
@@ -315,6 +344,8 @@ class OrderRegistry:
             limit_price_cents=row.get("limit_price_cents"),
             placed_at=row["placed_at"],
             placement_bid_cents=row.get("placement_bid_cents"),
+            entry_distance=float(row["entry_distance"]) if row.get("entry_distance") is not None else None,
+            entry_distance_at_fill=float(row["entry_distance_at_fill"]) if row.get("entry_distance_at_fill") is not None else None,
         )
 
     def close(self) -> None:

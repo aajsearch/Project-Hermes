@@ -23,6 +23,8 @@ class OrderIntent:
     client_order_id: str
     # Bid at placement time (yes_bid or no_bid for chosen side). Used as entry cost for stop-loss.
     placement_bid_cents: Optional[int] = None
+    # Actual distance-to-strike at placement. Used for trailing stop (distance_decay) so decay is vs real entry, not config minimum.
+    entry_distance: Optional[float] = None
 
     def __post_init__(self) -> None:
         if self.side not in ("yes", "no"):
@@ -82,6 +84,10 @@ class OrderRecord:
     placed_at: float
     # Bid at placement (ctx.quote). Used for stop-loss loss_pct so we don't use limit_price (99¢) as entry.
     placement_bid_cents: Optional[int] = None
+    # Actual distance-to-strike at placement. Used for distance_decay trailing stop (decay threshold = entry_distance * distance_decay_pct).
+    entry_distance: Optional[float] = None
+    # Actual distance-to-strike when the order becomes filled (used as trailing stop base).
+    entry_distance_at_fill: Optional[float] = None
 
     def is_active(self) -> bool:
         """True if order is still resting (not filled/canceled)."""

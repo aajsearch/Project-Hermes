@@ -1,6 +1,6 @@
 """
 Tick Logger: in-memory tick-by-tick tracking per (window, asset), flushed as one row per asset per window.
-Stores sec, yes_bid, no_bid, strike, k_spot, cb_spot as columnar arrays; at end of window
+Stores sec, yes_bid, no_bid, strike, spot as columnar arrays; at end of window
 serializes to JSON and writes a single row to v2_tick_log (window_id, asset, tick_history_json).
 """
 from __future__ import annotations
@@ -24,18 +24,17 @@ def _default_db_path() -> Path:
 class TickTracker:
     """
     In-memory columnar storage for one (window_id, asset).
-    Holds arrays: sec, yes_bid, no_bid, strike, k_spot, cb_spot.
+    Holds arrays: sec, yes_bid, no_bid, strike, spot (single oracle).
     """
 
-    __slots__ = ("sec", "yes_bid", "no_bid", "strike", "k_spot", "cb_spot")
+    __slots__ = ("sec", "yes_bid", "no_bid", "strike", "spot")
 
     def __init__(self) -> None:
         self.sec: List[float] = []
         self.yes_bid: List[int] = []
         self.no_bid: List[int] = []
         self.strike: List[Optional[float]] = []
-        self.k_spot: List[Optional[float]] = []
-        self.cb_spot: List[Optional[float]] = []
+        self.spot: List[Optional[float]] = []
 
     def append(
         self,
@@ -43,15 +42,13 @@ class TickTracker:
         yes_bid: int,
         no_bid: int,
         strike: Optional[float],
-        k_spot: Optional[float],
-        cb_spot: Optional[float],
+        spot: Optional[float],
     ) -> None:
         self.sec.append(sec)
         self.yes_bid.append(yes_bid)
         self.no_bid.append(no_bid)
         self.strike.append(strike)
-        self.k_spot.append(k_spot)
-        self.cb_spot.append(cb_spot)
+        self.spot.append(spot)
 
     def to_dict(self) -> Dict[str, List[Any]]:
         """Serialize to a dict suitable for JSON (one key per column, lists)."""
@@ -60,8 +57,7 @@ class TickTracker:
             "yes_bid": list(self.yes_bid),
             "no_bid": list(self.no_bid),
             "strike": list(self.strike),
-            "k_spot": list(self.k_spot),
-            "cb_spot": list(self.cb_spot),
+            "spot": list(self.spot),
         }
 
     def __len__(self) -> int:
@@ -114,8 +110,7 @@ class TickLogger:
         yes_bid: int,
         no_bid: int,
         strike: Optional[float] = None,
-        k_spot: Optional[float] = None,
-        cb_spot: Optional[float] = None,
+        spot: Optional[float] = None,
     ) -> None:
         """
         Append one tick for (window_id, asset). Call every second from the pipeline.
@@ -126,8 +121,7 @@ class TickLogger:
             yes_bid=int(yes_bid),
             no_bid=int(no_bid),
             strike=float(strike) if strike is not None else None,
-            k_spot=float(k_spot) if k_spot is not None else None,
-            cb_spot=float(cb_spot) if cb_spot is not None else None,
+            spot=float(spot) if spot is not None else None,
         )
 
     def flush_window(self, window_id: str) -> int:

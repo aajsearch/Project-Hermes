@@ -9,7 +9,7 @@ Export last 48 hours of last_90s_limit_99 telemetry to CSV for distance buffer a
 
 Columns in CSV:
   id, window_id, asset, placed, seconds_to_close, bid, distance, reason,
-  yes_bid, no_bid, yes_ask, no_ask, spot_kraken,   (from pre_data)
+  yes_bid, no_bid, yes_ask, no_ask, spot,   (from pre_data: "spot" or legacy "spot_kraken"/"spot_cb")
   min_bid_cents_cfg, min_distance_at_placement_cfg,   (current config for that asset)
   pre_data, timestamp
 
@@ -122,7 +122,7 @@ def main() -> int:
         r["no_bid"] = no_bid
         r["yes_ask"] = quote.get("yes_ask")
         r["no_ask"] = quote.get("no_ask")
-        r["spot_kraken"] = pre.get("spot_kraken")
+        r["spot"] = pre.get("spot") or pre.get("spot_cb") or pre.get("spot_kraken")
         r["min_bid_cents_cfg"] = min_bid_cents_cfg.get(asset, 95) if isinstance(min_bid_cents_cfg, dict) else min_bid_cents_cfg
         r["min_distance_at_placement_cfg"] = min_dist_cfg.get(asset)
 
@@ -132,7 +132,7 @@ def main() -> int:
     # CSV column order: table cols first, then derived, then pre_data, timestamp
     fieldnames = [
         "id", "window_id", "asset", "placed", "seconds_to_close", "bid", "distance", "reason",
-        "yes_bid", "no_bid", "yes_ask", "no_ask", "spot_kraken",
+        "yes_bid", "no_bid", "yes_ask", "no_ask", "spot",
         "min_bid_cents_cfg", "min_distance_at_placement_cfg",
         "pre_data", "timestamp",
     ]

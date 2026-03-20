@@ -13,17 +13,6 @@ from bot.pipeline.context import WindowContext
 
 logger = logging.getLogger(__name__)
 
-# Divergence sanity zones: if |spot_kraken - spot_coinbase| <= zone, use average distance; else use MIN (safety).
-SANITY_ZONES: Dict[str, float] = {
-    "btc": 30.0,
-    "eth": 2.0,
-    "sol": 0.10,
-    "xrp": 0.002,
-}
-# Assets that always use MIN(oracle distances) for entry — no average. Used by last_90s distance gate.
-DISTANCE_USE_MIN_FOR_ASSETS: frozenset = frozenset({"btc"})
-
-
 def _is_year_like(value: float) -> bool:
     """Reject values that look like years (e.g. 2026 from dates)."""
     return 2020 <= value <= 2035
@@ -224,15 +213,14 @@ def _extract_strike_from_market(market_data: Dict[str, Any]) -> Tuple[Optional[f
 class DataLayer:
     """
     Builds WindowContext per (interval, asset) per tick.
-    Caches strike per window_id; fetches spot (Kraken/Coinbase) via placeholder until Data Bus/REST hooked.
+    Single spot source (Coinbase). To use Kraken, change _get_spot_price to read from Kraken WS/REST and set spot from there.
     """
 
-    _strike_cache: Dict[str, float] = {}  # window_id -> strike (class-level, shared across instances)
-    _strike_source_cache: Dict[str, str] = {}  # window_id -> source (only when strike is cached)
-    _last_spot_source: str = "?"  # "WS" or "REST" after last _get_spot_prices call
-    _last_spot_kraken_age_s: Optional[float] = None
-    _last_spot_cb_age_s: Optional[float] = None
-    _last_window_id: Optional[str] = None  # for transition detection in run_unified
+    _strike_cache: Dict[str, float] = {}
+    _strike_source_cache: Dict[str, str] = {}
+    _last_spot_source: str = "?"
+    _last_spot_age_s: Optional[float] = None
+    _last_window_id: Optional[str] = None
 
     def __init__(self, kalshi_client: Any = None) -> None:
         self._kalshi_client = kalshi_client
@@ -292,80 +280,47 @@ class DataLayer:
             )
         return (extracted_strike, source)
 
-    def _get_spot_prices(self, asset: str) -> Tuple[Optional[float], Optional[float]]:
+    def _get_spot_price(self, asset: str) -> Tuple[Optional[float], str, Optional[float]]:
         """
-        Return (kraken_price, coinbase_price) for the given asset.
-        Uses Oracle WS (get_safe_spot_prices_sync) when available, else Kraken/Coinbase REST.
+        Return (spot_price, source, age_s) for the given asset. Single source (Coinbase).
+        To switch to Kraken: feed "spot" from Kraken WS in oracle_ws_manager and add Kraken REST fallback here.
         """
         a = (asset or "").strip().upper() or "BTC"
-        kraken_price: Optional[float] = None
-        coinbase_price: Optional[float] = None
+        spot: Optional[float] = None
         self._last_spot_source = "REST"
+        self._last_spot_age_s = None
         try:
             from bot.oracle_ws_manager import get_safe_spot_prices_sync, is_ws_running
             if is_ws_running():
-                ws_spot = get_safe_spot_prices_sync(asset, max_age_seconds=3.0, require_both=True)
+                ws_spot = get_safe_spot_prices_sync(asset, max_age_seconds=3.0)
                 if ws_spot:
-                    kraken_price = ws_spot.get("kraken")
-                    coinbase_price = ws_spot.get("cb")
-                    if kraken_price is not None or coinbase_price is not None:
+                    spot = ws_spot.get("spot")
+                    spot_ts = ws_spot.get("spot_ts")
+                    if spot is not None:
                         self._last_spot_source = "WS"
-                        now = time.time()
-                        k_ts = ws_spot.get("kraken_ts")
-                        cb_ts = ws_spot.get("cb_ts")
-                        k_age = (now - k_ts) if k_ts is not None else None
-                        cb_age = (now - cb_ts) if cb_ts is not None else None
-                        self._last_spot_kraken_age_s = k_age
-                        self._last_spot_cb_age_s = cb_age
-                        logger.debug(
-                            "[spot] WS available for %s: K=%s (age=%.1fs), CB=%s (age=%.1fs)",
-                            asset, kraken_price, k_age or 999.0, coinbase_price, cb_age or 999.0,
-                        )
-                else:
-                    self._last_spot_kraken_age_s = None
-                    self._last_spot_cb_age_s = None
-                    logger.info("[spot] WS miss for %s (need both K and CB <3s) — using REST", asset)
-            else:
-                self._last_spot_kraken_age_s = None
-                self._last_spot_cb_age_s = None
-                logger.info("[spot] Oracle WS not running for %s — using REST", asset)
+                        self._last_spot_age_s = (time.time() - spot_ts) if spot_ts is not None else None
+                        logger.debug("[spot] WS for %s: %.4f (age=%.1fs)", asset, spot, self._last_spot_age_s or 999.0)
+                if spot is None:
+                    logger.debug("[spot] WS miss for %s — using REST", asset)
         except Exception as e:
-            self._last_spot_kraken_age_s = None
-            self._last_spot_cb_age_s = None
             logger.debug("Oracle WS spot read failed for %s: %s", asset, e)
-        if kraken_price is None or coinbase_price is None:
+        if spot is None:
+            symbol = f"{a}-USD" if a in ("BTC", "ETH", "SOL", "XRP") else "BTC-USD"
             try:
-                from src.client.kraken_client import KrakenClient
-                client = KrakenClient()
-                if a == "ETH":
-                    p = client.latest_eth_price()
-                elif a == "SOL":
-                    p = client.latest_sol_price()
-                elif a == "XRP":
-                    p = client.latest_xrp_price()
-                else:
-                    p = client.latest_btc_price()
-                if p is not None and getattr(p, "price", None) is not None:
-                    kraken_price = float(p.price) if kraken_price is None else kraken_price
+                import urllib.request
+                with urllib.request.urlopen(
+                    f"https://api.coinbase.com/v2/prices/{symbol}/spot",
+                    timeout=2,
+                ) as resp:
+                    if resp.status == 200:
+                        import json
+                        data = json.loads(resp.read().decode())
+                        amount = (data or {}).get("data", {}).get("amount")
+                        if amount is not None:
+                            spot = float(amount)
             except Exception as e:
-                logger.debug("Kraken REST spot failed for %s: %s", asset, e)
-            if coinbase_price is None:
-                symbol = f"{a}-USD" if a in ("BTC", "ETH", "SOL", "XRP") else "BTC-USD"
-                try:
-                    import urllib.request
-                    with urllib.request.urlopen(
-                        f"https://api.coinbase.com/v2/prices/{symbol}/spot",
-                        timeout=2,
-                    ) as resp:
-                        if resp.status == 200:
-                            import json
-                            data = json.loads(resp.read().decode())
-                            amount = (data or {}).get("data", {}).get("amount")
-                            if amount is not None:
-                                coinbase_price = float(amount)
-                except Exception as e:
-                    logger.debug("Coinbase REST spot failed for %s: %s", asset, e)
-        return (kraken_price, coinbase_price)
+                logger.debug("Coinbase REST spot failed for %s: %s", asset, e)
+        return (spot, self._last_spot_source, self._last_spot_age_s)
 
     def build_context(
         self,
@@ -381,13 +336,12 @@ class DataLayer:
         market_data: Dict[str, Any],
     ) -> WindowContext:
         """
-        Build a WindowContext for the current tick: resolve spot, strike (cached), and distances.
+        Build a WindowContext for the current tick: single spot (Coinbase), distance = abs(spot - strike).
         """
-        kraken_price, coinbase_price = self._get_spot_prices(asset)
+        spot_price, spot_source, spot_age_s = self._get_spot_price(asset)
         window_id = f"{interval}_{market_id}"
         strike, strike_source = self._get_or_fetch_strike(window_id, market_data)
 
-        # Normalize quote to ints (cents)
         quote_normalized: Dict[str, int] = {
             "yes_bid": int(quote.get("yes_bid", 0) or 0),
             "yes_ask": int(quote.get("yes_ask", 0) or 0),
@@ -395,28 +349,9 @@ class DataLayer:
             "no_ask": int(quote.get("no_ask", 0) or 0),
         }
 
-        # Distance from strike (absolute). Compute both MIN and AVG; use:
-        # - Entry distance: AVG for all assets except BTC (which stays on MIN, as tuned).
-        # - Exit / stop-loss distance: strategies recompute MIN from distance_kraken/coinbase.
-        distance_kraken: Optional[float] = None
-        distance_coinbase: Optional[float] = None
-        if strike is not None:
-            if kraken_price is not None:
-                distance_kraken = abs(kraken_price - strike)
-            if coinbase_price is not None:
-                distance_coinbase = abs(coinbase_price - strike)
-        if distance_kraken is not None and distance_coinbase is not None:
-            asset_lower = (asset or "").strip().lower()
-            distance_min = min(distance_kraken, distance_coinbase)
-            distance_avg = (distance_kraken + distance_coinbase) / 2.0
-            if asset_lower in DISTANCE_USE_MIN_FOR_ASSETS:
-                # BTC (and any other assets we explicitly configure) keep using MIN for entry distance.
-                distance = distance_min
-            else:
-                # All other assets use AVG distance for entry logic.
-                distance = distance_avg
-        else:
-            distance = distance_kraken if distance_coinbase is None else distance_coinbase
+        distance: Optional[float] = None
+        if strike is not None and spot_price is not None:
+            distance = abs(spot_price - strike)
 
         return WindowContext(
             interval=interval,
@@ -425,15 +360,11 @@ class DataLayer:
             asset=asset,
             seconds_to_close=seconds_to_close,
             quote=quote_normalized,
-            spot_kraken=kraken_price,
-            spot_coinbase=coinbase_price,
-            spot_source=self._last_spot_source,
-            spot_kraken_age_s=self._last_spot_kraken_age_s,
-            spot_coinbase_age_s=self._last_spot_cb_age_s,
+            spot=spot_price,
+            spot_source=spot_source,
+            spot_age_s=spot_age_s,
             strike=strike,
             strike_source=strike_source,
-            distance_kraken=distance_kraken,
-            distance_coinbase=distance_coinbase,
             distance=distance,
             positions=positions,
             open_orders=open_orders,

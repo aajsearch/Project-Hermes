@@ -1,17 +1,13 @@
 """
-WebSocket Spot Oracles for HFT: Kraken + Coinbase.
+WebSocket Spot Oracle for Bot V2: single source (Coinbase).
 
-Maintains global_spot_prices updated in real time via WebSockets (no blocking REST).
-Provides get_safe_spot_prices_sync() for the last_90s strategy with stale-data guard.
+Maintains global_spot_prices updated in real time via WebSocket (no blocking REST).
+Provides get_safe_spot_prices_sync() for strategies with stale-data guard.
 
-Alignment with common sample code:
-- Kraken: Aligned. Same URL (wss://ws.kraken.com), same subscribe format
-  (event/subscribe, subscription.name=ticker, pair=[XBT/USD, ETH/USD, SOL/USD, XRP/USD]).
-  Ticker message: [channelID, ticker_obj, pair, channel_name]; we use data[2]=pair, data[1]["c"][0]=last price.
-- Coinbase: Two feeds exist. We default to Exchange feed (ws-feed.exchange.coinbase.com,
-  type/subscribe, channels=["ticker"], message type=ticker with price/product_id). Set
-  COINBASE_WS_FEED=advanced_trade to use Advanced Trade (wss://advanced-trade-ws.coinbase.com,
-  channel=ticker, message format events[0].tickers[0].price / product_id) to match sample.
+Design: We use a single "spot" key so that swapping to another provider (e.g. Kraken)
+later only requires changing which WS loop feeds "spot" and which REST fallback is used.
+- Coinbase: Exchange feed (ws-feed.exchange.coinbase.com) or set COINBASE_WS_FEED=advanced_trade
+  for Advanced Trade (wss://advanced-trade-ws.coinbase.com).
 """
 from __future__ import annotations
 
@@ -40,18 +36,14 @@ def _ws_ssl_context() -> ssl.SSLContext:
 
 
 # --- Global state (thread-safe) ---
-# Structure: global_spot_prices['BTC'] = {'kraken': 71000.5, 'kraken_ts': 170000000.1, 'cb': 71002.0, 'cb_ts': 170000000.2}
+# Single source: global_spot_prices['btc'] = {'spot': 71000.5, 'spot_ts': 170000000.1}
+# Using "spot" (not "cb") so swapping provider (e.g. Kraken) only changes which WS feeds it.
 _global_spot_prices: Dict[str, Dict[str, Any]] = {}
-# RLock: _set_kraken_price / _set_cb_price hold the lock and call _ensure_asset_entry which also acquires it.
 _lock = threading.RLock()
-# One-time log per (asset, source) when first price received (so we can verify WS is feeding).
-_first_kraken_logged: set = set()
-_first_cb_logged: set = set()
+_first_spot_logged: set = set()
 _loop: Optional[asyncio.AbstractEventLoop] = None
 _ws_task: Optional[threading.Thread] = None
 _ws_running = False
-# Hold ws refs so stop() can close them and unblock async for
-_kraken_ws: Any = None
 _cb_ws: Any = None
 
 
@@ -61,22 +53,10 @@ class StaleOracleDataException(Exception):
     pass
 
 
-# Subscription targets (used by WS loops; exposed for tests)
-KRAKEN_TICKER_PAIRS = ["XBT/USD", "ETH/USD", "SOL/USD", "XRP/USD"]
+# Subscription targets (Coinbase; exposed for tests). To add Kraken later, add KRAKEN_* and a second WS loop.
 COINBASE_TICKER_PRODUCTS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
 WS_ASSET_KEYS = ["BTC", "ETH", "SOL", "XRP"]
-
-KRAKEN_PAIR_TO_ASSET = {"XBT/USD": "BTC", "ETH/USD": "ETH", "SOL/USD": "SOL", "XRP/USD": "XRP"}
 COINBASE_PRODUCT_TO_ASSET = {"BTC-USD": "BTC", "ETH-USD": "ETH", "SOL-USD": "SOL", "XRP-USD": "XRP"}
-
-
-def _asset_to_kraken_pair(asset: str) -> str:
-    a = (asset or "").strip().upper()
-    if a == "BTC":
-        return "XBT/USD"
-    if a in ("ETH", "SOL", "XRP"):
-        return f"{a}/USD"
-    return "XBT/USD"
 
 
 def _asset_to_coinbase_product(asset: str) -> str:
@@ -91,39 +71,19 @@ def _asset_to_coinbase_product(asset: str) -> str:
 def _ensure_asset_entry(asset_key: str) -> None:
     with _lock:
         if asset_key not in _global_spot_prices:
-            _global_spot_prices[asset_key] = {
-                "kraken": None,
-                "kraken_ts": None,
-                "cb": None,
-                "cb_ts": None,
-            }
+            _global_spot_prices[asset_key] = {"spot": None, "spot_ts": None}
 
 
-def _set_kraken_price(asset_key: str, price: float) -> None:
+def _set_spot_price(asset_key: str, price: float) -> None:
+    """Set the single spot price (currently from Coinbase WS). Swap provider by feeding from another WS."""
     key = (asset_key or "").strip().lower() or "btc"
     with _lock:
         _ensure_asset_entry(key)
-        _global_spot_prices[key]["kraken"] = price
-        _global_spot_prices[key]["kraken_ts"] = time.time()
-        if key not in _first_kraken_logged:
-            _first_kraken_logged.add(key)
-            logger.info("[oracle_ws] First Kraken price received for %s: %s", key, price)
-    try:
-        import bot.data_bus as data_bus
-        data_bus.write_spot(key, price)
-    except Exception:
-        pass
-
-
-def _set_cb_price(asset_key: str, price: float) -> None:
-    key = (asset_key or "").strip().lower() or "btc"
-    with _lock:
-        _ensure_asset_entry(key)
-        _global_spot_prices[key]["cb"] = price
-        _global_spot_prices[key]["cb_ts"] = time.time()
-        if key not in _first_cb_logged:
-            _first_cb_logged.add(key)
-            logger.info("[oracle_ws] First Coinbase price received for %s: %s", key, price)
+        _global_spot_prices[key]["spot"] = price
+        _global_spot_prices[key]["spot_ts"] = time.time()
+        if key not in _first_spot_logged:
+            _first_spot_logged.add(key)
+            logger.info("[oracle_ws] First spot price received for %s: %s", key, price)
     try:
         import bot.data_bus as data_bus
         data_bus.write_spot(key, price)
@@ -136,13 +96,7 @@ def get_safe_spot_prices_sync(
 ) -> Optional[Dict[str, Any]]:
     """
     Synchronous read for the strategy thread. Returns current spot data for the asset.
-
-    - If require_both=True (default False for last_90s): returns data only when BOTH
-      Kraken and Coinbase have data newer than max_age_seconds; otherwise None.
-    - If require_both=False: returns data when AT LEAST ONE oracle has fresh data;
-      the other key may be None (caller uses min(distance_kraken, distance_coinbase)
-      or the single available distance). Reduces no-oracle-data skips when one feed
-      is slow or disconnected.
+    Single source: keys "spot" and "spot_ts". require_both is ignored (kept for API compat).
     """
     asset_key = (asset or "").strip().lower() or "btc"
     with _lock:
@@ -150,27 +104,13 @@ def get_safe_spot_prices_sync(
     if not entry:
         return None
     now = time.time()
-    k_ts = entry.get("kraken_ts")
-    cb_ts = entry.get("cb_ts")
-    k = entry.get("kraken")
-    cb = entry.get("cb")
-
-    k_fresh = k is not None and k_ts is not None and (now - k_ts) <= max_age_seconds
-    cb_fresh = cb is not None and cb_ts is not None and (now - cb_ts) <= max_age_seconds
-
-    if require_both:
-        if not (k_fresh and cb_fresh):
-            return None
-        return {"kraken": k, "cb": cb, "kraken_ts": k_ts, "cb_ts": cb_ts}
-
-    # At least one fresh
-    if k_fresh and cb_fresh:
-        return {"kraken": k, "cb": cb, "kraken_ts": k_ts, "cb_ts": cb_ts}
-    if k_fresh:
-        return {"kraken": k, "cb": None, "kraken_ts": k_ts, "cb_ts": None}
-    if cb_fresh:
-        return {"kraken": None, "cb": cb, "kraken_ts": None, "cb_ts": cb_ts}
-    return None
+    spot = entry.get("spot")
+    spot_ts = entry.get("spot_ts")
+    if spot is None or spot_ts is None:
+        return None
+    if (now - spot_ts) > max_age_seconds:
+        return None
+    return {"spot": spot, "spot_ts": spot_ts}
 
 
 def is_ws_running() -> bool:
@@ -178,84 +118,18 @@ def is_ws_running() -> bool:
 
 
 def get_ws_status() -> Dict[str, Any]:
-    """
-    Read-only snapshot of current WS state for debugging/health checks.
-    Returns e.g. {"running": True, "assets": {"BTC": {"kraken": 71000.5, "kraken_age_s": 0.1, "cb": 71002.0, "cb_age_s": 0.2}, ...}}
-    """
+    """Read-only snapshot of current WS state. Single source: spot, spot_age_s."""
     now = time.time()
     with _lock:
         assets = {}
         for key, entry in list(_global_spot_prices.items()):
-            k = entry.get("kraken")
-            k_ts = entry.get("kraken_ts")
-            cb = entry.get("cb")
-            cb_ts = entry.get("cb_ts")
+            spot = entry.get("spot")
+            spot_ts = entry.get("spot_ts")
             assets[key] = {
-                "kraken": k,
-                "kraken_age_s": round(now - k_ts, 2) if k_ts is not None else None,
-                "cb": cb,
-                "cb_age_s": round(now - cb_ts, 2) if cb_ts is not None else None,
+                "spot": spot,
+                "spot_age_s": round(now - spot_ts, 2) if spot_ts is not None else None,
             }
     return {"running": _ws_running, "assets": assets}
-
-
-async def _kraken_ws_loop() -> None:
-    try:
-        import websockets
-    except ImportError:
-        logger.warning("[oracle_ws] websockets package not installed; run pip install websockets. WS oracles disabled.")
-        return
-    pairs = KRAKEN_TICKER_PAIRS
-    asset_map = KRAKEN_PAIR_TO_ASSET
-    url = "wss://ws.kraken.com"
-    backoff = 1.0
-    global _kraken_ws
-    while True:
-        try:
-            async with websockets.connect(
-                url, ping_interval=20, ping_timeout=10, close_timeout=5, ssl=_ws_ssl_context()
-            ) as ws:
-                backoff = 1.0
-                _kraken_ws = ws
-                try:
-                    sub = {"event": "subscribe", "pair": pairs, "subscription": {"name": "ticker"}}
-                    await ws.send(json.dumps(sub))
-                    async for raw in ws:
-                        try:
-                            data = json.loads(raw)
-                        except Exception:
-                            continue
-                        if isinstance(data, dict):
-                            if data.get("event") == "heartbeat":
-                                continue
-                            if data.get("status") == "subscribed":
-                                continue
-                        if isinstance(data, list) and len(data) >= 4:
-                            # Kraken ticker: [channelID, tickerObj, channelName, pair] e.g. [324, {...}, "ticker", "XBT/USD"]
-                            try:
-                                pair = data[3]
-                                ticker = data[1] if isinstance(data[1], dict) else None
-                                if pair and ticker and isinstance(ticker, dict):
-                                    c = ticker.get("c")
-                                    if c and isinstance(c, (list, tuple)) and len(c) >= 1:
-                                        try:
-                                            price = float(c[0])
-                                        except (TypeError, ValueError):
-                                            continue
-                                        asset_key = asset_map.get(pair, "BTC")
-                                        _set_kraken_price(asset_key, price)
-                            except Exception as inner_e:
-                                logger.error("[oracle_ws] Kraken message processing error: %s; continuing", inner_e)
-                                continue
-                finally:
-                    _kraken_ws = None
-        except Exception as e:
-            logger.error(f"[Oracle FATAL] Kraken connection failed: {e}", exc_info=True)
-            await asyncio.sleep(max(backoff, 5))
-            backoff = min(backoff * 1.5, 60.0)
-            continue
-        await asyncio.sleep(backoff)
-        backoff = min(backoff * 1.5, 60.0)
 
 
 def _coinbase_ws_url_and_channel_key() -> tuple[str, str]:
@@ -281,6 +155,8 @@ async def _coinbase_ws_loop() -> None:
             async with websockets.connect(
                 url, ping_interval=20, ping_timeout=10, close_timeout=5, ssl=_ws_ssl_context()
             ) as ws:
+                if backoff > 1.0:
+                    logger.info("[oracle_ws] Coinbase reconnected.")
                 backoff = 1.0
                 _cb_ws = ws
                 try:
@@ -320,14 +196,18 @@ async def _coinbase_ws_loop() -> None:
                                 except (TypeError, ValueError):
                                     continue
                                 asset_key = asset_map.get(product, "BTC")
-                                _set_cb_price(asset_key, price)
+                                _set_spot_price(asset_key, price)
                         except Exception as inner_e:
                             logger.error("[oracle_ws] Coinbase message processing error: %s; continuing", inner_e)
                             continue
                 finally:
                     _cb_ws = None
         except Exception as e:
-            logger.error(f"[Oracle FATAL] Coinbase connection failed: {e}", exc_info=True)
+            logger.warning(
+                "[oracle_ws] Coinbase connection lost (%s); reconnecting in %.0fs...",
+                e,
+                max(backoff, 5),
+            )
             await asyncio.sleep(max(backoff, 5))
             backoff = min(backoff * 1.5, 60.0)
             continue
@@ -336,27 +216,26 @@ async def _coinbase_ws_loop() -> None:
 
 
 async def _close_oracle_connections() -> None:
-    """Close both Kraken and Coinbase ws so run_until_complete can exit. Call from loop thread."""
-    global _kraken_ws, _cb_ws
-    for w in [_kraken_ws, _cb_ws]:
-        if w is not None:
-            try:
-                await w.close()
-            except Exception:
-                pass
-    _kraken_ws = None
+    """Close WebSocket so run_until_complete can exit. Call from loop thread."""
+    global _cb_ws
+    if _cb_ws is not None:
+        try:
+            await _cb_ws.close()
+        except Exception:
+            pass
     _cb_ws = None
 
 
-async def _run_both() -> None:
-    await asyncio.gather(_kraken_ws_loop(), _coinbase_ws_loop())
+async def _run_ws_loop() -> None:
+    """Run the single spot oracle (Coinbase). To use Kraken, swap to _kraken_ws_loop or run both and set spot from preferred source."""
+    await _coinbase_ws_loop()
 
 
 def _run_loop_in_thread(loop: asyncio.AbstractEventLoop) -> None:
     global _ws_running
     _ws_running = True
     try:
-        loop.run_until_complete(_run_both())
+        loop.run_until_complete(_run_ws_loop())
     except Exception as e:
         logger.exception("[oracle_ws] WS thread crashed: %s", e)
     finally:
@@ -364,29 +243,29 @@ def _run_loop_in_thread(loop: asyncio.AbstractEventLoop) -> None:
 
 
 def start_ws_oracles() -> None:
-    """Start Kraken + Coinbase WebSocket oracles in a background thread. Idempotent."""
+    """Start the spot WebSocket oracle (Coinbase) in a background thread. Idempotent."""
     global _loop, _ws_task
     logger.info("[oracle_ws] start_ws_oracles() entered.")
     if _loop is not None and _ws_task is not None:
-        logger.info("[oracle_ws] WebSocket oracles already running; skipping start.")
+        logger.info("[oracle_ws] WebSocket oracle already running; skipping start.")
         return
     try:
         import websockets
     except ImportError:
-        logger.warning("[oracle_ws] websockets not installed; pip install websockets. WS oracles disabled.")
+        logger.warning("[oracle_ws] websockets not installed; pip install websockets. WS oracle disabled.")
         return
     try:
         _loop = asyncio.new_event_loop()
         _ws_task = threading.Thread(target=_run_loop_in_thread, args=(_loop,), daemon=True)
         _ws_task.start()
-        logger.info("[oracle_ws] WebSocket spot oracles (Kraken + Coinbase) started.")
+        logger.info("[oracle_ws] WebSocket spot oracle (Coinbase) started.")
     except Exception as e:
-        logger.exception("[oracle_ws] Failed to start WS oracles: %s", e)
+        logger.exception("[oracle_ws] Failed to start WS oracle: %s", e)
         _loop, _ws_task = None, None
 
 
 def stop_ws_oracles() -> None:
-    """Stop the WebSocket oracles: close connections and join the thread (prevents zombie processes)."""
+    """Stop the WebSocket oracle: close connection and join the thread (prevents zombie processes)."""
     global _loop, _ws_task
     if _loop is None:
         return

@@ -453,7 +453,10 @@ class PipelineExecutor:
                                 pnl_cents = (exit_price_cents - entry_price) * sell_count
                             outcome = "win" if exit_action.action == EXIT_ACTION_TAKE_PROFIT else "loss"
                             is_stop_loss = 0 if exit_action.action == EXIT_ACTION_TAKE_PROFIT else 1
-                            window_id = f"{entry_record.interval}_{entry_record.market_id}"
+                            # Use logical slot so window_id matches tick_log/telemetry and is queryable by slot (e.g. 26MAR180100).
+                            from bot.pipeline.window_utils import logical_window_slot
+                            slot = logical_window_slot(entry_record.market_id or "")
+                            window_id = f"{entry_record.interval}_{slot}"
                             self._registry.record_trade_outcome(
                                 order_id=exit_action.order_id,
                                 strategy_id=entry_record.strategy_id,
@@ -743,6 +746,7 @@ class PipelineExecutor:
                 limit_price_cents=intent.price_cents if intent.order_type == "limit" else None,
                 client_order_id=intent.client_order_id,
                 placement_bid_cents=getattr(intent, "placement_bid_cents", None),
+                entry_distance=getattr(intent, "entry_distance", None),
             )
             logger.info(
                 "[EXECUTION] Order PLACED on Kalshi — order_id=%s ticker=%s side=%s count=%s price_cents=%s (check Kalshi app/website to verify)",

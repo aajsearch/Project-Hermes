@@ -10,6 +10,7 @@ import os
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import List
 
 from dotenv import load_dotenv
@@ -27,11 +28,33 @@ from bot.pipeline.strategies.knife_catcher import KnifeCatcherStrategy
 from bot.pipeline.strategies.last_90s import Last90sStrategy
 from bot.v2_config_loader import load_v2_config
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    stream=sys.stdout,
-)
+
+def _configure_logging() -> None:
+    """
+    Log to both stdout and a persistent file (append across restarts).
+    File path: data/console.log
+    """
+    log_path = Path(__file__).resolve().parents[1] / "data" / "console.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+
+    # Avoid duplicate handlers if main() is invoked multiple times in-process.
+    if getattr(root, "_v2_handlers_configured", False):
+        return
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+
+    fh = logging.FileHandler(str(log_path), mode="a", encoding="utf-8")
+    fh.setFormatter(fmt)
+
+    root.handlers = [sh, fh]
+    setattr(root, "_v2_handlers_configured", True)
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -46,6 +69,7 @@ def _resolve_dry_run(config: dict) -> bool:
 
 
 def main() -> None:
+    _configure_logging()
     load_dotenv()
     logger.info("Environment variables loaded.")
 
@@ -67,12 +91,12 @@ def main() -> None:
     registry = OrderRegistry()
     data_layer = DataLayer(kalshi_client=kalshi_client)
 
-    # Start Kraken + Coinbase WebSocket oracles so pipeline can use spot=WS when data is fresh
+    # Start spot oracle WebSocket (single source: Coinbase) so pipeline can use spot=WS when data is fresh
     try:
         from bot.oracle_ws_manager import start_ws_oracles
         start_ws_oracles()
     except Exception as e:
-        logger.debug("Oracle WS oracles not started: %s", e)
+        logger.debug("Oracle WS not started: %s", e)
     aggregator = OrderAggregator()
     executor = PipelineExecutor(registry, dry_run=dry_run, kalshi_client=kalshi_client)
     tick_logger = TickLogger()

@@ -30,16 +30,13 @@ class WindowContext:
     asset: str
     seconds_to_close: float
     quote: Dict[str, int] = field(default_factory=_default_quote)  # yes_bid, yes_ask, no_bid, no_ask (cents)
-    spot_kraken: float | None = None
-    spot_coinbase: float | None = None
-    spot_source: str = "?"  # "WS" (oracle WebSocket) or "REST" (Kraken/Coinbase REST)
-    spot_kraken_age_s: float | None = None  # seconds since last WS update (only set when spot_source=WS)
-    spot_coinbase_age_s: float | None = None
+    # Single spot source (provider-agnostic: currently Coinbase; swap to Kraken by changing data layer + oracle).
+    spot: float | None = None
+    spot_source: str = "?"  # "WS" (oracle WebSocket) or "REST"
+    spot_age_s: float | None = None  # seconds since last update (when spot_source=WS)
     strike: float | None = None
     strike_source: str | None = None  # "api_fields", "subtitle", "title", or "ticker"
-    distance_kraken: float | None = None
-    distance_coinbase: float | None = None
-    distance: float | None = None  # conservative (e.g. min of kraken/coinbase when both present)
+    distance: float | None = None  # abs(spot - strike) from the single spot source
     positions: List[Dict[str, Any]] = field(default_factory=list)  # [{ticker, side, count, entry_price_cents}, ...]
     open_orders: List[Any] = field(default_factory=list)
     config: Dict[str, Any] = field(default_factory=dict)

@@ -29,5 +29,8 @@ pydantic>=2.0
 # --- Optional: Coinbase Advanced Trade (coinbase_grid_bot) ---
 coinbase-advanced-py>=1.8.0
 
+# --- Alpaca (options trading, Phase-1 runtime) ---
+alpaca-py>=0.43.2
+
 # --- Tests ---
 pytest>=7.0

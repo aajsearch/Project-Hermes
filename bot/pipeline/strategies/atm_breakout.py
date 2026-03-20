@@ -1,13 +1,13 @@
 """
 V2 port of atm_breakout_strategy: directional breakout when market is coiled (parity) and momentum triggers.
-Momentum is based on underlying spot price change (Smart Average of Kraken/Coinbase) over the 3s history window.
+Momentum is based on underlying spot price change (single oracle, currently Coinbase) over the 3s history window.
 Exit: simple take_profit_cents / stop_loss_cents (no trailing stop).
 
 Entry criteria (all must hold):
   1. Time: min_seconds_to_close <= seconds_to_close <= max_seconds_to_close (e.g. 120–840s).
   2. Coil: yes_ask and no_ask both in [min_price_parity, max_price_parity] (e.g. [45, 55]).
   3. Spread: abs(yes_bid - no_bid) <= max_price_parity.
-  4. Spot: current_spot (Smart Avg of Kraken/Coinbase) available.
+  4. Spot: current_spot (single oracle) available.
   5. Momentum: |current_spot - prev_spot| >= threshold over last N seconds; direction sets momentum (up/down).
   6. Position vs strike: trade only when position and momentum agree:
        - (spot > strike) AND (momentum is UP)   -> BUY YES
@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional
 from bot.pipeline.context import WindowContext
 from bot.pipeline.intents import ExitAction, OrderIntent, OrderRecord
 from bot.pipeline.strategies.base import BaseV2Strategy
+from bot.pipeline.window_utils import logical_window_slot
 
 logger = logging.getLogger(__name__)
 
@@ -75,19 +76,8 @@ def _window_id(ctx: WindowContext) -> str:
 
 
 def _current_spot(ctx: WindowContext) -> float | None:
-    """
-    Single spot used for both momentum (up_move/down_move) and spot-vs-strike (YES/NO).
-    Smart Average: (Kraken + Coinbase) / 2 when both present; else whichever is available.
-    """
-    k = ctx.spot_kraken
-    c = ctx.spot_coinbase
-    if k is not None and c is not None:
-        return (k + c) / 2.0
-    if k is not None:
-        return float(k)
-    if c is not None:
-        return float(c)
-    return None
+    """Single spot from the sole oracle (used for momentum and spot-vs-strike)."""
+    return float(ctx.spot) if ctx.spot is not None else None
 
 
 class AtmBreakoutStrategy(BaseV2Strategy):
@@ -132,25 +122,22 @@ class AtmBreakoutStrategy(BaseV2Strategy):
         pre_data = json.dumps(
             {
                 "quote": dict(ctx.quote),
-                "spot_kraken": ctx.spot_kraken,
-                "spot_coinbase": ctx.spot_coinbase,
-                "distance_kraken": ctx.distance_kraken,
-                "distance_coinbase": ctx.distance_coinbase,
+                "spot": ctx.spot,
                 "ref_spot": ref_spot,
                 "momentum_delta": momentum_delta,
                 "seconds_to_close": seconds_to_close,
                 "distance_buffer": distance_buffer,
-                # New: timestamps and configured window so we can audit the lookback interval.
                 "ref_spot_ts": ref_spot_ts,
                 "current_spot_ts": current_spot_ts,
                 "momentum_window_seconds": momentum_window_seconds,
             }
         )
-        window_id = f"{ctx.interval}_{ctx.market_id}"
+        # Use logical slot so window_id matches tick_log and is queryable by slot (e.g. 26MAR180100).
+        slot = logical_window_slot(ctx.market_id or "")
+        window_id = f"{ctx.interval}_{slot}"
         asset_str = (ctx.asset or "").strip().lower()
         strike = float(ctx.strike) if ctx.strike is not None else -1.0
-        spot_k = float(ctx.spot_kraken) if ctx.spot_kraken is not None else -1.0
-        spot_c = float(ctx.spot_coinbase) if ctx.spot_coinbase is not None else -1.0
+        spot_val = float(ctx.spot) if ctx.spot is not None else -1.0
         distance_raw = ctx.distance
         distance = float(distance_raw) if distance_raw is not None else -1.0
         path = _v2_db_path()
@@ -169,8 +156,8 @@ class AtmBreakoutStrategy(BaseV2Strategy):
                         side,
                         int(entry_price_cents),
                         strike,
-                        spot_k,
-                        spot_c,
+                        spot_val,
+                        spot_val,
                         distance,
                         reason,
                         pre_data,

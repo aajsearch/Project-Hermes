@@ -1,8 +1,8 @@
 """
-Unit and integration tests for WebSocket oracle implementation.
+Unit and integration tests for WebSocket oracle implementation (single source: Coinbase).
 
 Verifies:
-- Subscription targets for all assets [btc, eth, sol, xrp] (Kraken pairs + Coinbase products).
+- Subscription targets for all assets [btc, eth, sol, xrp] (Coinbase products).
 - get_ws_status() / get_safe_spot_prices_sync() contract and received prices (integration).
 
 Run live WS tests only when network is available: RUN_ORACLE_WS_LIVE=1 python3 -m unittest tests.test_oracle_ws -v
@@ -18,27 +18,18 @@ EXPECTED_ASSETS = ["BTC", "ETH", "SOL", "XRP"]
 
 
 class TestOracleWsSubscriptionTargets(unittest.TestCase):
-    """Verify implementation subscribes for the correct assets and exchange symbols."""
+    """Verify implementation subscribes for the correct assets and exchange symbols (Coinbase only)."""
 
     def test_implementation_subscribes_all_four_assets(self):
         from bot.oracle_ws_manager import (
             COINBASE_TICKER_PRODUCTS,
-            KRAKEN_TICKER_PAIRS,
             WS_ASSET_KEYS,
         )
         self.assertEqual(WS_ASSET_KEYS, EXPECTED_ASSETS)
-        self.assertEqual(KRAKEN_TICKER_PAIRS, ["XBT/USD", "ETH/USD", "SOL/USD", "XRP/USD"])
         self.assertEqual(
             COINBASE_TICKER_PRODUCTS,
             ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"],
         )
-
-    def test_kraken_pair_to_asset_mapping(self):
-        from bot.oracle_ws_manager import KRAKEN_PAIR_TO_ASSET
-        self.assertEqual(KRAKEN_PAIR_TO_ASSET["XBT/USD"], "BTC")
-        self.assertEqual(KRAKEN_PAIR_TO_ASSET["ETH/USD"], "ETH")
-        self.assertEqual(KRAKEN_PAIR_TO_ASSET["SOL/USD"], "SOL")
-        self.assertEqual(KRAKEN_PAIR_TO_ASSET["XRP/USD"], "XRP")
 
     def test_coinbase_product_to_asset_mapping(self):
         from bot.oracle_ws_manager import COINBASE_PRODUCT_TO_ASSET
@@ -134,7 +125,7 @@ class TestOracleWsLive(unittest.TestCase):
         )
         start_ws_oracles()
         self.assertTrue(is_ws_running(), "WS oracles should be running")
-        # Wait for at least one tick from both exchanges (often 1–3 s)
+        # Wait for at least one tick (single source: Coinbase)
         deadline = time.monotonic() + 8.0
         while time.monotonic() < deadline:
             status = get_ws_status()
@@ -143,7 +134,7 @@ class TestOracleWsLive(unittest.TestCase):
                 time.sleep(0.5)
                 continue
             have_all = all(
-                assets.get(a) and (assets[a].get("kraken") is not None or assets[a].get("cb") is not None)
+                assets.get(a) and assets[a].get("spot") is not None
                 for a in EXPECTED_ASSETS
             )
             if have_all:
@@ -154,18 +145,10 @@ class TestOracleWsLive(unittest.TestCase):
         for asset in EXPECTED_ASSETS:
             self.assertIn(asset, assets, f"Asset {asset} should appear in WS status")
             entry = assets[asset]
-            kraken_price = entry.get("kraken")
-            cb_price = entry.get("cb")
-            self.assertTrue(
-                kraken_price is not None or cb_price is not None,
-                f"Asset {asset} should have at least one price (kraken={kraken_price}, cb={cb_price})",
-            )
-            if kraken_price is not None:
-                self.assertIsInstance(kraken_price, (int, float))
-                self.assertGreater(kraken_price, 0, f"Kraken price for {asset} should be positive")
-            if cb_price is not None:
-                self.assertIsInstance(cb_price, (int, float))
-                self.assertGreater(cb_price, 0, f"Coinbase price for {asset} should be positive")
+            spot = entry.get("spot")
+            self.assertIsNotNone(spot, f"Asset {asset} should have spot price")
+            self.assertIsInstance(spot, (int, float))
+            self.assertGreater(spot, 0, f"Spot price for {asset} should be positive")
 
     def test_get_safe_spot_prices_after_ws_has_data(self):
         from bot.oracle_ws_manager import (
@@ -178,12 +161,10 @@ class TestOracleWsLive(unittest.TestCase):
         for asset in ["btc", "eth", "sol", "xrp"]:
             out = get_safe_spot_prices_sync(asset, max_age_seconds=5.0)
             if out is not None:
-                self.assertIn("kraken", out)
-                self.assertIn("cb", out)
-                self.assertIsInstance(out["kraken"], (int, float))
-                self.assertIsInstance(out["cb"], (int, float))
-                self.assertGreater(out["kraken"], 0)
-                self.assertGreater(out["cb"], 0)
+                self.assertIn("spot", out)
+                self.assertIn("spot_ts", out)
+                self.assertIsInstance(out["spot"], (int, float))
+                self.assertGreater(out["spot"], 0)
             else:
                 status = get_ws_status()
                 assets = status.get("assets", {})
