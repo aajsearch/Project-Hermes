@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 
 from bot.pipeline.context import WindowContext
 from bot.pipeline.intents import ExitAction, OrderIntent, OrderRecord
+from bot.pipeline.window_utils import logical_window_slot
 from bot.pipeline.strategies.base import BaseV2Strategy
 
 logger = logging.getLogger(__name__)
@@ -92,13 +93,7 @@ def _get_asset_config(value: Any, asset: str, default: Any) -> Any:
 
 
 def _min_spot_distance(ctx: WindowContext) -> Optional[float]:
-    """
-    Compute the minimum spot-to-strike distance using both oracles when available.
-    Falls back to ctx.distance when only one source exists.
-    """
-    candidates = [d for d in (ctx.distance_kraken, ctx.distance_coinbase) if d is not None]
-    if candidates:
-        return min(candidates)
+    """Spot-to-strike distance from the single oracle (currently Coinbase)."""
     return ctx.distance
 
 
@@ -147,13 +142,15 @@ class Last90sStrategy(BaseV2Strategy):
     def _record_telemetry(self, ctx: WindowContext, placed: int, reason: str) -> None:
         """
         Write one row to v2_telemetry_last_90s. All values from ctx only; no hardcoded 50.0, 45.0, or 97.
-        pre_data = JSON of ctx.quote and ctx.spot_kraken.
+        pre_data = JSON of ctx.quote and ctx.spot (single oracle).
         """
         pre_data = json.dumps({
             "quote": dict(ctx.quote),
-            "spot_kraken": ctx.spot_kraken,
+            "spot": ctx.spot,
         })
-        window_id = f"{ctx.interval}_{ctx.market_id}"
+        # Use logical slot so window_id matches tick_log and is queryable by slot (e.g. 26MAR180100).
+        slot = logical_window_slot(ctx.market_id or "")
+        window_id = f"{ctx.interval}_{slot}"
         asset_str = (ctx.asset or "").strip().lower()
         # Dynamic from ctx only; use -1.0 sentinel when missing (never 50.0, 45.0, or 97)
         seconds_to_close_raw = ctx.seconds_to_close
@@ -318,6 +315,8 @@ class Last90sStrategy(BaseV2Strategy):
         self._record_telemetry(ctx, 1, "intent_fired")
         client_order_id = f"last90s:{uuid.uuid4().hex[:12]}"
         # placement_bid_cents = bid at placement; used as entry cost for stop-loss (avoids phantom loss vs limit 99¢).
+        # entry_distance = actual distance at placement; used for trailing stop (distance_decay) so decay is vs real entry, not config minimum.
+        entry_dist = float(ctx.distance) if ctx.distance is not None else None
         return OrderIntent(
             side=side,
             price_cents=limit_price_cents,
@@ -325,6 +324,7 @@ class Last90sStrategy(BaseV2Strategy):
             order_type="limit",
             client_order_id=client_order_id,
             placement_bid_cents=bid_cents,
+            entry_distance=entry_dist,
         )
 
     def evaluate_exit(self, ctx: WindowContext, my_orders: List[OrderRecord]) -> List[ExitAction]:
@@ -343,30 +343,21 @@ class Last90sStrategy(BaseV2Strategy):
             catastrophic_pct = float(catastrophic_loss_pct) / 100.0
         except (TypeError, ValueError):
             catastrophic_pct = 0.25
-        # Reference distance at placement (we required distance >= min_distance_at_placement when placing).
+        # Fallback reference distance from config (for orders placed before entry_distance was stored).
         min_dist_placement = _get_asset_config(cfg.get("min_distance_at_placement"), asset, 0.0)
         try:
-            initial_placement_distance = float(min_dist_placement) if min_dist_placement is not None else 0.0
+            config_reference_distance = float(min_dist_placement) if min_dist_placement is not None else 0.0
         except (TypeError, ValueError):
-            initial_placement_distance = 0.0
-        # Absolute buffer: danger_threshold = initial_placement_distance - stop_loss_absolute_buffer.
-        # Stop-loss fires ONLY if current_min_distance < danger_threshold AND current_loss_pct > stop_loss_pct.
+            config_reference_distance = 0.0
         buffer_raw = _get_asset_config(cfg.get("stop_loss_absolute_buffer"), asset, None)
         try:
             buffer_f = float(buffer_raw) if buffer_raw is not None else None
         except (TypeError, ValueError):
             buffer_f = None
-        if buffer_f is not None and initial_placement_distance is not None:
-            danger_threshold = initial_placement_distance - buffer_f
-        else:
-            # Fallback if stop_loss_absolute_buffer not set (e.g. old config): no distance gate.
-            danger_threshold = None
         distance_min = _min_spot_distance(ctx)
         yes_bid = int(ctx.quote.get("yes_bid", 0) or 0)
         no_bid = int(ctx.quote.get("no_bid", 0) or 0)
-        # Configurable persistence: require normal (non-catastrophic) danger to persist this many seconds before firing (except in last 60s).
         persistence_sec = float(cfg.get("danger_persistence_seconds", 5.0) or 5.0)
-        # Distance decay trailing stop: fire earlier if current distance has given up a fraction of the initial safety cushion.
         distance_decay_pct = float(cfg.get("distance_decay_pct", 0.75) or 0.75)
         sec_to_close = float(ctx.seconds_to_close) if ctx.seconds_to_close is not None else None
         current_time = time.time()
@@ -390,6 +381,21 @@ class Last90sStrategy(BaseV2Strategy):
             current_bid = yes_bid if side == "yes" else no_bid
             loss_pct = (entry_cents - current_bid) / float(entry_cents) if current_bid is not None else 0.0
 
+            # --- Per-order reference distance: actual at fill (trailing stop base) ---
+            entry_dist = getattr(order, "entry_distance_at_fill", None)
+            if entry_dist is None:
+                # Fallback for legacy/older orders where entry_distance_at_fill was never stored.
+                entry_dist = getattr(order, "entry_distance", None)
+            try:
+                reference_distance = float(entry_dist) if entry_dist is not None else config_reference_distance
+            except (TypeError, ValueError):
+                reference_distance = config_reference_distance
+            if reference_distance is not None and reference_distance <= 0.0:
+                reference_distance = config_reference_distance
+            danger_threshold = None
+            if buffer_f is not None and reference_distance is not None and reference_distance > 0.0:
+                danger_threshold = reference_distance - buffer_f
+
             # --- 1. Hard circuit breaker (catastrophic): bypass all timers and window checks ---
             if loss_pct >= catastrophic_pct:
                 self.danger_timestamps.pop(asset, None)
@@ -401,37 +407,45 @@ class Last90sStrategy(BaseV2Strategy):
                 continue
 
             # --- 2. Wick filter (normal SL + distance) + distance-decay trailing stop ---
-            # Normal SL condition: loss_pct >= stop_loss_pct AND distance beyond danger_threshold.
+            # Normal SL: loss_pct >= stop_loss_pct AND distance < danger_threshold (reference_distance - buffer).
             normal_sl_met = (
                 loss_pct >= sl_pct
                 and (danger_threshold is None or (distance_min is not None and distance_min < danger_threshold))
             )
-            # Distance decay condition: current distance has decayed to distance_decay_pct of initial cushion AND we are in loss.
+            # Distance decay: current distance <= reference_distance * distance_decay_pct (dynamic trailing stop from actual entry).
+            # IMPORTANT: require loss_pct >= stop_loss_pct so we don't stop out on tiny mark dips.
             is_distance_decayed = False
-            if (
-                distance_min is not None
-                and initial_placement_distance is not None
-                and initial_placement_distance > 0.0
-            ):
+            if distance_min is not None and reference_distance is not None and reference_distance > 0.0:
                 try:
-                    decay_threshold = abs(initial_placement_distance) * distance_decay_pct
-                    is_distance_decayed = distance_min <= decay_threshold and loss_pct > 0.0
+                    dynamic_decay_threshold = abs(reference_distance) * distance_decay_pct
+                    is_distance_decayed = distance_min <= dynamic_decay_threshold and loss_pct >= sl_pct
                 except (TypeError, ValueError):
                     is_distance_decayed = False
 
             is_in_danger = normal_sl_met or is_distance_decayed
 
-            if is_in_danger:
-                # Rule A (Late-Window Panic): last minute — fire immediately.
-                if sec_to_close is not None and sec_to_close <= 60:
+            # Rule A (Late-Window Panic): last 60 seconds should only consider stop_loss_pct
+            # (ignore distance gate + distance-decay trailing-stop logic).
+            if sec_to_close is not None and sec_to_close <= 60:
+                if loss_pct >= sl_pct:
                     self.danger_timestamps.pop(asset, None)
-                    reason_tag = "sl_decay_late_window" if is_distance_decayed else "sl_normal_late_window"
-                    actions.append(ExitAction(order_id=order.order_id, action="stop_loss", reason=reason_tag))
-                    logger.info(
-                        "[last_90s] Stop-loss (late-window override, <=60s to close): order_id=%s asset=%s side=%s entry=%sc bid=%s loss_pct=%.2f",
-                        order.order_id, asset, side, entry_cents, current_bid, loss_pct,
+                    actions.append(
+                        ExitAction(order_id=order.order_id, action="stop_loss", reason="sl_pct_late_window")
                     )
-                    continue
+                    logger.info(
+                        "[last_90s] Stop-loss (late-window, loss_pct-only): order_id=%s asset=%s side=%s entry=%sc bid=%s loss_pct=%.2f sl_pct=%.2f",
+                        order.order_id,
+                        asset,
+                        side,
+                        entry_cents,
+                        current_bid,
+                        loss_pct,
+                        sl_pct,
+                    )
+                # Regardless of whether SL fired, do not apply persistence logic in late-window mode.
+                continue
+
+            if is_in_danger:
                 # Rule B (Persistence check): seconds_to_close > 60.
                 if asset not in self.danger_timestamps:
                     self.danger_timestamps[asset] = current_time
