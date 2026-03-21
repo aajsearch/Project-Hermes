@@ -20,7 +20,8 @@ fifteen_min:
       
       # --- EARLY EXIT TRIGGERS (Accounting for 8% Slippage) ---
       stop_loss_pct: 15  
-      distance_decay_pct: 0.70
+      # Require a deeper spot crash for highly volatile altcoins before panicking
+      distance_decay_pct: { btc: 0.80, eth: 0.80, sol: 0.85, xrp: 0.90 }
       catastrophic_loss_pct: 45
       
       stop_loss_absolute_buffer: { btc: 25.0, eth: 1, sol: 0.05, xrp: 0.0010 }
@@ -31,7 +32,7 @@ fifteen_min:
 
       # --- 4. STATE TIMERS ---
       global_cooldown_seconds: 60
-      danger_persistence_seconds: 6.0
+      danger_persistence_seconds: { btc: 2.0, eth: 2.0, sol: 1.5, xrp: 1.0 }
 
     # Legacy key (optional): strategy also reads last_90s_limit_99 if continuous_alpha_limit_99 missing
     # last_90s_limit_99:

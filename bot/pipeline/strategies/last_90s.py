@@ -92,6 +92,53 @@ def _get_asset_config(value: Any, asset: str, default: Any) -> Any:
     return value
 
 
+# Safe default when key/asset missing or value is non-numeric (avoids TypeError in timer math).
+_DEFAULT_DANGER_PERSISTENCE_SECONDS = 1.5
+
+
+def _parse_danger_persistence_seconds(cfg: dict, asset: str) -> float:
+    """
+    danger_persistence_seconds may be a float or per-asset dict, e.g.
+    { btc: 2.0, eth: 2.0, sol: 1.5, xrp: 1.0 }.
+    """
+    raw = _get_asset_config(
+        cfg.get("danger_persistence_seconds"),
+        asset,
+        _DEFAULT_DANGER_PERSISTENCE_SECONDS,
+    )
+    try:
+        v = float(raw) if raw is not None else _DEFAULT_DANGER_PERSISTENCE_SECONDS
+    except (TypeError, ValueError):
+        return _DEFAULT_DANGER_PERSISTENCE_SECONDS
+    if v <= 0:
+        return _DEFAULT_DANGER_PERSISTENCE_SECONDS
+    return v
+
+
+# Historical default when key/asset missing or value invalid (matches prior scalar default).
+_DEFAULT_DISTANCE_DECAY_PCT = 0.75
+
+
+def _parse_distance_decay_pct(cfg: dict, asset: str) -> float:
+    """
+    distance_decay_pct may be a float or per-asset dict, e.g.
+    { btc: 0.80, eth: 0.80, sol: 0.85, xrp: 0.90 }.
+    Used as: dynamic_decay_threshold = |reference_distance| * distance_decay_pct.
+    """
+    raw = _get_asset_config(
+        cfg.get("distance_decay_pct"),
+        asset,
+        _DEFAULT_DISTANCE_DECAY_PCT,
+    )
+    try:
+        v = float(raw) if raw is not None else _DEFAULT_DISTANCE_DECAY_PCT
+    except (TypeError, ValueError):
+        return _DEFAULT_DISTANCE_DECAY_PCT
+    if v <= 0:
+        return _DEFAULT_DISTANCE_DECAY_PCT
+    return v
+
+
 def _min_spot_distance(ctx: WindowContext) -> Optional[float]:
     """Spot-to-strike distance from the single oracle (currently Coinbase)."""
     return ctx.distance
@@ -116,7 +163,8 @@ class Last90sStrategy(BaseV2Strategy):
     def __init__(self, config: dict) -> None:
         strategy_id = _resolve_strategy_id(config)
         super().__init__(strategy_id, config)
-        # Stateful persistence filter: asset -> first time stop-loss condition was detected (for wick/flash-crash protection).
+        # Stateful persistence filter: order_id -> first time stop-loss condition was detected (for wick/flash-crash protection).
+        # Keyed by order_id (not asset) to avoid State Amnesia when pipeline evaluates different/empty market windows.
         self.danger_timestamps: Dict[str, float] = {}
         path = _v2_db_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -357,8 +405,8 @@ class Last90sStrategy(BaseV2Strategy):
         distance_min = _min_spot_distance(ctx)
         yes_bid = int(ctx.quote.get("yes_bid", 0) or 0)
         no_bid = int(ctx.quote.get("no_bid", 0) or 0)
-        persistence_sec = float(cfg.get("danger_persistence_seconds", 5.0) or 5.0)
-        distance_decay_pct = float(cfg.get("distance_decay_pct", 0.75) or 0.75)
+        persistence_sec = _parse_danger_persistence_seconds(cfg, asset)
+        distance_decay_pct = _parse_distance_decay_pct(cfg, asset)
         sec_to_close = float(ctx.seconds_to_close) if ctx.seconds_to_close is not None else None
         current_time = time.time()
 
@@ -398,7 +446,7 @@ class Last90sStrategy(BaseV2Strategy):
 
             # --- 1. Hard circuit breaker (catastrophic): bypass all timers and window checks ---
             if loss_pct >= catastrophic_pct:
-                self.danger_timestamps.pop(asset, None)
+                self.danger_timestamps.pop(order.order_id, None)
                 actions.append(ExitAction(order_id=order.order_id, action="stop_loss", reason="sl_catastrophic"))
                 logger.info(
                     "[last_90s] Stop-loss (CATASTROPHIC override): asset=%s order_id=%s loss_pct=%.2f",
@@ -428,7 +476,7 @@ class Last90sStrategy(BaseV2Strategy):
             # (ignore distance gate + distance-decay trailing-stop logic).
             if sec_to_close is not None and sec_to_close <= 60:
                 if loss_pct >= sl_pct:
-                    self.danger_timestamps.pop(asset, None)
+                    self.danger_timestamps.pop(order.order_id, None)
                     actions.append(
                         ExitAction(order_id=order.order_id, action="stop_loss", reason="sl_pct_late_window")
                     )
@@ -447,21 +495,25 @@ class Last90sStrategy(BaseV2Strategy):
 
             if is_in_danger:
                 # Rule B (Persistence check): seconds_to_close > 60.
-                if asset not in self.danger_timestamps:
-                    self.danger_timestamps[asset] = current_time
+                if order.order_id not in self.danger_timestamps:
+                    self.danger_timestamps[order.order_id] = current_time
                     if is_distance_decayed and not normal_sl_met:
                         reason = f'Distance Decay (curr_dist <= {distance_decay_pct:.2f} * init_dist)'
                     elif is_distance_decayed and normal_sl_met:
                         reason = f'Normal SL + Distance Decay (<= {distance_decay_pct:.2f} * init_dist)'
                     else:
                         reason = "Normal SL"
+                    logger.info(
+                        "[last_90s] Starting danger persistence timer for order_id=%s asset=%s.",
+                        order.order_id, asset,
+                    )
                     logger.debug(
-                        "[last_90s] Danger zone entered: asset=%s reason=\"%s\" waiting %.1fs",
-                        asset, reason, persistence_sec,
+                        "[last_90s] Danger zone entered: order_id=%s reason=\"%s\" waiting %.1fs",
+                        order.order_id, reason, persistence_sec,
                     )
                     continue
-                if (current_time - self.danger_timestamps[asset]) >= persistence_sec:
-                    self.danger_timestamps.pop(asset, None)
+                if (current_time - self.danger_timestamps[order.order_id]) >= persistence_sec:
+                    self.danger_timestamps.pop(order.order_id, None)
                     reason_tag = "sl_decay_persistence" if is_distance_decayed else "sl_normal_persistence"
                     actions.append(ExitAction(order_id=order.order_id, action="stop_loss", reason=reason_tag))
                     logger.info(
@@ -473,18 +525,23 @@ class Last90sStrategy(BaseV2Strategy):
                 continue
 
             # --- 3. Recovery: neither catastrophic nor normal SL met — clear danger state if present ---
-            if asset in self.danger_timestamps:
-                del self.danger_timestamps[asset]
-                logger.debug("[last_90s] Danger cleared (recovery): asset=%s", asset)
+            if order.order_id in self.danger_timestamps:
+                del self.danger_timestamps[order.order_id]
+                logger.info(
+                    "[last_90s] Danger condition recovered, clearing timer for order_id=%s.",
+                    order.order_id,
+                )
             # No stop-loss for this order; continue with normal evaluation (e.g. take-profit handled elsewhere if added).
 
-        # Cleanup: no filled orders for this asset (window closed or position finalized) — avoid leaking stale danger state.
-        has_filled = any(
-            (o.status == "filled" or (o.filled_count or 0) > 0)
-            for o in my_orders
-            if (o.side or "").strip().lower() in ("yes", "no")
-        )
-        if not has_filled:
-            self.danger_timestamps.pop(asset, None)
+        # Cleanup: only remove order_ids that are definitively done (exited/canceled) to prevent memory leaks.
+        # Do NOT include "filled" — a filled order is actively monitored for stop-loss; clearing its timer
+        # would reset persistence every tick (regression). Do NOT use broad asset-based cleanup — that
+        # caused State Amnesia when evaluating different/empty market windows.
+        for o in my_orders:
+            oid = getattr(o, "order_id", None)
+            if not oid:
+                continue
+            if getattr(o, "status", None) in ("exited", "canceled"):
+                self.danger_timestamps.pop(oid, None)
 
         return actions

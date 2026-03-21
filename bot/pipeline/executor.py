@@ -21,20 +21,64 @@ logger = logging.getLogger(__name__)
 def _exit_price_cents_from_sell_order(sell_order: Optional[dict], side: str) -> Optional[int]:
     """
     Extract exit (fill) price in cents from a Kalshi sell-order response.
-    Tries yes_price, no_price, average_fill_price, and dollar variants.
+
+    Uses side-specific price to avoid the inverted opposite-side bug: when selling NO,
+    yes_price can reflect the counterparty's side (wrong). We must use no_price for NO
+    sells and yes_price for YES sells. Prefer taker_fill_cost/fill_count when available
+    (actual execution price) over limit prices.
     """
     if not sell_order or not isinstance(sell_order, dict):
         return None
-    # Integer cents (Kalshi often returns limit price or fill in cents)
-    for key in ("yes_price", "no_price", "average_fill_price", "avg_fill_price"):
+    side = (side or "").strip().lower()
+
+    # 1. Prefer taker_fill_cost / fill_count (actual fill price per contract)
+    fill_count = sell_order.get("fill_count") or sell_order.get("filled_count") or 0
+    try:
+        fill_count = int(fill_count)
+    except (TypeError, ValueError):
+        fill_count = 0
+    if fill_count > 0:
+        taker_cost = sell_order.get("taker_fill_cost")
+        if taker_cost is not None:
+            try:
+                return int(round(float(taker_cost) / fill_count))
+            except (TypeError, ValueError):
+                pass
+        # Try dollar variant
+        taker_cost_d = sell_order.get("taker_fill_cost_dollars")
+        if taker_cost_d is not None:
+            try:
+                return int(round(float(taker_cost_d) * 100 / fill_count))
+            except (TypeError, ValueError):
+                pass
+
+    # 2. Side-specific price (avoid inverted opposite-side): NO sells -> no_price, YES sells -> yes_price
+    if side == "no":
+        for key in ("no_price", "no_price_dollars"):
+            v = sell_order.get(key)
+            if v is not None:
+                try:
+                    return int(round(float(v) * 100)) if "dollars" in key else int(round(float(v)))
+                except (TypeError, ValueError):
+                    pass
+    else:
+        for key in ("yes_price", "yes_price_dollars"):
+            v = sell_order.get(key)
+            if v is not None:
+                try:
+                    return int(round(float(v) * 100)) if "dollars" in key else int(round(float(v)))
+                except (TypeError, ValueError):
+                    pass
+
+    # 3. Fallback: average_fill_price (if API provides it)
+    for key in ("average_fill_price", "avg_fill_price"):
         v = sell_order.get(key)
         if v is not None:
             try:
                 return int(round(float(v)))
             except (TypeError, ValueError):
                 pass
-    # Dollar fields (V2 API)
-    for key in ("yes_price_dollars", "no_price_dollars", "average_fill_price_dollars"):
+    for key in ("average_fill_price_dollars",):
         v = sell_order.get(key)
         if v is not None:
             try:
