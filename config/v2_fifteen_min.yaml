@@ -8,14 +8,14 @@ fifteen_min:
   strategies:
     continuous_alpha_limit_99:
       enabled: true
-      window_seconds: { btc: 150, eth: 150, sol: 150, xrp: 150 }
+      window_seconds: { btc: 180, eth: 180, sol: 180, xrp: 180 }
       
       # --- 1. ENTRY CONSTRAINTS (The 85-95 Sweet Spot) ---
-      limit_price_cents: 97
-      min_bid_cents: { btc: 93, eth: 93, sol: 93, xrp: 93 }
+      limit_price_cents: 98
+      min_bid_cents: { btc: 93, eth: 93, sol: 94, xrp: 94 }
       
-      order_count: { btc: 1, eth: 1, sol: 1, xrp: 1 }
-      max_cost_cents: 500
+      order_count: { btc: 100, eth: 100, sol: 100, xrp: 100 }
+      max_cost_cents: 50000
       side: auto
       
       # --- EARLY EXIT TRIGGERS (Accounting for 8% Slippage) ---
@@ -26,7 +26,7 @@ fifteen_min:
       
       stop_loss_absolute_buffer: { btc: 25.0, eth: 1, sol: 0.05, xrp: 0.0010 }
       # --- ENTRY PREVENTION (Filtering out the noise) ---
-      min_distance_at_placement: { btc: 60.0, eth: 2.5, sol: 0.15, xrp: 0.0025 }
+      min_distance_at_placement: { btc: 45.0, eth: 2.0, sol: 0.1, xrp: 0.002 }
       # Cancel resting entry if distance decays too much before fill (pre-fill adverse selection protection)
       resting_cancel_decay_pct: 0.35
 

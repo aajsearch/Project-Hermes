@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-Reconcile Alpaca put spread state: compare JSON state + DB vs live Alpaca positions/orders.
-Reports drift (e.g. open_spread in state but no positions; positions but no state).
+Reconcile Alpaca options bot state: compare JSON state + DB vs live Alpaca positions.
+Supports nested open_positions[underlying][PCS|CCS|IC].
 Usage:
   python tools/reconcile_alpaca_state.py
-  python tools/reconcile_alpaca_state.py --fix   # optionally clear stale state (dry-run by default)
+  python tools/reconcile_alpaca_state.py --fix   # guidance only (no auto-edit)
 """
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from pathlib import Path
@@ -21,78 +20,96 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-STATE_PATH = Path(__file__).resolve().parents[1] / "data" / "alpaca_put_spread_state.json"
-DB_PATH = Path(__file__).resolve().parents[1] / "data" / "alpaca_put_spread.db"
+
+def _symbols_from_open_spread(spread: dict) -> set[str]:
+    legs = spread.get("legs")
+    if isinstance(legs, list) and legs:
+        return {str(x) for x in legs}
+    out = set()
+    for k in (
+        "short_put_symbol",
+        "long_put_symbol",
+        "short_call_symbol",
+        "long_call_symbol",
+    ):
+        v = spread.get(k)
+        if v:
+            out.add(str(v))
+    return out
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Reconcile Alpaca put spread state vs live")
-    ap.add_argument("--fix", action="store_true", help="Propose fixes (does not modify by default)")
+    ap = argparse.ArgumentParser(description="Reconcile Alpaca options state vs live")
+    ap.add_argument("--fix", action="store_true", help="Print fix hints (no writes)")
     args = ap.parse_args()
 
     from bot.alpaca_put_spread.alpaca_clients import make_alpaca_clients
+    from bot.alpaca_put_spread.state import load_state
     from trading_assistant.broker.alpaca.positions import list_open_positions
 
     paper = os.environ.get("ALPACA_PAPER", "true").lower() in ("1", "true", "yes")
     trading_client, _, _ = make_alpaca_clients(paper=paper)
 
-    # Load JSON state
-    state = {}
-    if STATE_PATH.exists():
-        state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    state = load_state()
+    open_positions = state.get("open_positions") or {}
+    pending_entry = state.get("pending_entry_order") or {}
+    pending_close = state.get("pending_close_order") or {}
 
-    open_spreads = (state.get("open_spread_by_underlying") or {})
-    pending_entry = (state.get("pending_entry_order_by_underlying") or {})
-    pending_close = (state.get("pending_close_order_by_underlying") or {})
-
-    # Fetch live positions
     try:
         positions = list_open_positions(trading_client)
     except Exception as e:
         print(f"ERROR: Failed to fetch Alpaca positions: {e}")
         return 1
 
-    # Build set of symbols we expect to have positions for
-    expected_symbols = set()
-    for und, spread in open_spreads.items():
-        short = spread.get("short_put_symbol")
-        long_sym = spread.get("long_put_symbol")
-        if short:
-            expected_symbols.add(short)
-        if long_sym:
-            expected_symbols.add(long_sym)
+    expected_symbols: set[str] = set()
+    for und, by_st in open_positions.items():
+        if not isinstance(by_st, dict):
+            continue
+        for st, spread in by_st.items():
+            if not isinstance(spread, dict):
+                continue
+            expected_symbols |= _symbols_from_open_spread(spread)
 
-    # Symbols we actually have
     actual_symbols = {s for s, p in (positions or {}).items() if float(p.get("qty", 0)) != 0}
 
     drift = []
 
-    # Check: open_spread says we have positions, but we don't
-    for und, spread in open_spreads.items():
-        short = spread.get("short_put_symbol")
-        long_sym = spread.get("long_put_symbol")
-        short_qty = float((positions or {}).get(short, {}).get("qty", 0))
-        long_qty = float((positions or {}).get(long_sym, {}).get("qty", 0))
-        if short_qty == 0 and long_qty == 0:
-            drift.append(f"STALE: open_spread for {und} but no positions (short={short}, long={long_sym})")
+    for und, by_st in open_positions.items():
+        if not isinstance(by_st, dict):
+            continue
+        for st, spread in by_st.items():
+            if not isinstance(spread, dict):
+                continue
+            syms = _symbols_from_open_spread(spread)
+            if not syms:
+                continue
+            flat = all(float((positions or {}).get(s, {}).get("qty", 0)) == 0 for s in syms)
+            if flat:
+                drift.append(f"STALE: open_positions[{und}][{st}] but no positions for {syms}")
 
-    # Check: we have option positions not in our state (manual trade or orphan)
     for sym in actual_symbols:
-        found = any(
-            (spread.get("short_put_symbol") == sym or spread.get("long_put_symbol") == sym)
-            for spread in open_spreads.values()
-        )
+        found = False
+        for by_st in open_positions.values():
+            if not isinstance(by_st, dict):
+                continue
+            for spread in by_st.values():
+                if isinstance(spread, dict) and sym in _symbols_from_open_spread(spread):
+                    found = True
+                    break
+            if found:
+                break
         if not found:
-            drift.append(f"ORPHAN: position in {sym} not in open_spread_by_underlying")
+            drift.append(f"ORPHAN: position in {sym} not tracked in open_positions")
 
-    # Pending orders: optional check against Alpaca (would need to fetch orders)
-    if pending_entry:
-        drift.append(f"INFO: {len(pending_entry)} pending entry orders: {list(pending_entry.keys())}")
-    if pending_close:
-        drift.append(f"INFO: {len(pending_close)} pending close orders: {list(pending_close.keys())}")
+    pe_flat = sum(len(v) for v in pending_entry.values() if isinstance(v, dict))
+    pc_flat = sum(len(v) for v in pending_close.values() if isinstance(v, dict))
+    if pe_flat:
+        drift.append(f"INFO: pending_entry_order slots: {pe_flat}")
+    if pc_flat:
+        drift.append(f"INFO: pending_close_order slots: {pc_flat}")
 
-    print("=== Alpaca Put Spread Reconciliation ===")
-    print(f"Open spreads (state): {list(open_spreads.keys()) or 'none'}")
+    print("=== Alpaca options reconciliation ===")
+    print(f"Open underlyings: {list(open_positions.keys()) or 'none'}")
     print(f"Expected option symbols: {sorted(expected_symbols) or 'none'}")
     print(f"Actual positions (non-zero qty): {sorted(actual_symbols) or 'none'}")
     print()
@@ -102,8 +119,7 @@ def main() -> int:
             print(f"  - {d}")
         if args.fix:
             print()
-            print("--fix: To clear stale open_spread, manually edit data/alpaca_put_spread_state.json")
-            print("  or run with a future --fix-implemented flag (not yet implemented).")
+            print("--fix: Edit data/alpaca_put_spread_state.json or clear stale open_positions entries.")
     else:
         print("No drift detected.")
 

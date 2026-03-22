@@ -20,12 +20,13 @@ class TestAlpacaStateTransitions(unittest.TestCase):
         from bot.alpaca_put_spread.state import _default_state
 
         st = _default_state()
-        self.assertIn("open_spread_by_underlying", st)
-        self.assertIn("pending_entry_order_by_underlying", st)
-        self.assertIn("pending_close_order_by_underlying", st)
-        self.assertIn("cooldown_until_ts_by_underlying", st)
-        self.assertIn("entry_disabled_by_underlying", st)
-        self.assertEqual(st["open_spread_by_underlying"], {})
+        self.assertIn("open_positions", st)
+        self.assertIn("pending_entry_order", st)
+        self.assertIn("pending_close_order", st)
+        self.assertIn("cooldown_until_ts", st)
+        self.assertIn("entry_disabled", st)
+        self.assertIn("entry_retry_count", st)
+        self.assertEqual(st["open_positions"], {})
 
     def test_open_spread_has_required_keys(self):
         open_spread = {
@@ -89,12 +90,31 @@ class TestTradeWindowWeekdays(unittest.TestCase):
         )
 
     def test_load_config_has_weekdays(self):
-        from bot.alpaca_put_spread.config import load_alpaca_put_spread_config
+        from bot.alpaca_put_spread.config import load_alpaca_options_config
 
-        cfg = load_alpaca_put_spread_config(PROJECT_ROOT / "config")
+        cfg = load_alpaca_options_config(PROJECT_ROOT / "config")
         self.assertTrue(cfg.trade_window_weekdays.issubset(frozenset(range(7))))
         if cfg.trade_window_timezone:
             self.assertEqual(cfg.trade_window_weekdays, frozenset(range(5)))
+
+
+class TestCloseDebitSlippageFloor(unittest.TestCase):
+    def test_zero_net_uses_min_cent_buffer(self):
+        from bot.alpaca_put_spread.strategy import _close_debit_limit_with_min_slippage
+
+        # Old formula: 0 * (1+pct) = 0; floor gives 0.01 debit limit.
+        self.assertAlmostEqual(_close_debit_limit_with_min_slippage(0.0, 0.02), 0.01)
+
+    def test_tiny_net_gets_min_buffer(self):
+        from bot.alpaca_put_spread.strategy import _close_debit_limit_with_min_slippage
+
+        # 0.001 * 0.02 = 0.00002 < 0.01 -> buffer 0.01
+        self.assertAlmostEqual(_close_debit_limit_with_min_slippage(0.001, 0.02), 0.011)
+
+    def test_large_net_uses_percentage(self):
+        from bot.alpaca_put_spread.strategy import _close_debit_limit_with_min_slippage
+
+        self.assertAlmostEqual(_close_debit_limit_with_min_slippage(2.0, 0.02), 2.04)
 
 
 class TestSingletonLock(unittest.TestCase):

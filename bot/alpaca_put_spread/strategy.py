@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from types import SimpleNamespace
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
 from alpaca.data.requests import OptionLatestQuoteRequest
@@ -21,6 +21,7 @@ from bot.alpaca_put_spread.alerts import (
     alert_sl_triggered,
     alert_tp_triggered,
 )
+from bot.alpaca_put_spread.call_credit_spread_selector import select_bear_call_credit_spread
 from bot.alpaca_put_spread.config import AlpacaPutSpreadConfig
 from bot.alpaca_put_spread.db import (
     close_spread as db_close_spread,
@@ -32,11 +33,27 @@ from bot.alpaca_put_spread.db import (
     log_event,
     update_order_status as db_update_order_status,
 )
+from bot.alpaca_put_spread.domain import Leg
 from bot.alpaca_put_spread.execution import cancel_order, submit_mleg_limit_order, wait_for_order
+from bot.alpaca_put_spread.iron_condor_selector import select_iron_condor
 from bot.alpaca_put_spread.option_symbol import option_expiry_utc, parse_occ_option_symbol
-from bot.alpaca_put_spread.put_spread_logic import PutSpreadCandidate, tp_sl_triggered
-from bot.alpaca_put_spread.put_spread_selector import select_bull_put_credit_spread
-from bot.alpaca_put_spread.state import load_state, save_state
+from bot.alpaca_put_spread.pricing_logic import (
+    CallSpreadCandidate,
+    IronCondorCandidate,
+    PutSpreadCandidate,
+    current_net_credit_mid_from_legs,
+    tp_sl_triggered,
+)
+from bot.alpaca_put_spread.put_spread_selector import _get_chain_silent, select_bull_put_credit_spread
+from bot.alpaca_put_spread.state import (
+    ensure_state_shape,
+    get_nested,
+    load_state,
+    pop_nested,
+    save_state,
+    set_nested,
+)
+from bot.alpaca_put_spread.strategy_types import StrategyType
 
 from trading_assistant.broker.alpaca.market_data import get_latest_mid
 from trading_assistant.broker.alpaca.positions import list_open_positions
@@ -44,8 +61,218 @@ from trading_assistant.broker.alpaca.positions import list_open_positions
 
 logger = logging.getLogger(__name__)
 
+# Minimum dollar slippage buffer on close (avoids zero debit limit when mark is tiny).
+_MIN_CLOSE_SLIPPAGE_DOLLARS = 0.01
 
-def _option_mid(option_data_client, symbol: str) -> Optional[float]:
+
+def _close_debit_limit_with_min_slippage(current_net: float, slippage_pct: float) -> float:
+    """
+    Positive debit limit to close a credit spread: current_net + slippage buffer.
+    Percentage slippage is current_net * slippage_pct; if that amount is below
+    _MIN_CLOSE_SLIPPAGE_DOLLARS, use the minimum instead (handles mark near zero).
+    """
+    c = float(current_net)
+    slip_amount = c * float(slippage_pct)
+    if slip_amount < _MIN_CLOSE_SLIPPAGE_DOLLARS:
+        slip_amount = _MIN_CLOSE_SLIPPAGE_DOLLARS
+    return c + slip_amount
+
+
+_STRATEGY_PCS = StrategyType.PUT_CREDIT_SPREAD.value
+_STRATEGY_CCS = StrategyType.CALL_CREDIT_SPREAD.value
+_STRATEGY_IC = StrategyType.IRON_CONDOR.value
+
+PENDING_ENTRY = "pending_entry_order"
+PENDING_CLOSE = "pending_close_order"
+COOLDOWN = "cooldown_until_ts"
+ENTRY_DISABLED = "entry_disabled"
+ENTRY_RETRY = "entry_retry_count"
+
+
+def _open_spread_strategy_type(open_spread: Dict[str, Any]) -> str:
+    return str(open_spread.get("strategy_type") or _STRATEGY_PCS).strip().upper()
+
+
+def _spread_legs_from_state(open_spread: Dict[str, Any]) -> List[str]:
+    legs = open_spread.get("legs")
+    if isinstance(legs, list) and legs:
+        return [str(x) for x in legs]
+    st = _open_spread_strategy_type(open_spread)
+    if st == _STRATEGY_CCS:
+        sc = open_spread.get("short_call_symbol")
+        lc = open_spread.get("long_call_symbol")
+        if sc and lc:
+            return [str(sc), str(lc)]
+    if st == _STRATEGY_IC:
+        lp = open_spread.get("long_put_symbol")
+        sp = open_spread.get("short_put_symbol")
+        sc = open_spread.get("short_call_symbol")
+        lc = open_spread.get("long_call_symbol")
+        if lp and sp and sc and lc:
+            return [str(lp), str(sp), str(sc), str(lc)]
+    short_sym = open_spread.get("short_put_symbol")
+    long_sym = open_spread.get("long_put_symbol")
+    if short_sym and long_sym:
+        return [str(short_sym), str(long_sym)]
+    return []
+
+
+def _pricing_legs_from_open(open_spread: Dict[str, Any]) -> List[Leg]:
+    st = _open_spread_strategy_type(open_spread)
+    if st == _STRATEGY_PCS:
+        return [
+            Leg(symbol=open_spread["short_put_symbol"], side="sell", intent="open", ratio=1),
+            Leg(symbol=open_spread["long_put_symbol"], side="buy", intent="open", ratio=1),
+        ]
+    if st == _STRATEGY_CCS:
+        return [
+            Leg(symbol=open_spread["short_call_symbol"], side="sell", intent="open", ratio=1),
+            Leg(symbol=open_spread["long_call_symbol"], side="buy", intent="open", ratio=1),
+        ]
+    if st == _STRATEGY_IC:
+        return [
+            Leg(symbol=open_spread["long_put_symbol"], side="buy", intent="open", ratio=1),
+            Leg(symbol=open_spread["short_put_symbol"], side="sell", intent="open", ratio=1),
+            Leg(symbol=open_spread["short_call_symbol"], side="sell", intent="open", ratio=1),
+            Leg(symbol=open_spread["long_call_symbol"], side="buy", intent="open", ratio=1),
+        ]
+    return []
+
+
+def _entry_legs_pcs(candidate: PutSpreadCandidate) -> List[Dict[str, Any]]:
+    return [
+        {
+            "symbol": candidate.short_put_symbol,
+            "ratio_qty": 1.0,
+            "side": OrderSide.SELL,
+            "position_intent": PositionIntent.SELL_TO_OPEN,
+        },
+        {
+            "symbol": candidate.long_put_symbol,
+            "ratio_qty": 1.0,
+            "side": OrderSide.BUY,
+            "position_intent": PositionIntent.BUY_TO_OPEN,
+        },
+    ]
+
+
+def _entry_legs_ccs(candidate: CallSpreadCandidate) -> List[Dict[str, Any]]:
+    return [
+        {
+            "symbol": candidate.short_call_symbol,
+            "ratio_qty": 1.0,
+            "side": OrderSide.SELL,
+            "position_intent": PositionIntent.SELL_TO_OPEN,
+        },
+        {
+            "symbol": candidate.long_call_symbol,
+            "ratio_qty": 1.0,
+            "side": OrderSide.BUY,
+            "position_intent": PositionIntent.BUY_TO_OPEN,
+        },
+    ]
+
+
+def _entry_legs_ic(candidate: IronCondorCandidate) -> List[Dict[str, Any]]:
+    return [
+        {
+            "symbol": candidate.long_put_symbol,
+            "ratio_qty": 1.0,
+            "side": OrderSide.BUY,
+            "position_intent": PositionIntent.BUY_TO_OPEN,
+        },
+        {
+            "symbol": candidate.short_put_symbol,
+            "ratio_qty": 1.0,
+            "side": OrderSide.SELL,
+            "position_intent": PositionIntent.SELL_TO_OPEN,
+        },
+        {
+            "symbol": candidate.short_call_symbol,
+            "ratio_qty": 1.0,
+            "side": OrderSide.SELL,
+            "position_intent": PositionIntent.SELL_TO_OPEN,
+        },
+        {
+            "symbol": candidate.long_call_symbol,
+            "ratio_qty": 1.0,
+            "side": OrderSide.BUY,
+            "position_intent": PositionIntent.BUY_TO_OPEN,
+        },
+    ]
+
+
+def _exit_legs_from_open(open_spread: Dict[str, Any]) -> List[Dict[str, Any]]:
+    st = _open_spread_strategy_type(open_spread)
+    if st == _STRATEGY_PCS:
+        short_sym = open_spread["short_put_symbol"]
+        long_sym = open_spread["long_put_symbol"]
+        return [
+            {"symbol": short_sym, "ratio_qty": 1.0, "side": OrderSide.BUY, "position_intent": PositionIntent.BUY_TO_CLOSE},
+            {"symbol": long_sym, "ratio_qty": 1.0, "side": OrderSide.SELL, "position_intent": PositionIntent.SELL_TO_CLOSE},
+        ]
+    if st == _STRATEGY_CCS:
+        short_sym = open_spread["short_call_symbol"]
+        long_sym = open_spread["long_call_symbol"]
+        return [
+            {"symbol": short_sym, "ratio_qty": 1.0, "side": OrderSide.BUY, "position_intent": PositionIntent.BUY_TO_CLOSE},
+            {"symbol": long_sym, "ratio_qty": 1.0, "side": OrderSide.SELL, "position_intent": PositionIntent.SELL_TO_CLOSE},
+        ]
+    if st == _STRATEGY_IC:
+        return [
+            {
+                "symbol": open_spread["long_put_symbol"],
+                "ratio_qty": 1.0,
+                "side": OrderSide.SELL,
+                "position_intent": PositionIntent.SELL_TO_CLOSE,
+            },
+            {
+                "symbol": open_spread["short_put_symbol"],
+                "ratio_qty": 1.0,
+                "side": OrderSide.BUY,
+                "position_intent": PositionIntent.BUY_TO_CLOSE,
+            },
+            {
+                "symbol": open_spread["short_call_symbol"],
+                "ratio_qty": 1.0,
+                "side": OrderSide.BUY,
+                "position_intent": PositionIntent.BUY_TO_CLOSE,
+            },
+            {
+                "symbol": open_spread["long_call_symbol"],
+                "ratio_qty": 1.0,
+                "side": OrderSide.SELL,
+                "position_intent": PositionIntent.SELL_TO_CLOSE,
+            },
+        ]
+    raise ValueError(f"Unknown strategy for exit legs: {st}")
+
+
+def _exit_cfg(cfg: AlpacaPutSpreadConfig, strategy_type: str) -> SimpleNamespace:
+    if strategy_type == _STRATEGY_PCS:
+        x = cfg.put_credit_spread
+        min_otm = float(x.min_short_otm_percent)
+    elif strategy_type == _STRATEGY_CCS:
+        x = cfg.call_credit_spread
+        min_otm = float(x.min_short_otm_percent)
+    elif strategy_type == _STRATEGY_IC:
+        x = cfg.iron_condor
+        min_otm = float(x.min_short_otm_percent) if x.min_short_otm_percent is not None else 0.02
+    else:
+        raise ValueError(strategy_type)
+    return SimpleNamespace(
+        tp_pct=x.tp_pct,
+        sl_pct=x.sl_pct,
+        distance_buffer_otm_fraction=x.distance_buffer_otm_fraction_of_min_short_otm,
+        distance_buffer_points=x.distance_buffer_points,
+        min_short_otm_percent=min_otm,
+        exit_before_minutes=x.exit_before_minutes,
+        exit_cooldown_minutes=x.exit_cooldown_minutes,
+        close_limit_slippage_pct=x.close_limit_slippage_pct,
+    )
+
+
+def _option_mid(option_data_client: Any, symbol: str) -> Optional[float]:
     qreq = OptionLatestQuoteRequest(symbol_or_symbols=[symbol])
     quotes = option_data_client.get_option_latest_quote(qreq)
     q = quotes.get(symbol) if isinstance(quotes, dict) else None
@@ -67,21 +294,37 @@ def _option_mid(option_data_client, symbol: str) -> Optional[float]:
     return None
 
 
-def _compute_distance_points(short_put_symbol: str, underlying_mid: float) -> Optional[float]:
+def _option_bid_ask(option_data_client: Any, symbol: str) -> Tuple[Optional[float], Optional[float]]:
+    qreq = OptionLatestQuoteRequest(symbol_or_symbols=[symbol])
+    quotes = option_data_client.get_option_latest_quote(qreq)
+    q = quotes.get(symbol) if isinstance(quotes, dict) else None
+    if not q:
+        return (None, None)
+    bid = getattr(q, "bid_price", None)
+    ask = getattr(q, "ask_price", None)
+    try:
+        bid_f = float(bid) if bid is not None else None
+        ask_f = float(ask) if ask is not None else None
+        return (bid_f, ask_f)
+    except Exception:
+        return (None, None)
+
+
+def _compute_distance_points_put_short(short_put_symbol: str, underlying_mid: float) -> Optional[float]:
     parts = parse_occ_option_symbol(short_put_symbol)
     if not parts:
         return None
-    # distance = short_strike - underlying_spot
     return float(parts.strike) - float(underlying_mid)
 
 
-def _compute_otm_percent(short_put_symbol: str, underlying_mid: float) -> Optional[float]:
-    """
-    OTM% for the short put relative to current underlying:
-      OTM% = (underlying_mid - short_strike) / underlying_mid
-    Positive when underlying is above the put strike (put is OTM),
-    and approaches 0 as underlying moves down toward/through the strike.
-    """
+def _compute_distance_points_call_short(short_call_symbol: str, underlying_mid: float) -> Optional[float]:
+    parts = parse_occ_option_symbol(short_call_symbol)
+    if not parts:
+        return None
+    return float(underlying_mid) - float(parts.strike)
+
+
+def _compute_otm_percent_put_short(short_put_symbol: str, underlying_mid: float) -> Optional[float]:
     if underlying_mid <= 0:
         return None
     parts = parse_occ_option_symbol(short_put_symbol)
@@ -90,46 +333,64 @@ def _compute_otm_percent(short_put_symbol: str, underlying_mid: float) -> Option
     return (float(underlying_mid) - float(parts.strike)) / float(underlying_mid)
 
 
-def _entry_to_order_legs(candidate: PutSpreadCandidate) -> list[Dict[str, Any]]:
-    # Entry for bull put credit spread:
-    #   Leg 1 (short): sell_to_open higher strike put
-    #   Leg 2 (long):  buy_to_open lower strike put
-    return [
-        {
-            "symbol": candidate.short_put_symbol,
-            "ratio_qty": 1.0,
-            "side": OrderSide.SELL,
-            "position_intent": PositionIntent.SELL_TO_OPEN,
-        },
-        {
-            "symbol": candidate.long_put_symbol,
-            "ratio_qty": 1.0,
-            "side": OrderSide.BUY,
-            "position_intent": PositionIntent.BUY_TO_OPEN,
-        },
-    ]
+def _compute_otm_percent_call_short(short_call_symbol: str, underlying_mid: float) -> Optional[float]:
+    if underlying_mid <= 0:
+        return None
+    parts = parse_occ_option_symbol(short_call_symbol)
+    if not parts:
+        return None
+    return (float(parts.strike) - float(underlying_mid)) / float(underlying_mid)
 
 
-def _exit_to_order_legs(open_spread: Dict[str, Any]) -> list[Dict[str, Any]]:
-    # Closing bull put credit spread:
-    #   Leg 1 (short): buy_to_close the higher strike put
-    #   Leg 2 (long):  sell_to_close the lower strike put
-    short_sym = open_spread["short_put_symbol"]
-    long_sym = open_spread["long_put_symbol"]
-    return [
-        {
-            "symbol": short_sym,
-            "ratio_qty": 1.0,
-            "side": OrderSide.BUY,
-            "position_intent": PositionIntent.BUY_TO_CLOSE,
-        },
-        {
-            "symbol": long_sym,
-            "ratio_qty": 1.0,
-            "side": OrderSide.SELL,
-            "position_intent": PositionIntent.SELL_TO_CLOSE,
-        },
-    ]
+def _distance_gate_met(
+    open_spread: Dict[str, Any],
+    underlying_mid: float,
+    strategy_type: str,
+    ec: SimpleNamespace,
+) -> Tuple[bool, Optional[str]]:
+    if ec.distance_buffer_otm_fraction is not None:
+        threshold_otm_pct = float(ec.min_short_otm_percent) * float(ec.distance_buffer_otm_fraction)
+        if strategy_type == _STRATEGY_PCS:
+            otm = _compute_otm_percent_put_short(open_spread["short_put_symbol"], underlying_mid)
+            if otm is not None and otm <= threshold_otm_pct:
+                return True, f"otm_gate_put otm_pct={otm:.4f}<={threshold_otm_pct:.4f}"
+        elif strategy_type == _STRATEGY_CCS:
+            otm = _compute_otm_percent_call_short(open_spread["short_call_symbol"], underlying_mid)
+            if otm is not None and otm <= threshold_otm_pct:
+                return True, f"otm_gate_call otm_pct={otm:.4f}<={threshold_otm_pct:.4f}"
+        elif strategy_type == _STRATEGY_IC:
+            otm_p = _compute_otm_percent_put_short(open_spread["short_put_symbol"], underlying_mid)
+            otm_c = _compute_otm_percent_call_short(open_spread["short_call_symbol"], underlying_mid)
+            if otm_p is not None and otm_p <= threshold_otm_pct:
+                return True, f"otm_gate_ic_put otm_pct={otm_p:.4f}<={threshold_otm_pct:.4f}"
+            if otm_c is not None and otm_c <= threshold_otm_pct:
+                return True, f"otm_gate_ic_call otm_pct={otm_c:.4f}<={threshold_otm_pct:.4f}"
+    else:
+        if strategy_type == _STRATEGY_PCS:
+            d = _compute_distance_points_put_short(open_spread["short_put_symbol"], underlying_mid)
+            if d is not None and d >= ec.distance_buffer_points:
+                return True, f"distance_buffer_put d={d:.4f}"
+        elif strategy_type == _STRATEGY_CCS:
+            d = _compute_distance_points_call_short(open_spread["short_call_symbol"], underlying_mid)
+            if d is not None and d >= ec.distance_buffer_points:
+                return True, f"distance_buffer_call d={d:.4f}"
+        elif strategy_type == _STRATEGY_IC:
+            d_p = _compute_distance_points_put_short(open_spread["short_put_symbol"], underlying_mid)
+            d_c = _compute_distance_points_call_short(open_spread["short_call_symbol"], underlying_mid)
+            if d_p is not None and d_p >= ec.distance_buffer_points:
+                return True, f"distance_buffer_ic_put d={d_p:.4f}"
+            if d_c is not None and d_c >= ec.distance_buffer_points:
+                return True, f"distance_buffer_ic_call d={d_c:.4f}"
+    return False, None
+
+
+def _expiry_symbol_for_open(open_spread: Dict[str, Any]) -> str:
+    st = _open_spread_strategy_type(open_spread)
+    if st == _STRATEGY_CCS:
+        return str(open_spread["short_call_symbol"])
+    if st == _STRATEGY_IC:
+        return str(open_spread["short_put_symbol"])
+    return str(open_spread["short_put_symbol"])
 
 
 class AlpacaPutSpreadRunner:
@@ -146,14 +407,29 @@ class AlpacaPutSpreadRunner:
         self.option_data_client = option_data_client
         self.cfg = cfg
         self.state = load_state()
+        ensure_state_shape(self.state)
 
-        # Ensure expected shape
-        self.state.setdefault("open_spread_by_underlying", {})
-        self.state.setdefault("pending_entry_order_by_underlying", {})
-        self.state.setdefault("pending_close_order_by_underlying", {})
-        self.state.setdefault("cooldown_until_ts_by_underlying", {})
-        self.state.setdefault("entry_retry_count_by_underlying", {})
-        self.state.setdefault("entry_disabled_by_underlying", {})
+    def _enabled_strategies(self) -> List[str]:
+        out: List[str] = []
+        if self.cfg.put_credit_spread.enabled:
+            out.append(_STRATEGY_PCS)
+        if self.cfg.call_credit_spread.enabled:
+            out.append(_STRATEGY_CCS)
+        if self.cfg.iron_condor.enabled:
+            out.append(_STRATEGY_IC)
+        return out
+
+    def _underlying_may_hunt_entry(self, underlying: str) -> bool:
+        """True if any enabled strategy could reach chain selection (no open, no pending, not disabled)."""
+        for st in self._enabled_strategies():
+            if get_nested(self.state, "open_positions", underlying, st):
+                continue
+            if get_nested(self.state, PENDING_ENTRY, underlying, st):
+                continue
+            if get_nested(self.state, ENTRY_DISABLED, underlying, st):
+                continue
+            return True
+        return False
 
     def _is_terminal_order_status(self, status: str) -> bool:
         s = (status or "").lower()
@@ -166,196 +442,116 @@ class AlpacaPutSpreadRunner:
             s = str(getattr(o, "status", "")).lower()
             return s.split(".")[-1]
         except Exception:
-            # If we can't query, treat as non-terminal to avoid duplicate order submission.
             return "unknown"
 
     def _within_hunt_window(self) -> bool:
-        """
-        Gate opening/hunting new positions by local weekday + time window.
-        If not configured, returns True.
-        """
         if not self.cfg.trade_window_timezone or not self.cfg.trade_window_start_time_local or not self.cfg.trade_window_end_time_local:
             return True
-
         tz = pytz.timezone(self.cfg.trade_window_timezone)
         now_local = datetime.now(tz)
-
         if now_local.weekday() not in self.cfg.trade_window_weekdays:
             return False
-
         start_t = datetime.strptime(self.cfg.trade_window_start_time_local, "%H:%M").time()
         end_t = datetime.strptime(self.cfg.trade_window_end_time_local, "%H:%M").time()
-
         if start_t <= end_t:
             return start_t <= now_local.time() <= end_t
-
-        # Window wraps midnight (e.g., 22:00 -> 02:00)
         return now_local.time() >= start_t or now_local.time() <= end_t
 
-    def _clear_open_spread_if_not_in_positions(self, underlying: str) -> None:
-        open_spread = (self.state.get("open_spread_by_underlying") or {}).get(underlying)
+    def _clear_open_spread_if_not_in_positions(self, underlying: str, strategy_type: str) -> None:
+        open_spread = get_nested(self.state, "open_positions", underlying, strategy_type)
         if not open_spread:
             return
-        # If we already have a close order pending for this underlying, don't
-        # clear state yet (prevents duplicate close orders).
-        if (self.state.get("pending_close_order_by_underlying") or {}).get(underlying):
+        if get_nested(self.state, PENDING_CLOSE, underlying, strategy_type):
             return
         try:
             open_positions = list_open_positions(self.trading_client)
         except Exception:
-            # If we can't query, leave state as-is.
             return
-        short_sym = open_spread.get("short_put_symbol")
-        long_sym = open_spread.get("long_put_symbol")
-        short_qty = float(open_positions.get(short_sym, {}).get("qty", 0.0)) if short_sym else 0.0
-        long_qty = float(open_positions.get(long_sym, {}).get("qty", 0.0)) if long_sym else 0.0
-        if short_qty == 0.0 and long_qty == 0.0:
-            logger.info("[%s] Clearing stale open spread state (legs no longer open)", underlying)
-            self.state["open_spread_by_underlying"].pop(underlying, None)
+        syms = _spread_legs_from_state(open_spread)
+        if not syms:
+            return
+        all_flat = all(float(open_positions.get(s, {}).get("qty", 0.0) or 0.0) == 0.0 for s in syms)
+        if all_flat:
+            logger.info("[%s][%s] Clearing stale open state (legs flat)", underlying, strategy_type)
+            pop_nested(self.state, "open_positions", underlying, strategy_type)
             save_state(self.state)
 
-    def _maybe_close(self, underlying: str, open_spread: Dict[str, Any]) -> bool:
-        """
-        Returns True if we submitted/filled a close and cleared state, else False.
-        """
-        reason = None
+    def _maybe_close(self, underlying: str, open_spread: Dict[str, Any], strategy_type: str) -> bool:
+        st = _open_spread_strategy_type(open_spread)
+        if st != strategy_type:
+            logger.warning("[%s] strategy_type mismatch open=%s loop=%s", underlying, st, strategy_type)
+        ec = _exit_cfg(self.cfg, strategy_type)
+        reason: Optional[str] = None
 
-        # Underlying distance buffer / gating.
-        # Requirement: TP/SL should not close the trade unless distance-gate is met.
         underlying_mid = get_latest_mid(self.stock_data_client, underlying)
         if underlying_mid <= 0:
             return False
 
-        distance_gate_met = False
-        distance_gate_reason = None
+        distance_gate_met, distance_reason = _distance_gate_met(open_spread, underlying_mid, strategy_type, ec)
+        if distance_gate_met:
+            reason = distance_reason
 
-        if self.cfg.distance_buffer_otm_fraction_of_min_short_otm is not None:
-            threshold_otm_pct = float(self.cfg.min_short_otm_percent) * float(
-                self.cfg.distance_buffer_otm_fraction_of_min_short_otm
+        if distance_gate_met:
+            legs = _pricing_legs_from_open(open_spread)
+            entry_credit = float(open_spread["entry_net_credit_mid"])
+            triggered, sl_reason = tp_sl_triggered(
+                None,
+                entry_credit,
+                ec.tp_pct,
+                ec.sl_pct,
+                legs=legs,
+                bid_ask_for=lambda sym: _option_bid_ask(self.option_data_client, sym),
             )
-            otm_pct = _compute_otm_percent(open_spread["short_put_symbol"], underlying_mid)
-            if otm_pct is not None:
-                # "distance moved below 1%" => OTM% <= threshold => gate met
-                if otm_pct <= threshold_otm_pct:
-                    distance_gate_met = True
-                    distance_gate_reason = (
-                        f"otm_gate otm_pct={otm_pct:.4f} <= threshold={threshold_otm_pct:.4f}"
-                    )
-        else:
-            # Backward compatible absolute-distance rule.
-            distance = _compute_distance_points(open_spread["short_put_symbol"], underlying_mid)
-            if distance is not None and distance >= self.cfg.distance_buffer_points:
-                distance_gate_met = True
-                distance_gate_reason = f"distance_buffer distance={distance:.4f}"
+            if triggered:
+                reason = sl_reason if not reason else (reason + f" + {sl_reason}")
 
-        if distance_gate_met:
-            reason = distance_gate_reason
-
-        # TP/SL based on net spread mid from option quotes
-        # Only check TP/SL once distance gate is met.
-        if distance_gate_met:
-            mid_short = _option_mid(self.option_data_client, open_spread["short_put_symbol"])
-            mid_long = _option_mid(self.option_data_client, open_spread["long_put_symbol"])
-            if mid_short is not None and mid_long is not None:
-                current_net_credit = mid_short - mid_long
-                entry_credit = float(open_spread["entry_net_credit_mid"])
-                triggered, sl_reason = tp_sl_triggered(
-                    current_net_credit_mid=current_net_credit,
-                    entry_net_credit_mid=entry_credit,
-                    tp_pct=self.cfg.tp_pct,
-                    sl_pct=self.cfg.sl_pct,
-                )
-                if triggered:
-                    reason = sl_reason if not reason else (reason + f" + {sl_reason}")
-
-        # 0DTE expiry cutoff (approx in US/Eastern 16:00 by default)
-        expiry_utc = option_expiry_utc(open_spread["short_put_symbol"])
+        exp_sym = _expiry_symbol_for_open(open_spread)
+        expiry_utc = option_expiry_utc(exp_sym)
         if expiry_utc is not None:
             now_utc = datetime.now(timezone.utc)
-            cutoff = expiry_utc - timedelta(minutes=self.cfg.exit_before_minutes)
+            cutoff = expiry_utc - timedelta(minutes=ec.exit_before_minutes)
             if now_utc >= cutoff:
                 reason = reason or "expiry_cutoff"
 
         if not reason:
             return False
 
-        logger.info("[%s] Closing bull put spread (%s)", underlying, reason)
+        logger.info("[%s][%s] Closing (%s)", underlying, strategy_type, reason)
         if "tp" in (reason or "").lower():
             alert_tp_triggered(underlying, reason or "")
         elif "sl" in (reason or "").lower():
             alert_sl_triggered(underlying, reason or "")
-        log_event("close_triggered", reason or "", underlying=underlying, extra={"reason": reason})
+        log_event(
+            "close_triggered",
+            reason or "",
+            underlying=underlying,
+            extra={"reason": reason, "strategy_type": strategy_type},
+        )
 
         if not self.cfg.execute:
-            # Paper config: do not modify state because no order was placed.
-            logger.info("[%s] execute=false; would close spread now", underlying)
+            logger.info("[%s][%s] execute=false; would close now", underlying, strategy_type)
             return False
 
-        # Close order already pending: poll its status and return.
-        pending_close = (self.state.get("pending_close_order_by_underlying") or {}).get(underlying)
+        pending_close = get_nested(self.state, PENDING_CLOSE, underlying, strategy_type)
         if pending_close:
-            order_id = pending_close.get("order_id")
-            submitted_at_ts = float(pending_close.get("submitted_at_ts", 0.0) or 0.0)
-            if not order_id:
-                self.state["pending_close_order_by_underlying"].pop(underlying, None)
-                save_state(self.state)
-                return False
+            return self._poll_pending_close(underlying, open_spread, strategy_type, pending_close, ec)
 
-            status = self._get_order_status(order_id)
-            if status == "filled":
-                open_spread = (self.state.get("open_spread_by_underlying") or {}).get(underlying)
-                spread_id = open_spread.get("spread_id") if open_spread else None
-                entry_credit = float(open_spread.get("entry_net_credit_mid", 0.0)) if open_spread else 0.0
-                close_debit = float(pending_close.get("close_debit_limit", 0.0) or 0.0)
-                if spread_id and close_debit > 0:
-                    db_close_spread(spread_id, order_id, close_debit, pending_close.get("close_reason", "close"), entry_credit, self.cfg.order_qty)
-                    pnl = (entry_credit - close_debit) * 100.0 * self.cfg.order_qty
-                    alert_close_filled(underlying, order_id, pending_close.get("close_reason", "close"), pnl)
-                db_update_order_status(order_id, "filled")
-                log_event("close_filled", f"order_id={order_id}", underlying=underlying, extra={"order_id": order_id})
-                self.state["pending_close_order_by_underlying"].pop(underlying, None)
-                self.state["open_spread_by_underlying"].pop(underlying, None)
-                self.state["cooldown_until_ts_by_underlying"][underlying] = time.time() + (
-                    int(self.cfg.exit_cooldown_minutes) * 60
-                )
-                save_state(self.state)
-                logger.info("[%s] Close filled; pending+state cleared", underlying)
-                return True
-
-            if self._is_terminal_order_status(status) and status != "filled":
-                # Terminal but not filled => clear pending; allow close retry next loop.
-                self.state["pending_close_order_by_underlying"].pop(underlying, None)
-                save_state(self.state)
-                logger.warning("[%s] Close order terminal status=%s; state cleared for retry", underlying, status)
-                return False
-
-            # Not terminal yet: if it's been too long, cancel and retry.
-            if submitted_at_ts and (time.time() - submitted_at_ts) >= self.cfg.order_fill_timeout_seconds:
-                try:
-                    cancel_order(self.trading_client, order_id)
-                except Exception:
-                    pass
-                self.state["pending_close_order_by_underlying"].pop(underlying, None)
-                save_state(self.state)
-                logger.warning("[%s] Close order timed out; canceled pending close for retry", underlying)
-                return False
-
-            # Still working: don't submit a new close order.
-            return False
-
-        # Close by submitting an mleg debit limit.
-        # debit_limit ~= current_net_credit_mid (credit spread value) * (1 + slippage)
-        # If we couldn't compute current net credit, fall back to entry credit.
-        current_net_credit = mid_short - mid_long if (mid_short is not None and mid_long is not None) else float(
-            open_spread.get("entry_net_credit_mid", 0.0)
+        legs_p = _pricing_legs_from_open(open_spread)
+        current_net = current_net_credit_mid_from_legs(
+            legs_p,
+            lambda sym: _option_bid_ask(self.option_data_client, sym),
         )
-        if current_net_credit <= 0:
-            logger.warning("[%s] Cannot compute positive debit to close; skipping close", underlying)
+        if current_net is None or current_net <= 0:
+            current_net = float(open_spread.get("entry_net_credit_mid", 0.0))
+        if current_net <= 0:
+            logger.warning("[%s][%s] Cannot compute positive debit to close; skip", underlying, strategy_type)
             return False
-        close_debit_limit = current_net_credit * (1.0 + self.cfg.close_limit_slippage_pct)
 
-        close_legs = _exit_to_order_legs(open_spread)
-        client_order_id = f"alpaca_put_spread_close:{underlying}:{int(time.time())}"
+        close_debit_limit = _close_debit_limit_with_min_slippage(
+            float(current_net), ec.close_limit_slippage_pct
+        )
+        close_legs = _exit_legs_from_open(open_spread)
+        client_order_id = f"alpaca_{strategy_type.lower()}_close:{underlying}:{int(time.time())}"
         order_id = submit_mleg_limit_order(
             self.trading_client,
             qty=int(self.cfg.order_qty),
@@ -363,29 +559,38 @@ class AlpacaPutSpreadRunner:
             legs=close_legs,
             client_order_id=client_order_id,
         )
-        logger.info("[%s] Submitted close order_id=%s limit_debit=%.4f", underlying, order_id, close_debit_limit)
+        logger.info("[%s][%s] Submitted close order_id=%s debit_limit=%.4f", underlying, strategy_type, order_id, close_debit_limit)
 
+        db_syms = _spread_legs_from_state(open_spread)
         db_insert_order(
             order_id=order_id,
             underlying=underlying,
             side="close",
             status="submitted",
             client_order_id=client_order_id,
+            strategy_type=strategy_type,
+            legs=db_syms or None,
             short_put_symbol=open_spread.get("short_put_symbol"),
             long_put_symbol=open_spread.get("long_put_symbol"),
             limit_price=close_debit_limit,
             qty=self.cfg.order_qty,
+            raw_snapshot={"strategy_type": strategy_type, "legs": db_syms},
         )
-        log_event("close_submitted", f"order_id={order_id} reason={reason}", underlying=underlying, extra={"order_id": order_id})
+        log_event("close_submitted", f"order_id={order_id}", underlying=underlying, extra={"order_id": order_id, "strategy_type": strategy_type})
         alert_close_submitted(underlying, order_id, reason or "close", close_debit_limit)
 
-        # Persist pending close order immediately so we don't resubmit on restart.
-        self.state["pending_close_order_by_underlying"][underlying] = {
-            "order_id": order_id,
-            "submitted_at_ts": time.time(),
-            "close_debit_limit": close_debit_limit,
-            "close_reason": reason,
-        }
+        set_nested(
+            self.state,
+            PENDING_CLOSE,
+            underlying,
+            strategy_type,
+            {
+                "order_id": order_id,
+                "submitted_at_ts": time.time(),
+                "close_debit_limit": close_debit_limit,
+                "close_reason": reason,
+            },
+        )
         save_state(self.state)
 
         final = wait_for_order(
@@ -399,14 +604,59 @@ class AlpacaPutSpreadRunner:
                 cancel_order(self.trading_client, order_id)
             except Exception:
                 pass
-            # Clear pending so we can retry later (or stop, depending on retry logic).
-            self.state["pending_close_order_by_underlying"].pop(underlying, None)
+            pop_nested(self.state, PENDING_CLOSE, underlying, strategy_type)
             save_state(self.state)
-            logger.warning("[%s] Close order not filled (status=%s); leaving state", underlying, status)
+            logger.warning("[%s][%s] Close not filled status=%s", underlying, strategy_type, status)
             return False
 
-        # Filled => DB, alerts, then clear state (same as async poll path)
-        pending_close = self.state.get("pending_close_order_by_underlying", {}).get(underlying, {})
+        pending_close = get_nested(self.state, PENDING_CLOSE, underlying, strategy_type) or {}
+        return self._finalize_close_fill(underlying, open_spread, strategy_type, order_id, pending_close, ec)
+
+    def _poll_pending_close(
+        self,
+        underlying: str,
+        open_spread: Dict[str, Any],
+        strategy_type: str,
+        pending_close: Dict[str, Any],
+        ec: SimpleNamespace,
+    ) -> bool:
+        order_id = pending_close.get("order_id")
+        submitted_at_ts = float(pending_close.get("submitted_at_ts", 0.0) or 0.0)
+        if not order_id:
+            pop_nested(self.state, PENDING_CLOSE, underlying, strategy_type)
+            save_state(self.state)
+            return False
+
+        status = self._get_order_status(order_id)
+        if status == "filled":
+            return self._finalize_close_fill(underlying, open_spread, strategy_type, order_id, pending_close, ec)
+
+        if self._is_terminal_order_status(status) and status != "filled":
+            pop_nested(self.state, PENDING_CLOSE, underlying, strategy_type)
+            save_state(self.state)
+            logger.warning("[%s][%s] Close terminal status=%s", underlying, strategy_type, status)
+            return False
+
+        if submitted_at_ts and (time.time() - submitted_at_ts) >= self.cfg.order_fill_timeout_seconds:
+            try:
+                cancel_order(self.trading_client, order_id)
+            except Exception:
+                pass
+            pop_nested(self.state, PENDING_CLOSE, underlying, strategy_type)
+            save_state(self.state)
+            logger.warning("[%s][%s] Close timed out", underlying, strategy_type)
+            return False
+        return False
+
+    def _finalize_close_fill(
+        self,
+        underlying: str,
+        open_spread: Dict[str, Any],
+        strategy_type: str,
+        order_id: str,
+        pending_close: Dict[str, Any],
+        ec: SimpleNamespace,
+    ) -> bool:
         spread_id = open_spread.get("spread_id")
         entry_credit = float(open_spread.get("entry_net_credit_mid", 0.0))
         close_debit = float(pending_close.get("close_debit_limit", 0.0) or 0.0)
@@ -416,175 +666,115 @@ class AlpacaPutSpreadRunner:
             pnl = (entry_credit - close_debit) * 100.0 * self.cfg.order_qty
             alert_close_filled(underlying, order_id, close_reason, pnl)
         db_update_order_status(order_id, "filled")
-        log_event("close_filled", f"order_id={order_id}", underlying=underlying, extra={"order_id": order_id})
+        log_event("close_filled", f"order_id={order_id}", underlying=underlying, extra={"order_id": order_id, "strategy_type": strategy_type})
 
-        self.state["pending_close_order_by_underlying"].pop(underlying, None)
-        self.state["open_spread_by_underlying"].pop(underlying, None)
-        # After a close fill, start cooldown gating for next entry hunting.
-        self.state["cooldown_until_ts_by_underlying"][underlying] = time.time() + (
-            int(self.cfg.exit_cooldown_minutes) * 60
-        )
+        pop_nested(self.state, PENDING_CLOSE, underlying, strategy_type)
+        pop_nested(self.state, "open_positions", underlying, strategy_type)
+        cooldown_until = time.time() + int(ec.exit_cooldown_minutes) * 60
+        set_nested(self.state, COOLDOWN, underlying, strategy_type, cooldown_until)
         save_state(self.state)
-        logger.info("[%s] Close filled; state cleared", underlying)
+        logger.info("[%s][%s] Close filled; state cleared", underlying, strategy_type)
         return True
 
-    def _maybe_open(self, underlying: str) -> None:
-        logger.info("[%s] scanning for candidate bull put credit spread...", underlying)
-        open_spread = (self.state.get("open_spread_by_underlying") or {}).get(underlying)
-        if open_spread:
+    def _maybe_open(self, underlying: str, strategy_type: str, chain: Optional[Any] = None) -> None:
+        logger.info("[%s][%s] scanning for candidate...", underlying, strategy_type)
+        if get_nested(self.state, "open_positions", underlying, strategy_type):
             return
-        if (self.state.get("entry_disabled_by_underlying") or {}).get(underlying):
+        if get_nested(self.state, ENTRY_DISABLED, underlying, strategy_type):
             return
 
-        pending_entry = (self.state.get("pending_entry_order_by_underlying") or {}).get(underlying)
+        pending_entry = get_nested(self.state, PENDING_ENTRY, underlying, strategy_type)
         if pending_entry:
-            order_id = pending_entry.get("order_id")
-            submitted_at_ts = float(pending_entry.get("submitted_at_ts", 0.0) or 0.0)
-            if not order_id:
-                self.state["pending_entry_order_by_underlying"].pop(underlying, None)
-                save_state(self.state)
-                return
-
-            status = self._get_order_status(order_id)
-            if status == "filled":
-                # Build open_spread from the stored candidate snapshot.
-                short_sym = pending_entry.get("short_put_symbol")
-                long_sym = pending_entry.get("long_put_symbol")
-                entry_credit_mid = float(pending_entry.get("entry_net_credit_mid", 0.0))
-                if short_sym and long_sym:
-                    # Best-effort recompute entry credit from latest quotes.
-                    mid_short = _option_mid(self.option_data_client, short_sym)
-                    mid_long = _option_mid(self.option_data_client, long_sym)
-                    if mid_short is not None and mid_long is not None:
-                        entry_credit_mid = float(mid_short - mid_long)
-                    underlying_mid = get_latest_mid(self.stock_data_client, underlying)
-                    spread_id = db_insert_spread(
-                        underlying=underlying,
-                        short_put_symbol=short_sym,
-                        long_put_symbol=long_sym,
-                        entry_credit_mid=entry_credit_mid,
-                        entry_order_id=order_id,
-                    )
-                    db_update_order_status(order_id, "filled")
-                    open_spread = {
-                        "spread_id": spread_id,
-                        "entry_order_id": order_id,
-                        "short_put_symbol": short_sym,
-                        "long_put_symbol": long_sym,
-                        "entry_net_credit_mid": float(entry_credit_mid),
-                        "entry_underlying_mid": float(underlying_mid) if underlying_mid else None,
-                        "opened_at_ts": float(pending_entry.get("submitted_at_ts", time.time())),
-                    }
-                    self.state["open_spread_by_underlying"][underlying] = open_spread
-                    log_event("entry_filled", f"order_id={order_id} spread_id={spread_id}", underlying=underlying, extra={"order_id": order_id, "spread_id": spread_id})
-                    alert_entry_filled(underlying, order_id, entry_credit_mid)
-                self.state["pending_entry_order_by_underlying"].pop(underlying, None)
-                self.state["entry_retry_count_by_underlying"].pop(underlying, None)
-                self.state["entry_disabled_by_underlying"].pop(underlying, None)
-                save_state(self.state)
-                logger.info("[%s] Entry filled; pending->open state stored", underlying)
-                return
-
-            if self._is_terminal_order_status(status) and status != "filled":
-                # Don't retry: clear the pending order and disable further hunting
-                # for this underlying until you restart / manually change config/state.
-                self.state["pending_entry_order_by_underlying"].pop(underlying, None)
-                self.state["entry_disabled_by_underlying"][underlying] = True
-                logger.warning("[%s] Entry order terminal status=%s; not retrying => disabling entry", underlying, status)
-                save_state(self.state)
-                return
-
-            # Still working: keep polling on every loop; do not submit a new entry.
+            self._handle_pending_entry(underlying, strategy_type, pending_entry)
             return
 
-        # Entry retry disabled/attempt tracking is handled above.
-        # Only gate hunting when we are about to submit a *new* entry (no pending order).
         if not self._within_hunt_window():
-            logger.info(
-                "[%s] entry hunting gated by trade window (tz=%s weekdays=%s start=%s end=%s); skipping open",
-                underlying,
-                self.cfg.trade_window_timezone,
-                sorted(self.cfg.trade_window_weekdays),
-                self.cfg.trade_window_start_time_local,
-                self.cfg.trade_window_end_time_local,
-            )
+            logger.info("[%s][%s] gated by trade window", underlying, strategy_type)
             return
 
-        # Loss cap gating: block new entries if daily PnL exceeds configured caps.
         if self.cfg.max_daily_loss_dollars > 0:
             daily_pnl = get_daily_pnl()
             if daily_pnl <= -self.cfg.max_daily_loss_dollars:
-                logger.warning(
-                    "[%s] Entry hunting blocked by daily loss cap: daily_pnl=%.2f cap=%.2f",
-                    underlying, daily_pnl, self.cfg.max_daily_loss_dollars,
-                )
-                log_event("loss_cap_block", f"daily PnL={daily_pnl:.2f} <= -{self.cfg.max_daily_loss_dollars}", underlying=underlying)
+                logger.warning("[%s] blocked by daily loss cap", underlying)
+                log_event("loss_cap_block", f"daily PnL={daily_pnl:.2f}", underlying=underlying)
                 alert_loss_cap_hit(None, daily_pnl, self.cfg.max_daily_loss_dollars)
                 return
         if self.cfg.max_loss_per_underlying_dollars > 0:
             und_pnl = get_pnl_by_underlying_today(underlying)
             if und_pnl <= -self.cfg.max_loss_per_underlying_dollars:
-                logger.warning(
-                    "[%s] Entry hunting blocked by per-underlying loss cap: pnl=%.2f cap=%.2f",
-                    underlying, und_pnl, self.cfg.max_loss_per_underlying_dollars,
-                )
-                log_event("loss_cap_block", f"{underlying} PnL={und_pnl:.2f} <= -{self.cfg.max_loss_per_underlying_dollars}", underlying=underlying)
+                logger.warning("[%s] blocked by per-underlying loss cap", underlying)
+                log_event("loss_cap_block", f"{underlying} PnL={und_pnl:.2f}", underlying=underlying)
                 alert_loss_cap_hit(underlying, und_pnl, self.cfg.max_loss_per_underlying_dollars)
                 return
 
-        # Cooldown gating: after a close fills, wait N minutes before hunting
-        # for a new entry for the same underlying.
-        cooldown_until_ts = float(
-            (self.state.get("cooldown_until_ts_by_underlying") or {}).get(underlying, 0.0) or 0.0
-        )
-        now_ts = time.time()
-        if cooldown_until_ts and now_ts < cooldown_until_ts:
-            remaining_s = cooldown_until_ts - now_ts
-            logger.info(
-                "[%s] Entry hunting cooldown active: %.0fs remaining",
-                underlying,
-                remaining_s,
-            )
+        cooldown_until_ts = float(get_nested(self.state, COOLDOWN, underlying, strategy_type) or 0.0)
+        if cooldown_until_ts and time.time() < cooldown_until_ts:
+            logger.info("[%s][%s] cooldown active", underlying, strategy_type)
             return
 
-        # Select candidate bull put credit spread using option chain filters
+        underlying_mid = get_latest_mid(self.stock_data_client, underlying)
+        spot = underlying_mid if underlying_mid and underlying_mid > 0 else None
+
+        candidate: Any = None
+        entry_legs: List[Dict[str, Any]] = []
         try:
-            underlying_mid = get_latest_mid(self.stock_data_client, underlying)
-            candidate = select_bull_put_credit_spread(
-                underlying=underlying,
-                option_data_client=self.option_data_client,
-                cfg=self.cfg,
-                underlying_spot_mid=underlying_mid if underlying_mid and underlying_mid > 0 else None,
-            )
+            if strategy_type == _STRATEGY_PCS:
+                candidate = select_bull_put_credit_spread(
+                    underlying=underlying,
+                    option_data_client=self.option_data_client,
+                    cfg=self.cfg.put_credit_spread,
+                    underlying_spot_mid=spot,
+                    chain=chain,
+                )
+                if candidate:
+                    entry_legs = _entry_legs_pcs(candidate)
+            elif strategy_type == _STRATEGY_CCS:
+                candidate = select_bear_call_credit_spread(
+                    underlying=underlying,
+                    option_data_client=self.option_data_client,
+                    cfg=self.cfg.call_credit_spread,
+                    underlying_spot_mid=spot,
+                    chain=chain,
+                )
+                if candidate:
+                    entry_legs = _entry_legs_ccs(candidate)
+            elif strategy_type == _STRATEGY_IC:
+                candidate = select_iron_condor(
+                    underlying=underlying,
+                    option_data_client=self.option_data_client,
+                    cfg=self.cfg.iron_condor,
+                    underlying_spot_mid=spot,
+                    chain=chain,
+                )
+                if candidate:
+                    entry_legs = _entry_legs_ic(candidate)
         except Exception as e:
-            logger.warning("[%s] option-chain selection failed: %s", underlying, e)
-            log_event("api_error", str(e), underlying=underlying, extra={"operation": "option_chain"})
+            logger.warning("[%s][%s] selection failed: %s", underlying, strategy_type, e)
+            log_event("api_error", str(e), underlying=underlying, extra={"operation": "option_chain", "strategy_type": strategy_type})
             alert_api_error(underlying, "option_chain", str(e))
             return
 
         if not candidate:
-            logger.info("[%s] no candidate spread found (filters/target not met).", underlying)
+            logger.info("[%s][%s] no candidate", underlying, strategy_type)
             return
-
-        logger.info(
-            "[%s] Candidate bull put credit spread: long=%s short=%s entry_net_credit_mid=%.4f",
-            underlying,
-            candidate.long_put_symbol,
-            candidate.short_put_symbol,
-            candidate.entry_net_credit_mid,
-        )
 
         if not self.cfg.execute:
-            logger.info("[%s] execute=false; would submit entry mleg now", underlying)
+            logger.info("[%s][%s] execute=false; would submit entry", underlying, strategy_type)
             return
 
-        # Submit entry mleg:
-        #   For mleg limit_price, negative => credit.
-        entry_limit_credit = float(self.cfg.target_credit)
-        entry_limit_price = -entry_limit_credit
-        entry_legs = _entry_to_order_legs(candidate)
-        client_order_id = f"alpaca_put_spread_open:{underlying}:{int(time.time())}"
+        entry_net_credit_mid = float(getattr(candidate, "entry_net_credit_mid", 0.0) or 0.0)
+        if entry_net_credit_mid <= 0:
+            logger.warning(
+                "[%s][%s] invalid entry_net_credit_mid=%s; skip entry",
+                underlying,
+                strategy_type,
+                entry_net_credit_mid,
+            )
+            return
 
+        # Alpaca credit: negative limit; use live mid from candidate (YAML target_credit is selection-only).
+        entry_limit_price = -entry_net_credit_mid
+        client_order_id = f"alpaca_{strategy_type.lower()}_open:{underlying}:{int(time.time())}"
         order_id = submit_mleg_limit_order(
             self.trading_client,
             qty=int(self.cfg.order_qty),
@@ -593,57 +783,207 @@ class AlpacaPutSpreadRunner:
             client_order_id=client_order_id,
         )
 
+        db_syms = _spread_legs_from_state(_open_dict_from_candidate(strategy_type, candidate))
+        short_p = long_p = None
+        if strategy_type == _STRATEGY_PCS:
+            short_p = candidate.short_put_symbol
+            long_p = candidate.long_put_symbol
         db_insert_order(
             order_id=order_id,
             underlying=underlying,
             side="open",
             status="submitted",
             client_order_id=client_order_id,
-            short_put_symbol=candidate.short_put_symbol,
-            long_put_symbol=candidate.long_put_symbol,
-            limit_price=-entry_limit_credit,
+            strategy_type=strategy_type,
+            legs=db_syms or None,
+            short_put_symbol=short_p,
+            long_put_symbol=long_p,
+            limit_price=entry_limit_price,
             qty=self.cfg.order_qty,
-            raw_snapshot={"short": candidate.short_put_symbol, "long": candidate.long_put_symbol},
+            raw_snapshot={"strategy_type": strategy_type, "legs": db_syms},
         )
-        log_event("entry_submitted", f"order_id={order_id}", underlying=underlying, extra={"order_id": order_id})
-        alert_entry_submitted(underlying, order_id, entry_limit_credit)
+        log_event("entry_submitted", f"order_id={order_id}", underlying=underlying, extra={"order_id": order_id, "strategy_type": strategy_type})
+        alert_entry_submitted(underlying, order_id, entry_net_credit_mid)
 
-        # Persist pending entry order immediately so we don't open multiples
-        # for this underlying and can recover after restart.
-        pending_entry_snapshot = {
-            "order_id": order_id,
-            "submitted_at_ts": time.time(),
-            "short_put_symbol": candidate.short_put_symbol,
-            "long_put_symbol": candidate.long_put_symbol,
-            "entry_net_credit_mid": float(candidate.entry_net_credit_mid),
-        }
-        self.state["pending_entry_order_by_underlying"][underlying] = pending_entry_snapshot
+        snap = _pending_snapshot_from_candidate(strategy_type, candidate)
+        snap["order_id"] = order_id
+        set_nested(self.state, PENDING_ENTRY, underlying, strategy_type, snap)
         save_state(self.state)
+        logger.info("[%s][%s] Submitted entry order_id=%s", underlying, strategy_type, order_id)
 
-        logger.info(
-            "[%s] Submitted entry order_id=%s net_credit_limit=%.4f; will poll status until filled",
-            underlying,
-            order_id,
-            entry_limit_credit,
-        )
-        # IMPORTANT: do not wait/retry here. We will evaluate TP/SL only after
-        # the order status becomes 'filled' in subsequent loop iterations.
-        return
+    def _handle_pending_entry(self, underlying: str, strategy_type: str, pending_entry: Dict[str, Any]) -> None:
+        order_id = pending_entry.get("order_id")
+        if not order_id:
+            pop_nested(self.state, PENDING_ENTRY, underlying, strategy_type)
+            save_state(self.state)
+            return
+
+        status = self._get_order_status(order_id)
+        if status == "filled":
+            entry_credit_mid = float(pending_entry.get("entry_net_credit_mid", 0.0))
+            syms = _spread_legs_from_state(_open_dict_from_pending(strategy_type, pending_entry))
+            if not syms:
+                pop_nested(self.state, PENDING_ENTRY, underlying, strategy_type)
+                save_state(self.state)
+                logger.warning("[%s][%s] Entry filled but no leg symbols in pending; cleared", underlying, strategy_type)
+                return
+
+            legs_for_recalc = _pricing_legs_from_open(_open_dict_from_pending(strategy_type, pending_entry))
+            recalc = current_net_credit_mid_from_legs(
+                legs_for_recalc,
+                lambda sym: _option_bid_ask(self.option_data_client, sym),
+            )
+            if recalc is not None:
+                entry_credit_mid = float(recalc)
+
+            underlying_mid = get_latest_mid(self.stock_data_client, underlying)
+            spread_id = db_insert_spread(
+                underlying=underlying,
+                entry_credit_mid=entry_credit_mid,
+                entry_order_id=order_id,
+                strategy_type=strategy_type,
+                legs=syms,
+                short_put_symbol=pending_entry.get("short_put_symbol"),
+                long_put_symbol=pending_entry.get("long_put_symbol"),
+            )
+            db_update_order_status(order_id, "filled")
+            open_spread = _open_spread_from_pending(strategy_type, pending_entry, spread_id, entry_credit_mid, underlying_mid)
+            set_nested(self.state, "open_positions", underlying, strategy_type, open_spread)
+            pop_nested(self.state, PENDING_ENTRY, underlying, strategy_type)
+            pop_nested(self.state, ENTRY_RETRY, underlying, strategy_type)
+            pop_nested(self.state, ENTRY_DISABLED, underlying, strategy_type)
+            save_state(self.state)
+            log_event(
+                "entry_filled",
+                f"order_id={order_id} spread_id={spread_id}",
+                underlying=underlying,
+                extra={"order_id": order_id, "spread_id": spread_id, "strategy_type": strategy_type},
+            )
+            alert_entry_filled(underlying, order_id, entry_credit_mid)
+            logger.info("[%s][%s] Entry filled spread_id=%s", underlying, strategy_type, spread_id)
+            return
+
+        if self._is_terminal_order_status(status) and status != "filled":
+            pop_nested(self.state, PENDING_ENTRY, underlying, strategy_type)
+            set_nested(self.state, ENTRY_DISABLED, underlying, strategy_type, True)
+            save_state(self.state)
+            logger.warning("[%s][%s] Entry terminal status=%s -> disabled", underlying, strategy_type, status)
+            return
 
     def run_forever(self) -> None:
-        loop_no = 0
         while True:
-            loop_no += 1
             for underlying in self.cfg.get_underlyings_for_today():
-                try:
-                    self._clear_open_spread_if_not_in_positions(underlying)
-                    open_spread = (self.state.get("open_spread_by_underlying") or {}).get(underlying)
-                    if open_spread:
-                        self._maybe_close(underlying, open_spread)
-                    else:
-                        self._maybe_open(underlying)
-                except Exception as e:
-                    logger.exception("[%s] Loop error: %s", underlying, e)
+                shared_chain: Optional[Any] = None
+                if self._underlying_may_hunt_entry(underlying):
+                    try:
+                        shared_chain = _get_chain_silent(self.option_data_client, underlying)
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] Shared option chain fetch failed (selectors will refetch if needed): %s",
+                            underlying,
+                            e,
+                        )
+                        shared_chain = None
 
+                for strategy_type in self._enabled_strategies():
+                    try:
+                        self._clear_open_spread_if_not_in_positions(underlying, strategy_type)
+                        open_spread = get_nested(self.state, "open_positions", underlying, strategy_type)
+                        if open_spread:
+                            self._maybe_close(underlying, open_spread, strategy_type)
+                        else:
+                            self._maybe_open(underlying, strategy_type, chain=shared_chain)
+                    except Exception as e:
+                        logger.exception("[%s][%s] Loop error: %s", underlying, strategy_type, e)
             time.sleep(self.cfg.loop_sleep_seconds)
 
+
+def _open_dict_from_candidate(strategy_type: str, candidate: Any) -> Dict[str, Any]:
+    if strategy_type == _STRATEGY_PCS:
+        c = candidate
+        return {
+            "strategy_type": strategy_type,
+            "short_put_symbol": c.short_put_symbol,
+            "long_put_symbol": c.long_put_symbol,
+            "legs": [c.short_put_symbol, c.long_put_symbol],
+        }
+    if strategy_type == _STRATEGY_CCS:
+        c = candidate
+        return {
+            "strategy_type": strategy_type,
+            "short_call_symbol": c.short_call_symbol,
+            "long_call_symbol": c.long_call_symbol,
+            "legs": [c.short_call_symbol, c.long_call_symbol],
+        }
+    c = candidate
+    return {
+        "strategy_type": strategy_type,
+        "long_put_symbol": c.long_put_symbol,
+        "short_put_symbol": c.short_put_symbol,
+        "short_call_symbol": c.short_call_symbol,
+        "long_call_symbol": c.long_call_symbol,
+        "legs": [c.long_put_symbol, c.short_put_symbol, c.short_call_symbol, c.long_call_symbol],
+    }
+
+
+def _pending_snapshot_from_candidate(strategy_type: str, candidate: Any) -> Dict[str, Any]:
+    snap: Dict[str, Any] = {
+        "submitted_at_ts": time.time(),
+        "strategy_type": strategy_type,
+        "entry_net_credit_mid": float(candidate.entry_net_credit_mid),
+    }
+    if strategy_type == _STRATEGY_PCS:
+        snap["short_put_symbol"] = candidate.short_put_symbol
+        snap["long_put_symbol"] = candidate.long_put_symbol
+    elif strategy_type == _STRATEGY_CCS:
+        snap["short_call_symbol"] = candidate.short_call_symbol
+        snap["long_call_symbol"] = candidate.long_call_symbol
+    else:
+        snap["long_put_symbol"] = candidate.long_put_symbol
+        snap["short_put_symbol"] = candidate.short_put_symbol
+        snap["short_call_symbol"] = candidate.short_call_symbol
+        snap["long_call_symbol"] = candidate.long_call_symbol
+    return snap
+
+
+def _open_dict_from_pending(strategy_type: str, pending: Dict[str, Any]) -> Dict[str, Any]:
+    d = dict(pending)
+    d["strategy_type"] = strategy_type
+    return d
+
+
+def _open_spread_from_pending(
+    strategy_type: str,
+    pending: Dict[str, Any],
+    spread_id: int,
+    entry_credit_mid: float,
+    underlying_mid: Optional[float],
+) -> Dict[str, Any]:
+    base = {
+        "spread_id": spread_id,
+        "entry_order_id": pending.get("order_id"),
+        "entry_net_credit_mid": float(entry_credit_mid),
+        "entry_underlying_mid": float(underlying_mid) if underlying_mid else None,
+        "opened_at_ts": float(pending.get("submitted_at_ts", time.time())),
+        "strategy_type": strategy_type,
+    }
+    if strategy_type == _STRATEGY_PCS:
+        base["short_put_symbol"] = pending["short_put_symbol"]
+        base["long_put_symbol"] = pending["long_put_symbol"]
+        base["legs"] = [pending["short_put_symbol"], pending["long_put_symbol"]]
+    elif strategy_type == _STRATEGY_CCS:
+        base["short_call_symbol"] = pending["short_call_symbol"]
+        base["long_call_symbol"] = pending["long_call_symbol"]
+        base["legs"] = [pending["short_call_symbol"], pending["long_call_symbol"]]
+    else:
+        base["long_put_symbol"] = pending["long_put_symbol"]
+        base["short_put_symbol"] = pending["short_put_symbol"]
+        base["short_call_symbol"] = pending["short_call_symbol"]
+        base["long_call_symbol"] = pending["long_call_symbol"]
+        base["legs"] = [
+            pending["long_put_symbol"],
+            pending["short_put_symbol"],
+            pending["short_call_symbol"],
+            pending["long_call_symbol"],
+        ]
+    return base

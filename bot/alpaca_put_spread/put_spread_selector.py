@@ -11,9 +11,9 @@ from alpaca.data.enums import OptionsFeed
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.requests import OptionChainRequest
 
-from bot.alpaca_put_spread.config import AlpacaPutSpreadConfig
+from bot.alpaca_put_spread.config import PutCreditSpreadStrategyConfig
 from bot.alpaca_put_spread.option_symbol import parse_occ_option_symbol
-from bot.alpaca_put_spread.put_spread_logic import (
+from bot.alpaca_put_spread.pricing_logic import (
     PutSpreadCandidate,
     entry_condition_met,
     net_credit_mid,
@@ -144,12 +144,13 @@ def select_bull_put_credit_spread(
     *,
     underlying: str,
     option_data_client: OptionHistoricalDataClient,
-    cfg: AlpacaPutSpreadConfig,
+    cfg: PutCreditSpreadStrategyConfig,
     underlying_spot_mid: Optional[float] = None,
+    chain: Optional[Any] = None,
 ) -> Optional[PutSpreadCandidate]:
     """
     MVP candidate selection (silent):
-      - Fetch option chain once
+      - Use ``chain`` if provided (shared prefetch), else fetch option chain once
       - Pick long put + short put from same chain using delta/IV/spread filters
       - Enforce bull put credit spread ordering and width
       - Compute net credit mid = mid(short) - mid(long)
@@ -157,7 +158,8 @@ def select_bull_put_credit_spread(
     """
     debug = os.getenv("ALPACA_PUT_SPREAD_DEBUG", "").strip().lower() in ("1", "true", "yes", "y", "on")
 
-    chain = _get_chain_silent(option_data_client, underlying)
+    if chain is None:
+        chain = _get_chain_silent(option_data_client, underlying)
     items = _normalize_chain_items(chain)
     if not items:
         return None

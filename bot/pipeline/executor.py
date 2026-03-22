@@ -18,74 +18,124 @@ from src.client.kalshi_client import KalshiClient
 logger = logging.getLogger(__name__)
 
 
-def _exit_price_cents_from_sell_order(sell_order: Optional[dict], side: str) -> Optional[int]:
+def _exit_price_cents_from_fill_rows(fills: List[dict], side: str) -> Optional[int]:
     """
-    Extract exit (fill) price in cents from a Kalshi sell-order response.
+    Weighted average exit price (cents per contract) on the **traded side**, using Kalshi
+    fill rows from GET /portfolio/fills. Each fill exposes both yes_price_dollars and
+    no_price_dollars; we use the one matching `side` so we never apply 100 - price heuristics.
 
-    Uses side-specific price to avoid the inverted opposite-side bug: when selling NO,
-    yes_price can reflect the counterparty's side (wrong). We must use no_price for NO
-    sells and yes_price for YES sells. Prefer taker_fill_cost/fill_count when available
-    (actual execution price) over limit prices.
+    See: https://docs.kalshi.com/api-reference/portfolio/get-fills.md (Fill schema).
+    """
+    side = (side or "").strip().lower()
+    if side not in ("yes", "no") or not fills:
+        return None
+    key_d = "no_price_dollars" if side == "no" else "yes_price_dollars"
+    key_dep = "no_price_fixed" if side == "no" else "yes_price_fixed"
+    total_weighted_cents = 0.0
+    total_n = 0
+    for f in fills:
+        if not isinstance(f, dict):
+            continue
+        n = KalshiClient._parse_count_fp(f.get("count_fp") or f.get("count"))
+        if n <= 0:
+            continue
+        pd = f.get(key_d) if f.get(key_d) is not None else f.get(key_dep)
+        if pd is None:
+            continue
+        try:
+            cents = float(pd) * 100.0
+        except (TypeError, ValueError):
+            continue
+        total_weighted_cents += cents * float(n)
+        total_n += n
+    if total_n <= 0:
+        return None
+    # Half-up (avoid Python 3 banker's rounding on .5 ties for money-like cents).
+    avg = total_weighted_cents / float(total_n)
+    return int(avg + 0.5)
+
+
+def _exit_price_cents_from_sell_order_fallback(sell_order: Optional[dict], side: str) -> Optional[int]:
+    """
+    Used only when fills are missing (lag / API). Avoids taker_fill_cost/fill_count: on sells that
+    field often does not match per-contract proceeds on the traded side (~100 - true for NO).
     """
     if not sell_order or not isinstance(sell_order, dict):
         return None
     side = (side or "").strip().lower()
 
-    # 1. Prefer taker_fill_cost / fill_count (actual fill price per contract)
-    fill_count = sell_order.get("fill_count") or sell_order.get("filled_count") or 0
-    try:
-        fill_count = int(fill_count)
-    except (TypeError, ValueError):
-        fill_count = 0
-    if fill_count > 0:
-        taker_cost = sell_order.get("taker_fill_cost")
-        if taker_cost is not None:
-            try:
-                return int(round(float(taker_cost) / fill_count))
-            except (TypeError, ValueError):
-                pass
-        # Try dollar variant
-        taker_cost_d = sell_order.get("taker_fill_cost_dollars")
-        if taker_cost_d is not None:
-            try:
-                return int(round(float(taker_cost_d) * 100 / fill_count))
-            except (TypeError, ValueError):
-                pass
-
-    # 2. Side-specific price (avoid inverted opposite-side): NO sells -> no_price, YES sells -> yes_price
-    if side == "no":
-        for key in ("no_price", "no_price_dollars"):
-            v = sell_order.get(key)
-            if v is not None:
-                try:
-                    return int(round(float(v) * 100)) if "dollars" in key else int(round(float(v)))
-                except (TypeError, ValueError):
-                    pass
-    else:
-        for key in ("yes_price", "yes_price_dollars"):
-            v = sell_order.get(key)
-            if v is not None:
-                try:
-                    return int(round(float(v) * 100)) if "dollars" in key else int(round(float(v)))
-                except (TypeError, ValueError):
-                    pass
-
-    # 3. Fallback: average_fill_price (if API provides it)
     for key in ("average_fill_price", "avg_fill_price"):
         v = sell_order.get(key)
         if v is not None:
             try:
-                return int(round(float(v)))
+                c = int(round(float(v)))
+                if 0 <= c <= 100:
+                    return c
             except (TypeError, ValueError):
                 pass
-    for key in ("average_fill_price_dollars",):
+    for key in ("average_fill_price_dollars", "avg_fill_price_dollars"):
         v = sell_order.get(key)
         if v is not None:
             try:
-                return int(round(float(v) * 100))
+                c = int(round(float(v) * 100))
+                if 0 <= c <= 100:
+                    return c
             except (TypeError, ValueError):
                 pass
+
+    # Side-specific display/limit fields: reject 1c aggressive IOC limit (not the fill).
+    if side == "no":
+        for key in ("no_price_dollars", "no_price"):
+            v = sell_order.get(key)
+            if v is None:
+                continue
+            try:
+                c = int(round(float(v) * 100)) if "dollars" in key else int(round(float(v)))
+            except (TypeError, ValueError):
+                continue
+            if 2 <= c <= 99:
+                return c
+    else:
+        for key in ("yes_price_dollars", "yes_price"):
+            v = sell_order.get(key)
+            if v is None:
+                continue
+            try:
+                c = int(round(float(v) * 100)) if "dollars" in key else int(round(float(v)))
+            except (TypeError, ValueError):
+                continue
+            if 2 <= c <= 99:
+                return c
     return None
+
+
+def _resolve_exit_price_cents_for_market_sell(
+    kalshi_client: Optional[KalshiClient],
+    sell_order_id: Optional[str],
+    side: str,
+    sell_order: Optional[dict],
+) -> Optional[int]:
+    """
+    Primary: portfolio fills for sell_order_id (true per-side execution prices).
+    Fallback: order snapshot fields that are not the 1c IOC limit artifact.
+    """
+    side = (side or "").strip().lower()
+    if kalshi_client and sell_order_id:
+        for attempt in range(2):
+            try:
+                fills = kalshi_client.get_all_fills(order_id=str(sell_order_id), max_pages=5, limit=200)
+                px = _exit_price_cents_from_fill_rows(fills, side)
+                if px is not None:
+                    return px
+            except Exception as e:
+                logger.debug("[EXECUTION] get_all_fills for exit price order_id=%s: %s", sell_order_id, e)
+            if attempt == 0:
+                time.sleep(0.2)
+        logger.warning(
+            "[EXECUTION] No fills yet for sell order_id=%s; using order snapshot fallback for exit_price_cents",
+            sell_order_id,
+        )
+    return _exit_price_cents_from_sell_order_fallback(sell_order, side)
 
 
 def _sl_audit_db_path() -> Path:
@@ -491,7 +541,12 @@ class PipelineExecutor:
                                 if getattr(entry_record, "placement_bid_cents", None) is not None
                                 else (entry_record.limit_price_cents or 99)
                             )
-                            exit_price_cents = _exit_price_cents_from_sell_order(so_d, side)
+                            exit_price_cents = _resolve_exit_price_cents_for_market_sell(
+                                self._kalshi_client,
+                                str(sell_order_id) if sell_order_id else None,
+                                side,
+                                so_d,
+                            )
                             pnl_cents: Optional[int] = None
                             if exit_price_cents is not None:
                                 pnl_cents = (exit_price_cents - entry_price) * sell_count
