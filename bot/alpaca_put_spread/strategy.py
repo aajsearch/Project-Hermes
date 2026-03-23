@@ -487,31 +487,31 @@ class AlpacaPutSpreadRunner:
         if underlying_mid <= 0:
             return False
 
-        distance_gate_met, distance_reason = _distance_gate_met(open_spread, underlying_mid, strategy_type, ec)
-        if distance_gate_met:
-            reason = distance_reason
-
-        if distance_gate_met:
-            legs = _pricing_legs_from_open(open_spread)
-            entry_credit = float(open_spread["entry_net_credit_mid"])
-            triggered, sl_reason = tp_sl_triggered(
-                None,
-                entry_credit,
-                ec.tp_pct,
-                ec.sl_pct,
-                legs=legs,
-                bid_ask_for=lambda sym: _option_bid_ask(self.option_data_client, sym),
-            )
-            if triggered:
-                reason = sl_reason if not reason else (reason + f" + {sl_reason}")
-
+        # Expiry cutoff closes regardless of distance gate or TP/SL.
         exp_sym = _expiry_symbol_for_open(open_spread)
         expiry_utc = option_expiry_utc(exp_sym)
         if expiry_utc is not None:
             now_utc = datetime.now(timezone.utc)
             cutoff = expiry_utc - timedelta(minutes=ec.exit_before_minutes)
             if now_utc >= cutoff:
-                reason = reason or "expiry_cutoff"
+                reason = "expiry_cutoff"
+
+        # Distance / OTM gate only unlocks TP/SL; proximity alone must not force a close.
+        if reason is None:
+            distance_gate_met, _ = _distance_gate_met(open_spread, underlying_mid, strategy_type, ec)
+            if distance_gate_met:
+                legs = _pricing_legs_from_open(open_spread)
+                entry_credit = float(open_spread["entry_net_credit_mid"])
+                triggered, tp_sl_tag = tp_sl_triggered(
+                    None,
+                    entry_credit,
+                    ec.tp_pct,
+                    ec.sl_pct,
+                    legs=legs,
+                    bid_ask_for=lambda sym: _option_bid_ask(self.option_data_client, sym),
+                )
+                if triggered:
+                    reason = tp_sl_tag
 
         if not reason:
             return False

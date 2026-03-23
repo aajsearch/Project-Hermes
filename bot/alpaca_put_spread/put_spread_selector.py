@@ -81,6 +81,16 @@ def _normalize_chain_items(chain: Any) -> List[Tuple[str, Any]]:
         return []
 
 
+def _filter_chain_by_expiry(chain_items: List[Tuple[str, Any]], expiry_yyyymmdd: str) -> List[Tuple[str, Any]]:
+    """Restrict chain rows to contracts sharing the same OCC expiry (YYMMDD string)."""
+    out: List[Tuple[str, Any]] = []
+    for sym, snap in chain_items:
+        p = parse_occ_option_symbol(sym)
+        if p and p.expiry_yyyymmdd == expiry_yyyymmdd:
+            out.append((sym, snap))
+    return out
+
+
 def _pick_best_put_from_chain(
     *,
     chain_items: List[Tuple[str, Any]],
@@ -375,19 +385,7 @@ def select_bull_put_credit_spread(
             logger.info("[%s] debug: greeks.delta missing -> using strike-extremes fallback", underlying)
         return _fallback_by_strike()
 
-    # Normal delta-based selection
-    long_pick = _pick_best_put_from_chain(
-        chain_items=items,
-        dte_min=cfg.dte_min,
-        dte_max=cfg.dte_max,
-        delta_abs_min=cfg.long_delta_abs_min,
-        delta_abs_max=cfg.long_delta_abs_max,
-        iv_max=cfg.iv_max,
-        spread_pct_max=cfg.spread_pct_max,
-        target_delta=cfg.long_target_delta,
-    )
-    if not long_pick:
-        return None
+    # Delta path: pick short leg first, then long only from the same expiration (vertical, not diagonal).
     short_pick = _pick_best_put_from_chain(
         chain_items=items,
         dte_min=cfg.dte_min,
@@ -400,12 +398,30 @@ def select_bull_put_credit_spread(
     )
     if not short_pick:
         return None
+    short_symbol, short_meta = short_pick
+    short_parts = parse_occ_option_symbol(short_symbol)
+    if not short_parts:
+        return None
+    same_exp = _filter_chain_by_expiry(items, short_parts.expiry_yyyymmdd)
+    if not same_exp:
+        return None
+
+    long_pick = _pick_best_put_from_chain(
+        chain_items=same_exp,
+        dte_min=cfg.dte_min,
+        dte_max=cfg.dte_max,
+        delta_abs_min=cfg.long_delta_abs_min,
+        delta_abs_max=cfg.long_delta_abs_max,
+        iv_max=cfg.iv_max,
+        spread_pct_max=cfg.spread_pct_max,
+        target_delta=cfg.long_target_delta,
+    )
+    if not long_pick:
+        return None
 
     long_symbol, long_meta = long_pick
-    short_symbol, short_meta = short_pick
 
     long_parts = parse_occ_option_symbol(long_symbol)
-    short_parts = parse_occ_option_symbol(short_symbol)
     if not long_parts or not short_parts:
         logger.debug("[%s] Failed to parse OCC option symbols", underlying)
         return None

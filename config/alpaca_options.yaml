@@ -17,8 +17,8 @@ alpaca_options:
   # Risk caps (operational safety). Block new entries when daily PnL <= -cap.
   # Set to 0 to disable.
   risk:
-    max_daily_loss_dollars: 500
-    max_loss_per_underlying_dollars: 200
+    max_daily_loss_dollars: 5000
+    max_loss_per_underlying_dollars: 2000
     # Only hunt/open new positions within this Pacific time window.
     # Timezone is DST-aware via America/Los_Angeles.
     trade_window_timezone: "America/Los_Angeles"
@@ -35,145 +35,112 @@ alpaca_options:
   underlyings_mon_to_fri: ["QQQ", "SPY", "IWM"]
   underlyings_mon_wed_fri: ["NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "AVGO"]
 
-  # Per-strategy tunables. Global runtime + risk stay at root.
+  # ---------------------------------------------------------------------------
+  # PAPER STRESS TEST PROFILE — "machine gun" (high churn, loose filters).
+  # Revert to conservative defaults before live. distance_buffer × min_otm = 10%
+  # gate → TP/SL evaluated on first tick after entry for typical 0DTE strikes.
+  # ---------------------------------------------------------------------------
   strategies:
     put_credit_spread:
       enabled: true
-      # For 0DTE we typically want dte_min=0 and dte_max=0.
       options:
         dte_min: 0
         dte_max: 0
-        # Candidate filters (simple MVP defaults; tune later)
-        spread_pct_max: 0.30
-        iv_max: 2.5
+        spread_pct_max: 1.0    # STRESS: ignore wide bid/ask
+        iv_max: 5.0            # STRESS: ignore IV spikes
 
-        # Pick the long and short put legs separately.
-        # Long cap < short floor avoids overlapping |delta| bands (strike ordering rejects many pairs otherwise).
         long_put:
-          # delta bounds passed as absolute values (function converts to negative range internally)
-          delta_abs_min: 0.03   # very cheap / far OTM protection
-          delta_abs_max: 0.10
+          delta_abs_min: 0.01
+          delta_abs_max: 0.15
           target_delta: -0.06
 
         short_put:
-          delta_abs_min: 0.12   # floor above long max (0.10) — no overlap
-          delta_abs_max: 0.25
-          target_delta: -0.18
+          delta_abs_min: 0.16   # floor just above long max
+          delta_abs_max: 0.45   # STRESS: allow near-the-money shorts
+          target_delta: -0.30
 
       entry:
-        # Net credit mid = mid(short) - mid(long), same units as Alpaca option quotes ($/share).
-        # Far-OTM long + ~12–25Δ short collects less than old 40–60Δ short; 0.20 was too tight for many chains.
-        # Tune with ALPACA_PUT_SPREAD_DEBUG=1: raise slightly if fills are too eager, lower if no candidates.
-        target_credit: 0.10
-        entry_operator: ">="   # ">=" or "<="
-        # Strike selection guard
-        # Bull put credit spread width = short_strike - long_strike
-        put_spread_width_points_min: 8.0
-        put_spread_width_points_max: 10.0
-
-        # Minimum OTM distance for the SHORT put at entry:
-        # short_put_strike <= underlying_spot_mid * (1 - min_short_otm_percent)
-        min_short_otm_percent: 0.02
-
-      exit:
-        tp_pct: 0.60
-        # Stop loss on spread mark (see pricing_logic.tp_sl_triggered):
-        #   SL fires when current_net_credit_mid >= entry_net_credit_mid * (1 + sl_pct).
-        # sl_pct: 2.0  =>  threshold = entry * 3  =>  exit when the mark reaches 3× entry credit
-        # (common "3× credit" risk framing relative to the entry credit mid).
-        sl_pct: 2.0
-        # After a position is closed (TP/SL), wait this long before hunting
-        # for a new entry for the same underlying.
-        exit_cooldown_minutes: 15
-        # Exit distance buffer expressed as OTM% gating.
-        # OTM% is computed as (underlying_mid - short_put_strike) / underlying_mid.
-        # We exit (and only then allow TP/SL exits) when:
-        #   OTM% <= min_short_otm_percent * distance_buffer_otm_fraction_of_min_short_otm
-        # If min_short_otm_percent=0.02 and fraction=0.5 => threshold=0.01 (1%).
-        distance_buffer_otm_fraction_of_min_short_otm: 0.50
-        # Close before option expiry time in US/Eastern
-        exit_before_minutes: 3
-        # When closing, submit a debit limit slightly worse than current mark to improve fill probability.
-        close_limit_slippage_pct: 0.02
-
-    # --- Call Credit Spread (CCS) — standard 0DTE starting config ---
-    # Volatility skew (crash fear → rich puts) and melt-up risk mean short calls are usually
-    # placed further OTM (lower delta) than comparable short puts.
-    call_credit_spread:
-      # Set true to run CCS alongside PCS (separate open state per underlying).
-      enabled: false
-      options:
-        dte_min: 0
-        dte_max: 0
-        spread_pct_max: 0.30
-        iv_max: 2.5
-
-        # Long call serves as structural protection
-        long_call:
-          delta_abs_min: 0.02
-          delta_abs_max: 0.06
-          target_delta: 0.04   # positive deltas for calls
-
-        # Short call placed further OTM than the put equivalent
-        short_call:
-          delta_abs_min: 0.08
-          delta_abs_max: 0.16
-          target_delta: 0.12
-
-      entry:
-        target_credit: 0.15
+        target_credit: 0.05    # STRESS: accept tiny credits to force entries
         entry_operator: ">="
-        # Tighter width for better Risk/Reward on ETFs
-        call_spread_width_points_min: 1.0
-        call_spread_width_points_max: 5.0
-        min_short_otm_percent: 0.02
+        put_spread_width_points_min: 1.0
+        put_spread_width_points_max: 20.0
+        min_short_otm_percent: 0.001   # STRESS: allow essentially ATM shorts
 
       exit:
-        tp_pct: 0.60
-        sl_pct: 2.0   # stop at ~3× entry credit (see pricing_logic.tp_sl_triggered)
-        exit_cooldown_minutes: 15
-        distance_buffer_otm_fraction_of_min_short_otm: 0.50
+        tp_pct: 0.10           # STRESS: 10% profit exit (fast)
+        sl_pct: 0.5            # STRESS: 50% loss exit (fast)
+        exit_cooldown_minutes: 1
+        # 0.001 * 100 => 10% OTM threshold → gate opens immediately for normal shorts
+        distance_buffer_otm_fraction_of_min_short_otm: 100.0
         exit_before_minutes: 3
-        close_limit_slippage_pct: 0.02
+        close_limit_slippage_pct: 0.05
 
-    # --- Iron Condor (IC) — standard 0DTE starting config ---
-    # Premium on both sides → higher total credit; two short strikes sandbox the underlying.
-    # Widen strikes slightly (lower deltas), take profit earlier (4-leg slippage), allow more spread% on quotes.
-    iron_condor:
-      # Set true to run 4-leg IC (separate open state per underlying).
-      enabled: false
+    call_credit_spread:
+      enabled: true            # STRESS: on
       options:
         dte_min: 0
         dte_max: 0
-        spread_pct_max: 0.35   # slightly higher tolerance for 4 legs
-        iv_max: 2.5
+        spread_pct_max: 1.0
+        iv_max: 5.0
 
-        # Symmetrical delta targeting to balance the wings
+        long_call:
+          delta_abs_min: 0.01
+          delta_abs_max: 0.15
+          target_delta: 0.06
+
+        short_call:
+          delta_abs_min: 0.16
+          delta_abs_max: 0.45
+          target_delta: 0.30
+
+      entry:
+        target_credit: 0.05
+        entry_operator: ">="
+        call_spread_width_points_min: 1.0
+        call_spread_width_points_max: 20.0
+        min_short_otm_percent: 0.001
+
+      exit:
+        tp_pct: 0.10
+        sl_pct: 0.5
+        exit_cooldown_minutes: 1
+        distance_buffer_otm_fraction_of_min_short_otm: 100.0
+        exit_before_minutes: 3
+        close_limit_slippage_pct: 0.05
+
+    iron_condor:
+      enabled: true            # STRESS: on
+      options:
+        dte_min: 0
+        dte_max: 0
+        spread_pct_max: 1.5    # STRESS: 4-leg quote tolerance
+        iv_max: 5.0
+
         long_legs:
-          delta_abs_min: 0.02
-          delta_abs_max: 0.08
+          delta_abs_min: 0.01
+          delta_abs_max: 0.15
           target_delta: 0.05
 
         short_legs:
-          delta_abs_min: 0.09
-          delta_abs_max: 0.15
-          target_delta: 0.12
+          delta_abs_min: 0.16
+          delta_abs_max: 0.35  # slightly tighter so wings do not overlap
+          target_delta: 0.20
 
       entry:
-        # Combined credit target (PCS + CCS style total for the full condor)
-        target_credit: 0.35
+        target_credit: 0.10
         entry_operator: ">="
-        # Keeping wings symmetrical
-        wing_width_points_min: 2.0
-        wing_width_points_max: 5.0
+        wing_width_points_min: 1.0
+        wing_width_points_max: 20.0
+        # Align exit OTM gate math with PCS/CCS (IC selector does not filter on this today)
+        min_short_otm_percent: 0.001
 
       exit:
-        # Take profit earlier on ICs — avoid late-day gamma / 4-leg slippage
-        tp_pct: 0.50
-        sl_pct: 1.5   # tighter stop (~2.5× entry credit vs entry)
-        exit_cooldown_minutes: 30   # longer cooldown; ICs prefer calmer conditions
-        exit_before_minutes: 5   # close slightly earlier for 4-leg liquidity
-        close_limit_slippage_pct: 0.03   # higher slippage tolerance on close
+        tp_pct: 0.05           # STRESS: condors move slower — tighter TP
+        sl_pct: 0.3            # STRESS: 30% loss exit
+        exit_cooldown_minutes: 2
+        distance_buffer_otm_fraction_of_min_short_otm: 100.0
+        exit_before_minutes: 3
+        close_limit_slippage_pct: 0.08
 
   # Backward compatibility: if you omit strategies.put_credit_spread, you may keep flat
   # options / entry / exit at this root level and the loader will treat them as PCS defaults.

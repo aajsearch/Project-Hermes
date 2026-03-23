@@ -15,6 +15,7 @@ from bot.alpaca_put_spread.option_symbol import parse_occ_option_symbol
 from bot.alpaca_put_spread.pricing_logic import CallSpreadCandidate, entry_condition_met
 from bot.alpaca_put_spread.put_spread_selector import (
     _contract_dte_from_symbol,
+    _filter_chain_by_expiry,
     _get_chain_silent,
     _normalize_chain_items,
     _safe_get,
@@ -231,19 +232,7 @@ def select_bear_call_credit_spread(
             logger.info("[%s] CCS: greeks.delta missing -> strike fallback", underlying)
         return _fallback_by_strike()
 
-    long_pick = _pick_best_call_from_chain(
-        chain_items=items,
-        dte_min=cfg.dte_min,
-        dte_max=cfg.dte_max,
-        delta_abs_min=cfg.long_delta_abs_min,
-        delta_abs_max=cfg.long_delta_abs_max,
-        iv_max=cfg.iv_max,
-        spread_pct_max=cfg.spread_pct_max,
-        target_delta=cfg.long_target_delta,
-    )
-    if not long_pick:
-        return _fallback_by_strike()
-
+    # Delta path: short leg first, then long only from the same expiration (vertical bear call).
     short_pick = _pick_best_call_from_chain(
         chain_items=items,
         dte_min=cfg.dte_min,
@@ -257,11 +246,31 @@ def select_bear_call_credit_spread(
     if not short_pick:
         return _fallback_by_strike()
 
-    long_symbol, long_meta = long_pick
     short_symbol, short_meta = short_pick
+    short_parts = parse_occ_option_symbol(short_symbol)
+    if not short_parts:
+        return _fallback_by_strike()
+
+    same_exp = _filter_chain_by_expiry(items, short_parts.expiry_yyyymmdd)
+    if not same_exp:
+        return _fallback_by_strike()
+
+    long_pick = _pick_best_call_from_chain(
+        chain_items=same_exp,
+        dte_min=cfg.dte_min,
+        dte_max=cfg.dte_max,
+        delta_abs_min=cfg.long_delta_abs_min,
+        delta_abs_max=cfg.long_delta_abs_max,
+        iv_max=cfg.iv_max,
+        spread_pct_max=cfg.spread_pct_max,
+        target_delta=cfg.long_target_delta,
+    )
+    if not long_pick:
+        return _fallback_by_strike()
+
+    long_symbol, long_meta = long_pick
 
     long_parts = parse_occ_option_symbol(long_symbol)
-    short_parts = parse_occ_option_symbol(short_symbol)
     if not long_parts or not short_parts:
         return None
 
