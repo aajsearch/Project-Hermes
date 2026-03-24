@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -76,6 +77,20 @@ def _close_debit_limit_with_min_slippage(current_net: float, slippage_pct: float
     if slip_amount < _MIN_CLOSE_SLIPPAGE_DOLLARS:
         slip_amount = _MIN_CLOSE_SLIPPAGE_DOLLARS
     return c + slip_amount
+
+
+def _alpaca_limit_price(raw_price: float, *, is_credit: bool) -> float:
+    """
+    Normalize multi-leg limit price for Alpaca options:
+    - max 2 decimal places (cent precision)
+    - non-zero absolute value (>= $0.01)
+    - credit orders use negative sign, debit orders use positive sign
+    """
+    q = Decimal(str(abs(float(raw_price)))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if q < Decimal("0.01"):
+        q = Decimal("0.01")
+    out = -q if is_credit else q
+    return float(out)
 
 
 _STRATEGY_PCS = StrategyType.PUT_CREDIT_SPREAD.value
@@ -547,9 +562,10 @@ class AlpacaPutSpreadRunner:
             logger.warning("[%s][%s] Cannot compute positive debit to close; skip", underlying, strategy_type)
             return False
 
-        close_debit_limit = _close_debit_limit_with_min_slippage(
+        close_debit_limit_raw = _close_debit_limit_with_min_slippage(
             float(current_net), ec.close_limit_slippage_pct
         )
+        close_debit_limit = _alpaca_limit_price(close_debit_limit_raw, is_credit=False)
         close_legs = _exit_legs_from_open(open_spread)
         client_order_id = f"alpaca_{strategy_type.lower()}_close:{underlying}:{int(time.time())}"
         order_id = submit_mleg_limit_order(
@@ -604,13 +620,23 @@ class AlpacaPutSpreadRunner:
                 cancel_order(self.trading_client, order_id)
             except Exception:
                 pass
+            st = str(status).split(".")[-1].lower()
+            db_update_order_status(order_id, st)
             pop_nested(self.state, PENDING_CLOSE, underlying, strategy_type)
             save_state(self.state)
             logger.warning("[%s][%s] Close not filled status=%s", underlying, strategy_type, status)
             return False
 
         pending_close = get_nested(self.state, PENDING_CLOSE, underlying, strategy_type) or {}
-        return self._finalize_close_fill(underlying, open_spread, strategy_type, order_id, pending_close, ec)
+        return self._finalize_close_fill(
+            underlying,
+            open_spread,
+            strategy_type,
+            order_id,
+            pending_close,
+            ec,
+            close_debit_filled_avg=_filled_avg_price_from_order(final),
+        )
 
     def _poll_pending_close(
         self,
@@ -629,9 +655,23 @@ class AlpacaPutSpreadRunner:
 
         status = self._get_order_status(order_id)
         if status == "filled":
-            return self._finalize_close_fill(underlying, open_spread, strategy_type, order_id, pending_close, ec)
+            try:
+                o = self.trading_client.get_order_by_id(order_id)
+            except Exception:
+                o = None
+            fill = _filled_avg_price_from_order(o) if o is not None else None
+            return self._finalize_close_fill(
+                underlying,
+                open_spread,
+                strategy_type,
+                order_id,
+                pending_close,
+                ec,
+                close_debit_filled_avg=fill,
+            )
 
         if self._is_terminal_order_status(status) and status != "filled":
+            db_update_order_status(order_id, status)
             pop_nested(self.state, PENDING_CLOSE, underlying, strategy_type)
             save_state(self.state)
             logger.warning("[%s][%s] Close terminal status=%s", underlying, strategy_type, status)
@@ -642,6 +682,12 @@ class AlpacaPutSpreadRunner:
                 cancel_order(self.trading_client, order_id)
             except Exception:
                 pass
+            try:
+                o = self.trading_client.get_order_by_id(str(order_id))
+                st = str(getattr(o, "status", "canceled")).lower().split(".")[-1]
+            except Exception:
+                st = "canceled"
+            db_update_order_status(str(order_id), st)
             pop_nested(self.state, PENDING_CLOSE, underlying, strategy_type)
             save_state(self.state)
             logger.warning("[%s][%s] Close timed out", underlying, strategy_type)
@@ -656,16 +702,29 @@ class AlpacaPutSpreadRunner:
         order_id: str,
         pending_close: Dict[str, Any],
         ec: SimpleNamespace,
+        *,
+        close_debit_filled_avg: Optional[float] = None,
     ) -> bool:
         spread_id = open_spread.get("spread_id")
         entry_credit = float(open_spread.get("entry_net_credit_mid", 0.0))
-        close_debit = float(pending_close.get("close_debit_limit", 0.0) or 0.0)
+        limit_debit = float(pending_close.get("close_debit_limit", 0.0) or 0.0)
         close_reason = pending_close.get("close_reason", "close")
-        if spread_id and close_debit > 0:
-            db_close_spread(spread_id, order_id, close_debit, close_reason, entry_credit, self.cfg.order_qty)
-            pnl = (entry_credit - close_debit) * 100.0 * self.cfg.order_qty
+        debit_for_pnl = (
+            abs(float(close_debit_filled_avg)) if close_debit_filled_avg is not None else float(limit_debit)
+        )
+        if spread_id and debit_for_pnl > 0:
+            db_close_spread(
+                spread_id,
+                order_id,
+                limit_debit,
+                close_reason,
+                entry_credit,
+                self.cfg.order_qty,
+                filled_avg_price=close_debit_filled_avg,
+            )
+            pnl = (entry_credit - debit_for_pnl) * 100.0 * self.cfg.order_qty
             alert_close_filled(underlying, order_id, close_reason, pnl)
-        db_update_order_status(order_id, "filled")
+        db_update_order_status(order_id, "filled", filled_avg_price=close_debit_filled_avg)
         log_event("close_filled", f"order_id={order_id}", underlying=underlying, extra={"order_id": order_id, "strategy_type": strategy_type})
 
         pop_nested(self.state, PENDING_CLOSE, underlying, strategy_type)
@@ -773,7 +832,7 @@ class AlpacaPutSpreadRunner:
             return
 
         # Alpaca credit: negative limit; use live mid from candidate (YAML target_credit is selection-only).
-        entry_limit_price = -entry_net_credit_mid
+        entry_limit_price = _alpaca_limit_price(entry_net_credit_mid, is_credit=True)
         client_order_id = f"alpaca_{strategy_type.lower()}_open:{underlying}:{int(time.time())}"
         order_id = submit_mleg_limit_order(
             self.trading_client,
@@ -811,6 +870,59 @@ class AlpacaPutSpreadRunner:
         save_state(self.state)
         logger.info("[%s][%s] Submitted entry order_id=%s", underlying, strategy_type, order_id)
 
+    def _complete_entry_fill(
+        self,
+        underlying: str,
+        strategy_type: str,
+        pending_entry: Dict[str, Any],
+        order_obj: Any = None,
+    ) -> None:
+        order_id = str(pending_entry.get("order_id") or "")
+        if not order_id:
+            return
+        entry_credit_mid = float(pending_entry.get("entry_net_credit_mid", 0.0))
+        syms = _spread_legs_from_state(_open_dict_from_pending(strategy_type, pending_entry))
+        if not syms:
+            pop_nested(self.state, PENDING_ENTRY, underlying, strategy_type)
+            save_state(self.state)
+            logger.warning("[%s][%s] Entry filled but no leg symbols in pending; cleared", underlying, strategy_type)
+            return
+
+        legs_for_recalc = _pricing_legs_from_open(_open_dict_from_pending(strategy_type, pending_entry))
+        recalc = current_net_credit_mid_from_legs(
+            legs_for_recalc,
+            lambda sym: _option_bid_ask(self.option_data_client, sym),
+        )
+        if recalc is not None:
+            entry_credit_mid = float(recalc)
+
+        underlying_mid = get_latest_mid(self.stock_data_client, underlying)
+        spread_id = db_insert_spread(
+            underlying=underlying,
+            entry_credit_mid=entry_credit_mid,
+            entry_order_id=order_id,
+            strategy_type=strategy_type,
+            legs=syms,
+            short_put_symbol=pending_entry.get("short_put_symbol"),
+            long_put_symbol=pending_entry.get("long_put_symbol"),
+        )
+        favg = _filled_avg_price_from_order(order_obj) if order_obj is not None else None
+        db_update_order_status(order_id, "filled", filled_avg_price=favg)
+        open_spread = _open_spread_from_pending(strategy_type, pending_entry, spread_id, entry_credit_mid, underlying_mid)
+        set_nested(self.state, "open_positions", underlying, strategy_type, open_spread)
+        pop_nested(self.state, PENDING_ENTRY, underlying, strategy_type)
+        pop_nested(self.state, ENTRY_RETRY, underlying, strategy_type)
+        pop_nested(self.state, ENTRY_DISABLED, underlying, strategy_type)
+        save_state(self.state)
+        log_event(
+            "entry_filled",
+            f"order_id={order_id} spread_id={spread_id}",
+            underlying=underlying,
+            extra={"order_id": order_id, "spread_id": spread_id, "strategy_type": strategy_type},
+        )
+        alert_entry_filled(underlying, order_id, entry_credit_mid)
+        logger.info("[%s][%s] Entry filled spread_id=%s", underlying, strategy_type, spread_id)
+
     def _handle_pending_entry(self, underlying: str, strategy_type: str, pending_entry: Dict[str, Any]) -> None:
         order_id = pending_entry.get("order_id")
         if not order_id:
@@ -820,58 +932,115 @@ class AlpacaPutSpreadRunner:
 
         status = self._get_order_status(order_id)
         if status == "filled":
-            entry_credit_mid = float(pending_entry.get("entry_net_credit_mid", 0.0))
-            syms = _spread_legs_from_state(_open_dict_from_pending(strategy_type, pending_entry))
-            if not syms:
-                pop_nested(self.state, PENDING_ENTRY, underlying, strategy_type)
-                save_state(self.state)
-                logger.warning("[%s][%s] Entry filled but no leg symbols in pending; cleared", underlying, strategy_type)
-                return
-
-            legs_for_recalc = _pricing_legs_from_open(_open_dict_from_pending(strategy_type, pending_entry))
-            recalc = current_net_credit_mid_from_legs(
-                legs_for_recalc,
-                lambda sym: _option_bid_ask(self.option_data_client, sym),
-            )
-            if recalc is not None:
-                entry_credit_mid = float(recalc)
-
-            underlying_mid = get_latest_mid(self.stock_data_client, underlying)
-            spread_id = db_insert_spread(
-                underlying=underlying,
-                entry_credit_mid=entry_credit_mid,
-                entry_order_id=order_id,
-                strategy_type=strategy_type,
-                legs=syms,
-                short_put_symbol=pending_entry.get("short_put_symbol"),
-                long_put_symbol=pending_entry.get("long_put_symbol"),
-            )
-            db_update_order_status(order_id, "filled")
-            open_spread = _open_spread_from_pending(strategy_type, pending_entry, spread_id, entry_credit_mid, underlying_mid)
-            set_nested(self.state, "open_positions", underlying, strategy_type, open_spread)
-            pop_nested(self.state, PENDING_ENTRY, underlying, strategy_type)
-            pop_nested(self.state, ENTRY_RETRY, underlying, strategy_type)
-            pop_nested(self.state, ENTRY_DISABLED, underlying, strategy_type)
-            save_state(self.state)
-            log_event(
-                "entry_filled",
-                f"order_id={order_id} spread_id={spread_id}",
-                underlying=underlying,
-                extra={"order_id": order_id, "spread_id": spread_id, "strategy_type": strategy_type},
-            )
-            alert_entry_filled(underlying, order_id, entry_credit_mid)
-            logger.info("[%s][%s] Entry filled spread_id=%s", underlying, strategy_type, spread_id)
+            try:
+                o = self.trading_client.get_order_by_id(str(order_id))
+            except Exception:
+                o = None
+            self._complete_entry_fill(underlying, strategy_type, pending_entry, order_obj=o)
             return
 
         if self._is_terminal_order_status(status) and status != "filled":
+            db_update_order_status(str(order_id), status)
             pop_nested(self.state, PENDING_ENTRY, underlying, strategy_type)
-            set_nested(self.state, ENTRY_DISABLED, underlying, strategy_type, True)
+            pop_nested(self.state, ENTRY_DISABLED, underlying, strategy_type)
             save_state(self.state)
-            logger.warning("[%s][%s] Entry terminal status=%s -> disabled", underlying, strategy_type, status)
+            logger.warning("[%s][%s] Entry terminal status=%s; pending cleared (may hunt again)", underlying, strategy_type, status)
             return
+
+    def sync_pending_orders_with_broker(self) -> None:
+        """
+        Reconcile pending_entry / pending_close with Alpaca before pricing and exit logic.
+        Updates local DB order status and advances state when orders are terminal.
+        """
+        # Pending closes first (exit lifecycle).
+        pending_close_root = self.state.get(PENDING_CLOSE) or {}
+        for underlying in list(pending_close_root.keys()):
+            by_st = pending_close_root.get(underlying) or {}
+            if not isinstance(by_st, dict):
+                continue
+            for strategy_type in list(by_st.keys()):
+                pending_close = get_nested(self.state, PENDING_CLOSE, underlying, strategy_type)
+                if not isinstance(pending_close, dict):
+                    continue
+                order_id = pending_close.get("order_id")
+                if not order_id:
+                    continue
+                try:
+                    o = self.trading_client.get_order_by_id(str(order_id))
+                except Exception as e:
+                    logger.debug("[%s][%s] sync close: get_order %s failed: %s", underlying, strategy_type, order_id, e)
+                    continue
+                status = str(getattr(o, "status", "")).lower().split(".")[-1]
+                if status == "filled":
+                    open_spread = get_nested(self.state, "open_positions", underlying, strategy_type)
+                    if not open_spread:
+                        pop_nested(self.state, PENDING_CLOSE, underlying, strategy_type)
+                        save_state(self.state)
+                        continue
+                    ec = _exit_cfg(self.cfg, strategy_type)
+                    self._finalize_close_fill(
+                        underlying,
+                        open_spread,
+                        strategy_type,
+                        str(order_id),
+                        pending_close,
+                        ec,
+                        close_debit_filled_avg=_filled_avg_price_from_order(o),
+                    )
+                    continue
+                if self._is_terminal_order_status(status) and status != "filled":
+                    db_update_order_status(str(order_id), status)
+                    pop_nested(self.state, PENDING_CLOSE, underlying, strategy_type)
+                    save_state(self.state)
+                    logger.info(
+                        "[%s][%s] sync: close order %s terminal=%s; kept open_positions for retry",
+                        underlying,
+                        strategy_type,
+                        order_id,
+                        status,
+                    )
+
+        # Pending entries
+        pending_entry_root = self.state.get(PENDING_ENTRY) or {}
+        for underlying in list(pending_entry_root.keys()):
+            by_st = pending_entry_root.get(underlying) or {}
+            if not isinstance(by_st, dict):
+                continue
+            for strategy_type in list(by_st.keys()):
+                pending_entry = get_nested(self.state, PENDING_ENTRY, underlying, strategy_type)
+                if not isinstance(pending_entry, dict):
+                    continue
+                order_id = pending_entry.get("order_id")
+                if not order_id:
+                    continue
+                try:
+                    o = self.trading_client.get_order_by_id(str(order_id))
+                except Exception as e:
+                    logger.debug("[%s][%s] sync entry: get_order %s failed: %s", underlying, strategy_type, order_id, e)
+                    continue
+                status = str(getattr(o, "status", "")).lower().split(".")[-1]
+                if status == "filled":
+                    self._complete_entry_fill(underlying, strategy_type, pending_entry, order_obj=o)
+                    continue
+                if self._is_terminal_order_status(status) and status != "filled":
+                    db_update_order_status(str(order_id), status)
+                    pop_nested(self.state, PENDING_ENTRY, underlying, strategy_type)
+                    pop_nested(self.state, ENTRY_DISABLED, underlying, strategy_type)
+                    save_state(self.state)
+                    logger.info(
+                        "[%s][%s] sync: entry order %s terminal=%s; pending cleared",
+                        underlying,
+                        strategy_type,
+                        order_id,
+                        status,
+                    )
 
     def run_forever(self) -> None:
         while True:
+            try:
+                self.sync_pending_orders_with_broker()
+            except Exception as e:
+                logger.exception("sync_pending_orders_with_broker failed: %s", e)
             for underlying in self.cfg.get_underlyings_for_today():
                 shared_chain: Optional[Any] = None
                 if self._underlying_may_hunt_entry(underlying):
@@ -950,6 +1119,20 @@ def _open_dict_from_pending(strategy_type: str, pending: Dict[str, Any]) -> Dict
     d = dict(pending)
     d["strategy_type"] = strategy_type
     return d
+
+
+def _filled_avg_price_from_order(order: Any) -> Optional[float]:
+    """Alpaca Order.filled_avg_price for mleg (net); None if missing."""
+    v = getattr(order, "filled_avg_price", None)
+    if v is None:
+        return None
+    try:
+        f = float(v)
+        if f != f:  # NaN
+            return None
+        return f
+    except (TypeError, ValueError):
+        return None
 
 
 def _open_spread_from_pending(

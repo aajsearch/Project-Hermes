@@ -8,11 +8,11 @@ fifteen_min:
   strategies:
     continuous_alpha_limit_99:
       enabled: true
-      window_seconds: { btc: 180, eth: 180, sol: 180, xrp: 180 }
+      window_seconds: { btc: 150, eth: 150, sol: 150, xrp: 150 }
       
       # --- 1. ENTRY CONSTRAINTS (The 85-95 Sweet Spot) ---
-      limit_price_cents: 98
-      min_bid_cents: { btc: 93, eth: 93, sol: 94, xrp: 94 }
+      limit_price_cents: 99
+      min_bid_cents: { btc: 96, eth: 96, sol: 96, xrp: 96 }
       
       order_count: { btc: 100, eth: 100, sol: 100, xrp: 100 }
       max_cost_cents: 50000
@@ -32,7 +32,7 @@ fifteen_min:
 
       # --- 4. STATE TIMERS ---
       global_cooldown_seconds: 60
-      danger_persistence_seconds: { btc: 2.0, eth: 2.0, sol: 1.5, xrp: 1.0 }
+      danger_persistence_seconds: { btc: 2.5, eth: 2.5, sol: 1.5, xrp: 1.5 }
 
     # Legacy key (optional): strategy also reads last_90s_limit_99 if continuous_alpha_limit_99 missing
     # last_90s_limit_99:

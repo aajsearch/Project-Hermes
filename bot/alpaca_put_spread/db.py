@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+_DB_INIT_LOGGED_PATHS: set[str] = set()
 
 ORDERS_TABLE = "alpaca_orders"
 SPREADS_TABLE = "alpaca_spreads"
@@ -80,6 +81,10 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             WHERE strategy_type IS NULL OR TRIM(strategy_type) = ''
             """
         )
+
+    cols_orders = _table_columns(conn, ORDERS_TABLE)
+    if "filled_avg_price" not in cols_orders:
+        conn.execute(f"ALTER TABLE {ORDERS_TABLE} ADD COLUMN filled_avg_price REAL")
     conn.commit()
 
 
@@ -104,7 +109,8 @@ def init_alpaca_db(db_path: Optional[Path] = None) -> None:
                 qty INTEGER,
                 submitted_at REAL,
                 updated_at REAL,
-                raw_snapshot_json TEXT
+                raw_snapshot_json TEXT,
+                filled_avg_price REAL
             );
             CREATE INDEX IF NOT EXISTS idx_orders_underlying ON {ORDERS_TABLE}(underlying);
             CREATE INDEX IF NOT EXISTS idx_orders_side ON {ORDERS_TABLE}(side);
@@ -143,7 +149,10 @@ def init_alpaca_db(db_path: Optional[Path] = None) -> None:
         )
         conn.commit()
         _migrate_schema(conn)
-        logger.info("Alpaca options DB initialized at %s", path)
+        path_key = str(path.resolve())
+        if path_key not in _DB_INIT_LOGGED_PATHS:
+            logger.info("Alpaca options DB initialized at %s", path)
+            _DB_INIT_LOGGED_PATHS.add(path_key)
     finally:
         conn.close()
 
@@ -212,6 +221,7 @@ def update_order_status(
     order_id: str,
     status: str,
     *,
+    filled_avg_price: Optional[float] = None,
     db_path: Optional[Path] = None,
 ) -> None:
     import time
@@ -219,10 +229,20 @@ def update_order_status(
     path = db_path or _default_db_path()
     conn = sqlite3.connect(str(path))
     try:
-        conn.execute(
-            f"UPDATE {ORDERS_TABLE} SET status = ?, updated_at = ? WHERE order_id = ?",
-            (status, time.time(), order_id),
-        )
+        if filled_avg_price is not None:
+            conn.execute(
+                f"""
+                UPDATE {ORDERS_TABLE}
+                SET status = ?, updated_at = ?, filled_avg_price = COALESCE(?, filled_avg_price)
+                WHERE order_id = ?
+                """,
+                (status, time.time(), float(filled_avg_price), order_id),
+            )
+        else:
+            conn.execute(
+                f"UPDATE {ORDERS_TABLE} SET status = ?, updated_at = ? WHERE order_id = ?",
+                (status, time.time(), order_id),
+            )
         conn.commit()
     finally:
         conn.close()
@@ -275,11 +295,16 @@ def close_spread(
     entry_credit_mid: float,
     qty: int = 1,
     *,
+    filled_avg_price: Optional[float] = None,
     db_path: Optional[Path] = None,
 ) -> None:
     import time
 
-    pnl = (float(entry_credit_mid) - float(close_debit_mid)) * 100.0 * int(qty)
+    # Prefer Alpaca-reported net fill when provided (realized debit to close the spread).
+    debit_for_pnl = (
+        abs(float(filled_avg_price)) if filled_avg_price is not None else abs(float(close_debit_mid))
+    )
+    pnl = (float(entry_credit_mid) - debit_for_pnl) * 100.0 * int(qty)
     path = db_path or _default_db_path()
     conn = sqlite3.connect(str(path))
     try:
@@ -289,7 +314,7 @@ def close_spread(
             SET close_order_id = ?, close_debit_mid = ?, pnl_dollars = ?, closed_at = ?, close_reason = ?
             WHERE spread_id = ?
             """,
-            (close_order_id, close_debit_mid, pnl, time.time(), close_reason, spread_id),
+            (close_order_id, debit_for_pnl, pnl, time.time(), close_reason, spread_id),
         )
         conn.commit()
     finally:

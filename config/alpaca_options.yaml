@@ -36,9 +36,8 @@ alpaca_options:
   underlyings_mon_wed_fri: ["NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "AVGO"]
 
   # ---------------------------------------------------------------------------
-  # PAPER STRESS TEST PROFILE — "machine gun" (high churn, loose filters).
-  # Revert to conservative defaults before live. distance_buffer × min_otm = 10%
-  # gate → TP/SL evaluated on first tick after entry for typical 0DTE strikes.
+  # PRODUCTION "SNIPER" PROFILE — High probability, strict filters, low churn.
+  # Re-enabled distance gating, target deltas ~10–20Δ, strictly limited widths.
   # ---------------------------------------------------------------------------
   strategies:
     put_credit_spread:
@@ -46,101 +45,101 @@ alpaca_options:
       options:
         dte_min: 0
         dte_max: 0
-        spread_pct_max: 1.0    # STRESS: ignore wide bid/ask
-        iv_max: 5.0            # STRESS: ignore IV spikes
+        spread_pct_max: 0.30   # SNIPER: reject illiquid chains with wide bid/ask
+        iv_max: 2.5            # SNIPER: avoid extreme market panic/spikes
 
         long_put:
-          delta_abs_min: 0.01
-          delta_abs_max: 0.15
-          target_delta: -0.06
+          delta_abs_min: 0.02
+          delta_abs_max: 0.08
+          target_delta: -0.05  # Cheap protection
 
         short_put:
-          delta_abs_min: 0.16   # floor just above long max
-          delta_abs_max: 0.45   # STRESS: allow near-the-money shorts
-          target_delta: -0.30
+          delta_abs_min: 0.10  # SNIPER: far OTM, high win-rate
+          delta_abs_max: 0.20
+          target_delta: -0.15
 
       entry:
-        target_credit: 0.05    # STRESS: accept tiny credits to force entries
+        target_credit: 0.15    # Demand meaningful credit vs risk (per $/share mid)
         entry_operator: ">="
         put_spread_width_points_min: 1.0
-        put_spread_width_points_max: 20.0
-        min_short_otm_percent: 0.001   # STRESS: allow essentially ATM shorts
+        put_spread_width_points_max: 5.0  # Keep max risk tight on ETF spreads
+        min_short_otm_percent: 0.015      # Short strike at least ~1.5% OTM
 
       exit:
-        tp_pct: 0.10           # STRESS: 10% profit exit (fast)
-        sl_pct: 0.5            # STRESS: 50% loss exit (fast)
-        exit_cooldown_minutes: 1
-        # 0.001 * 100 => 10% OTM threshold → gate opens immediately for normal shorts
-        distance_buffer_otm_fraction_of_min_short_otm: 100.0
+        tp_pct: 0.60           # SNIPER: Let theta decay — exit when mark <= 40% of entry credit mid
+        sl_pct: 2.0            # Stop when mark >= 3× entry credit mid (1 + sl_pct)
+        exit_cooldown_minutes: 15
+
+        # Gate: TP/SL only after underlying is within (min_otm × fraction) of short (see strategy.py)
+        distance_buffer_otm_fraction_of_min_short_otm: 0.50
         exit_before_minutes: 3
-        close_limit_slippage_pct: 0.05
+        close_limit_slippage_pct: 0.02
 
     call_credit_spread:
-      enabled: true            # STRESS: on
+      enabled: true
       options:
         dte_min: 0
         dte_max: 0
-        spread_pct_max: 1.0
-        iv_max: 5.0
+        spread_pct_max: 0.30
+        iv_max: 2.5
 
         long_call:
-          delta_abs_min: 0.01
-          delta_abs_max: 0.15
-          target_delta: 0.06
+          delta_abs_min: 0.02
+          delta_abs_max: 0.06
+          target_delta: 0.04
 
         short_call:
-          delta_abs_min: 0.16
-          delta_abs_max: 0.45
-          target_delta: 0.30
+          delta_abs_min: 0.08
+          delta_abs_max: 0.16
+          target_delta: 0.12
 
       entry:
-        target_credit: 0.05
+        target_credit: 0.15
         entry_operator: ">="
         call_spread_width_points_min: 1.0
-        call_spread_width_points_max: 20.0
-        min_short_otm_percent: 0.001
+        call_spread_width_points_max: 5.0
+        min_short_otm_percent: 0.015
 
       exit:
-        tp_pct: 0.10
-        sl_pct: 0.5
-        exit_cooldown_minutes: 1
-        distance_buffer_otm_fraction_of_min_short_otm: 100.0
+        tp_pct: 0.60
+        sl_pct: 2.0
+        exit_cooldown_minutes: 15
+        distance_buffer_otm_fraction_of_min_short_otm: 0.50
         exit_before_minutes: 3
-        close_limit_slippage_pct: 0.05
+        close_limit_slippage_pct: 0.02
 
     iron_condor:
-      enabled: true            # STRESS: on
+      enabled: true
       options:
         dte_min: 0
         dte_max: 0
-        spread_pct_max: 1.5    # STRESS: 4-leg quote tolerance
-        iv_max: 5.0
+        spread_pct_max: 0.35   # Slightly looser for 4 legs
+        iv_max: 2.5
 
         long_legs:
-          delta_abs_min: 0.01
-          delta_abs_max: 0.15
+          delta_abs_min: 0.02
+          delta_abs_max: 0.08
           target_delta: 0.05
 
         short_legs:
-          delta_abs_min: 0.16
-          delta_abs_max: 0.35  # slightly tighter so wings do not overlap
-          target_delta: 0.20
+          delta_abs_min: 0.09
+          delta_abs_max: 0.15  # Tighter shorts for a wide body sandbox
+          target_delta: 0.12
 
       entry:
-        target_credit: 0.10
+        target_credit: 0.30
         entry_operator: ">="
-        wing_width_points_min: 1.0
-        wing_width_points_max: 20.0
-        # Align exit OTM gate math with PCS/CCS (IC selector does not filter on this today)
-        min_short_otm_percent: 0.001
+        wing_width_points_min: 2.0
+        wing_width_points_max: 5.0
+        min_short_otm_percent: 0.015
 
       exit:
-        tp_pct: 0.05           # STRESS: condors move slower — tighter TP
-        sl_pct: 0.3            # STRESS: 30% loss exit
-        exit_cooldown_minutes: 2
-        distance_buffer_otm_fraction_of_min_short_otm: 100.0
-        exit_before_minutes: 3
-        close_limit_slippage_pct: 0.08
+        tp_pct: 0.50
+        sl_pct: 1.5
+        exit_cooldown_minutes: 30
+        distance_buffer_otm_fraction_of_min_short_otm: 0.50
+        exit_before_minutes: 5
+        close_limit_slippage_pct: 0.03
 
   # Backward compatibility: if you omit strategies.put_credit_spread, you may keep flat
   # options / entry / exit at this root level and the loader will treat them as PCS defaults.

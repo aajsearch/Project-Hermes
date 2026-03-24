@@ -79,6 +79,7 @@ def main() -> None:
 
     # A small sleep so Alpaca account state stabilizes after process start.
     time.sleep(1)
+    # run_forever() calls sync_pending_orders_with_broker() at the top of each loop before pricing/entries.
     runner.run_forever()
 
 

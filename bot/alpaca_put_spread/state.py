@@ -13,6 +13,8 @@ STATE_PATH = Path("data") / "alpaca_put_spread_state.json"
 
 # JSON state shape (schema_version >= 2):
 #   open_positions: { "<UNDERLYING>": { "<STRATEGY_TYPE>": <spread dict | ...> } }
+# pending_entry_order / pending_close_order are reconciled against Alpaca each loop via
+# AlpacaPutSpreadRunner.sync_pending_orders_with_broker() before new entries or exits.
 # Example: open_positions["QQQ"]["PCS"] -> single open spread for that strategy.
 # Legacy flat key open_spread_by_underlying is migrated to open_positions[u]["PCS"] on load.
 OPEN_POSITIONS_ROOT = "open_positions"

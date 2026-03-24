@@ -15,10 +15,24 @@ def _to_email() -> Optional[str]:
     return (os.environ.get("SMTP_TO") or "").strip() or None
 
 
+def _alerts_enabled() -> bool:
+    """
+    Alert sending toggle.
+    Default is disabled to avoid noisy SMTP failures during stress tests.
+    Set ALPACA_ALERTS_ENABLED=1/true/yes/on to enable.
+    """
+    raw = (os.environ.get("ALPACA_ALERTS_ENABLED") or "").strip().lower()
+    return raw in ("1", "true", "yes", "y", "on")
+
+
 def send_alert(subject: str, body: str) -> bool:
     """
     Send email alert. Returns True if sent, False if skipped (no SMTP_TO) or failed.
     """
+    if not _alerts_enabled():
+        logger.debug("Alerts disabled; skipping alert: %s", subject[:60])
+        return False
+
     to_addr = _to_email()
     if not to_addr:
         logger.debug("SMTP_TO not set; skipping alert: %s", subject[:60])
