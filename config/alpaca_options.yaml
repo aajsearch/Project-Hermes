@@ -68,9 +68,9 @@ alpaca_options:
 
       exit:
         tp_pct: 0.60           # Let theta decay burn off 60% of the premium
-        sl_pct: 2.0            # Stop out if mark hits 3x our entry credit
+        sl_pct: 1.5            # Stop out if mark hits ~2.5x our entry credit (1 + 1.5)
         exit_cooldown_minutes: 15
-        distance_buffer_otm_fraction_of_min_short_otm: 0.50  # Gate opens if stock drops within 0.2% of strike
+        distance_buffer_otm_fraction_of_min_short_otm: 0.80  # Gate unlocks at ~0.32% OTM (0.004 * 0.80)
         exit_before_minutes: 3
         close_limit_slippage_pct: 0.02
 
@@ -102,9 +102,9 @@ alpaca_options:
 
       exit:
         tp_pct: 0.60
-        sl_pct: 2.0
+        sl_pct: 1.5
         exit_cooldown_minutes: 15
-        distance_buffer_otm_fraction_of_min_short_otm: 0.50
+        distance_buffer_otm_fraction_of_min_short_otm: 0.80
         exit_before_minutes: 3
         close_limit_slippage_pct: 0.02
 
@@ -137,7 +137,7 @@ alpaca_options:
         tp_pct: 0.50           # ICs are harder to close cleanly. Take profit at 50%.
         sl_pct: 1.5            # Tighter stop loss on ICs to prevent gamma pin risk
         exit_cooldown_minutes: 30
-        distance_buffer_otm_fraction_of_min_short_otm: 0.50
+        distance_buffer_otm_fraction_of_min_short_otm: 0.80  # Gate unlocks at ~0.32% OTM (0.004 * 0.80)
         exit_before_minutes: 5 # 4 legs take longer to fill, start trying to exit 5 mins before expiry
         close_limit_slippage_pct: 0.03
 
