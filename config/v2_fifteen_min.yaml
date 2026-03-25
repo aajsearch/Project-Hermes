@@ -8,31 +8,34 @@ fifteen_min:
   strategies:
     continuous_alpha_limit_99:
       enabled: true
-      window_seconds: { btc: 150, eth: 150, sol: 150, xrp: 150 }
+      window_seconds: { btc: 150, eth: 150, sol: 120, xrp: 150 }
       
       # --- 1. ENTRY CONSTRAINTS (The 85-95 Sweet Spot) ---
       limit_price_cents: 99
-      min_bid_cents: { btc: 96, eth: 96, sol: 96, xrp: 96 }
+      min_bid_cents: { btc: 96, eth: 96, sol: 97, xrp: 96 }
       
       order_count: { btc: 100, eth: 100, sol: 100, xrp: 100 }
       max_cost_cents: 50000
       side: auto
       
       # --- EARLY EXIT TRIGGERS (Accounting for 8% Slippage) ---
-      stop_loss_pct: 15  
-      # Require a deeper spot crash for highly volatile altcoins before panicking
-      distance_decay_pct: { btc: 0.80, eth: 0.80, sol: 0.85, xrp: 0.90 }
-      catastrophic_loss_pct: 45
-      
-      stop_loss_absolute_buffer: { btc: 25.0, eth: 1, sol: 0.05, xrp: 0.0010 }
+      # Tuned from last 14 v2_strategy_reports SL rows (continuous_alpha_limit_99): BTC bled 19–29% on
+      # mark while ref_dist stayed large, so distance gate blocked 15% until catastrophic. SOL/XRP refs
+      # are tiny so distance arms easily; a few rows show <15% exit PnL (fills vs mark / timing).
+      stop_loss_pct: 15
+      distance_decay_pct: { btc: 0.88, eth: 0.82, sol: 0.88, xrp: 0.92 }
+      # Hard ceiling before deep bleed (observed exits clustered under old 30%)
+      catastrophic_loss_pct: 22
+      # null = no distance gate for that asset → normal SL is mark-based 15% + persistence (last_90s.py)
+      stop_loss_absolute_buffer: { btc: 15, eth: 1.0, sol: 0.04, xrp: 0.0008 }
       # --- ENTRY PREVENTION (Filtering out the noise) ---
-      min_distance_at_placement: { btc: 45.0, eth: 2.0, sol: 0.1, xrp: 0.002 }
+      min_distance_at_placement: { btc: 45.0, eth: 2.0, sol: 0.1, xrp: 0.0025 }
       # Cancel resting entry if distance decays too much before fill (pre-fill adverse selection protection)
       resting_cancel_decay_pct: 0.35
 
       # --- 4. STATE TIMERS ---
       global_cooldown_seconds: 60
-      danger_persistence_seconds: { btc: 2.5, eth: 2.5, sol: 1.5, xrp: 1.5 }
+      danger_persistence_seconds: { btc: 2.0, eth: 2.0, sol: 1.2, xrp: 1.2 }
 
     # Legacy key (optional): strategy also reads last_90s_limit_99 if continuous_alpha_limit_99 missing
     # last_90s_limit_99:
