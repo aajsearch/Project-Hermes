@@ -1,14 +1,15 @@
 # Project Hermes
 
-A cross-domain, low-latency quantitative trading bot for **Kalshi** prediction markets. It runs statistical arbitrage and event-driven strategies: limit orders in the final seconds of 15‑minute windows (**last_90s_limit_99**), and directional breakout entries with take-profit/stop-loss (**atm_breakout_strategy**). Hermes uses live spot data (Kraken, Coinbase) and Kalshi order books to place and manage positions with configurable risk (stop-loss, panic close, distance filters).
+A cross-domain, low-latency quantitative trading bot for **Kalshi** prediction markets. It runs statistical arbitrage and event-driven strategies: limit orders in the final seconds of 15-minute windows (**continuous_alpha_limit_99**, with `last_90s_limit_99` as a legacy alias), and directional breakout entries with take-profit/stop-loss (**atm_breakout_strategy**). Hermes uses live spot data (Kraken, Coinbase) and Kalshi order books to place and manage positions with configurable risk (stop-loss, panic close, distance filters).
 
 ---
 
 ## Features
 
 - **V2 unified pipeline** — Single process, config-driven; runs 15‑min (and optionally hourly) intervals in separate threads. Order registry and strategy reports in SQLite (`data/v2_state.db`).
-- **last_90s_limit_99** — Places limit-at-99¢ orders in the last N seconds of each 15‑min window when distance and bid thresholds pass; per-asset `min_bid_cents`, `min_distance_at_placement`, `stop_loss_distance_factor`. Exits via stop-loss (including panic close when spot crosses strike) using min(Kraken, Coinbase) distance.
+- **continuous_alpha_limit_99** (legacy alias: `last_90s_limit_99`) — Places limit-at-99¢ orders in the last N seconds of each 15-minute window when per-asset `min_bid_cents` and `min_distance_at_placement` pass; exits via stop-loss with distance-decay + catastrophic ceiling.
 - **atm_breakout_strategy** — Momentum-based ITM entries when spot crosses strike and momentum triggers; take-profit and stop-loss executed as aggressive limit sells (IoC + reduce_only) on Kalshi.
+- **Alpaca PCS/CCS/IC “sniper” options** — Multi-leg limit orders via `python3 -m bot.alpaca_options_main` using `config/alpaca_options.yaml` (PCS/CCS verticals + 4-leg iron condor).
 - **Data layer** — Spot from Kraken + Coinbase; entry uses average distance (non‑BTC) or min distance (BTC); exit/stop-loss uses min distance for all assets.
 - **Execution** — TP/SL and last_90s stop-loss go through a single executor path: aggressive limit sell (1¢) with `reduce_only` and `time_in_force: immediate_or_cancel`. SL execution attempts are audited to `v2_sl_execution_audit` for analysis.
 
@@ -47,7 +48,7 @@ pip install -r requirements.txt
   - **KALSHI_BASE_URL** — Kalshi API base (no path). Production: `https://api.elections.kalshi.com`. Demo: use Kalshi’s demo base URL if applicable.
 - V2 config lives under `config/`:
   - **v2_common.yaml** — Intervals (fifteen_min, hourly), assets, caps, no_trade_windows, `dry_run`.
-  - **v2_fifteen_min.yaml** — Pipeline `run_interval_seconds`, `strategy_priority`; strategy blocks for `last_90s_limit_99` and `atm_breakout_strategy` (per-asset knobs where noted).
+  - **v2_fifteen_min.yaml** — Pipeline `run_interval_seconds`, `strategy_priority`; strategy blocks for `continuous_alpha_limit_99` (legacy: `last_90s_limit_99` behavior), `knife_catcher` (optional), and `atm_breakout_strategy`.
 
 Do not commit `.env` or PEM files; they are in `.gitignore`.
 
@@ -64,7 +65,22 @@ V2_DRY_RUN=false python -m bot.v2_main
 - The bot starts the **fifteen_min** pipeline (and hourly if enabled). Each cycle: resolve markets and spot, build context, evaluate entry/exit per strategy, then execute (place/cancel/sell) when not in dry run.
 - Logs go to stdout. SL/TP and execution audit rows go to `data/v2_state.db` (e.g. `v2_sl_execution_audit`).
 
-### 5. Legacy bot (optional)
+### 5. Alpaca options sniper (optional)
+
+This repo also includes a separate process for multi-leg options trading (PCS/CCS/IC):
+
+```bash
+python -m bot.alpaca_options_main
+```
+
+It reads `config/alpaca_options.yaml` for strategy parameters and uses `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` from your environment.
+
+Current sniper exit behavior in `config/alpaca_options.yaml`:
+- Exit gate unlocks when the underlying is about `min_short_otm_percent * distance_buffer_otm_fraction_of_min_short_otm` OTM
+  (with `0.004 * 0.80 = 0.0032` → ~**0.32% OTM**).
+- Stop-loss uses `sl_pct: 1.5` (PCS/CCS/IC) after the gate unlocks.
+
+### 6. Legacy bot (optional)
 
 The legacy single-loop bot and dashboard are still available:
 
@@ -85,12 +101,12 @@ Config is merged from `config/common.yaml`, `config/fifteen_min.yaml`, `config/h
 | File | Purpose |
 |------|--------|
 | **config/v2_common.yaml** | Intervals (fifteen_min, hourly), assets, caps, no_trade_windows, `dry_run`. |
-| **config/v2_fifteen_min.yaml** | Pipeline `run_interval_seconds`, `strategy_priority`; strategy blocks for `last_90s_limit_99` and `atm_breakout_strategy`. |
+| **config/v2_fifteen_min.yaml** | Pipeline `run_interval_seconds`, `strategy_priority`; strategy blocks for `continuous_alpha_limit_99` (legacy: `last_90s_limit_99`), optional `knife_catcher`, and `atm_breakout_strategy`. |
 | **config/v2_hourly.yaml** | Hourly pipeline and strategies (if used). |
 
 Key strategy knobs (see YAML comments):
 
-- **last_90s_limit_99:** `window_seconds`, `min_bid_cents` (per-asset), `min_distance_at_placement`, `stop_loss_pct`, `stop_loss_distance_factor` (per-asset), `order_count`, `max_cost_cents`, `side`.
+- **continuous_alpha_limit_99:** `window_seconds` (per-asset), `limit_price_cents`, `min_bid_cents` (per-asset), `min_distance_at_placement`, `order_count`, `max_cost_cents`, `side`, plus exit tuning: `stop_loss_pct`, `distance_decay_pct`, `catastrophic_loss_pct`, `stop_loss_absolute_buffer`, `danger_persistence_seconds` (per-asset).
 - **atm_breakout_strategy:** `min_distance_at_placement`, `min_entry_price`, `max_entry_price`, `momentum_window_seconds`, `momentum_trigger_3s`, `take_profit_cents`, `stop_loss_cents`, `order_count`, `contracts`, `max_cost_cents`.
 
 ---
@@ -164,8 +180,12 @@ docs/                     # Audit and verification notes
 | `KALSHI_API_KEY` | Yes (for live) | Kalshi API key ID. |
 | `KALSHI_PRIVATE_KEY` | Yes (for live) | Path to PEM file or inline PEM content for request signing. |
 | `KALSHI_BASE_URL` | Yes (for live) | Kalshi API base URL with no path (e.g. `https://api.elections.kalshi.com` for production). |
+| `ALPACA_API_KEY` | Yes (for Alpaca options) | Alpaca API key ID. |
+| `ALPACA_SECRET_KEY` | Yes (for Alpaca options) | Alpaca API secret key. |
 | `V2_DRY_RUN` | No | Override config: `true` or `false` to force dry run or live. |
 | `SMTP_*` | No | Optional; used for legacy hourly report email. |
+| `ALPACA_ALERTS_ENABLED` | No | Optional; enable Alpaca alerts (see `bot/alpaca_put_spread/alerts.py`). |
+| `ALPACA_PUT_SPREAD_DEBUG` | No | Optional; enable extra PCS/CCS/IC selector logging. |
 
 ---
 
