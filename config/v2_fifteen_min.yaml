@@ -29,7 +29,7 @@ fifteen_min:
       # null = no distance gate for that asset → normal SL is mark-based 15% + persistence (last_90s.py)
       stop_loss_absolute_buffer: { btc: 15, eth: 1.0, sol: 0.04, xrp: 0.0008 }
       # --- ENTRY PREVENTION (Filtering out the noise) ---
-      min_distance_at_placement: { btc: 45.0, eth: 2.0, sol: 0.1, xrp: 0.0025 }
+      min_distance_at_placement: { btc: 55.0, eth: 2.0, sol: 0.1, xrp: 0.0025 }
       # Cancel resting entry if distance decays too much before fill (pre-fill adverse selection protection)
       resting_cancel_decay_pct: 0.35
 
