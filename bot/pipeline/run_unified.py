@@ -404,17 +404,58 @@ def run_pipeline_cycle(
                             cancel_threshold = placement_dist * (1.0 - cancel_decay_pct)
                             if current_dist <= cancel_threshold:
                                 if kalshi_client is not None:
+                                    cancel_failed = False
                                     try:
                                         kalshi_client.cancel_order(str(o.order_id))
                                     except Exception as e:
-                                        # If cancel fails because it already filled, we'll detect fill below.
                                         logger.warning(
                                             "[EXECUTION] Cancel resting order failed (may already be filled): order_id=%s ticker=%s: %s",
                                             o.order_id,
                                             o.ticker,
                                             e,
                                         )
-                                    else:
+                                        cancel_failed = True
+
+                                    filled_after_cancel = 0
+                                    post_status = None
+                                    try:
+                                        info = kalshi_client.get_order(str(o.order_id))
+                                        od = info.get("order", info) if isinstance(info, dict) else {}
+                                        post_status = str(od.get("status") or "").lower()
+                                        filled_after_cancel = int(od.get("fill_count") or od.get("filled_count") or 0)
+                                    except Exception as ve:
+                                        logger.warning(
+                                            "[EXECUTION] Post-cancel get_order failed: order_id=%s %s",
+                                            o.order_id,
+                                            ve,
+                                        )
+
+                                    if filled_after_cancel > 0:
+                                        fill_dist = float(ctx.distance) if ctx.distance is not None else None
+                                        registry.update_order_status(
+                                            str(o.order_id),
+                                            "filled",
+                                            filled_after_cancel,
+                                            entry_distance_at_fill=fill_dist,
+                                        )
+                                        from bot.pipeline.intents import ExitAction
+
+                                        asset_exits.append(
+                                            ExitAction(
+                                                order_id=str(o.order_id),
+                                                action="stop_loss",
+                                                reason="post_cancel_fill_detected",
+                                            )
+                                        )
+                                        logger.warning(
+                                            "[EXECUTION] Bad fill detected → immediate exit — order_id=%s status=%s fill_count=%s",
+                                            o.order_id,
+                                            post_status,
+                                            filled_after_cancel,
+                                        )
+                                        continue
+
+                                    if not cancel_failed or post_status == "canceled":
                                         try:
                                             registry.update_order_status(str(o.order_id), "canceled", 0)
                                         except Exception:
@@ -431,7 +472,7 @@ def run_pipeline_cycle(
                                             cancel_threshold,
                                             cancel_decay_pct,
                                         )
-                                        continue
+                                    continue
                     except Exception:
                         pass
 
