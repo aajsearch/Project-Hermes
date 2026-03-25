@@ -382,3 +382,113 @@ def log_event(
         conn.commit()
     finally:
         conn.close()
+
+
+def _parse_legs_field(legs_field: Optional[str]) -> Optional[List[str]]:
+    if not legs_field:
+        return None
+    try:
+        v = json.loads(str(legs_field))
+        if isinstance(v, list):
+            return [str(x) for x in v]
+    except Exception:
+        return None
+    return None
+
+
+def find_open_spread_id_by_legs(
+    *,
+    underlying: str,
+    strategy_type: str,
+    legs: List[str],
+    db_path: Optional[Path] = None,
+) -> Optional[int]:
+    """
+    Best-effort lookup: find the most recent spread row (close_order_id is NULL)
+    matching (underlying, strategy_type, legs).
+    """
+    path = db_path or _default_db_path()
+    if not path.exists():
+        return None
+    legs_key = tuple(sorted(str(x) for x in legs))
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT spread_id, legs
+            FROM {SPREADS_TABLE}
+            WHERE underlying = ?
+              AND strategy_type = ?
+              AND close_order_id IS NULL
+            ORDER BY opened_at DESC
+            LIMIT 50
+            """,
+            (str(underlying), str(strategy_type)),
+        ).fetchall()
+        for r in rows:
+            cur_legs = _parse_legs_field(r["legs"])
+            if cur_legs and tuple(sorted(cur_legs)) == legs_key:
+                return int(r["spread_id"])
+    finally:
+        conn.close()
+    return None
+
+
+def list_filled_close_orders_without_spread_link(
+    *,
+    since_ts: Optional[float] = None,
+    db_path: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Return close orders that are filled in alpaca_orders but not yet linked to alpaca_spreads.close_order_id.
+    This is used as a reconciliation fallback when JSON state is missing pending_close metadata.
+    """
+    path = db_path or _default_db_path()
+    if not path.exists():
+        return []
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    try:
+        where_time = ""
+        params: List[Any] = []
+        if since_ts is not None:
+            where_time = "AND submitted_at >= ?"
+            params.append(float(since_ts))
+        rows = conn.execute(
+            f"""
+            SELECT order_id, underlying, strategy_type, legs, limit_price, filled_avg_price, submitted_at
+            FROM {ORDERS_TABLE}
+            WHERE side = 'close'
+              AND status = 'filled'
+              {where_time}
+              AND order_id NOT IN (
+                SELECT close_order_id FROM {SPREADS_TABLE} WHERE close_order_id IS NOT NULL
+              )
+            ORDER BY submitted_at ASC
+            """,
+            tuple(params),
+        ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            out.append(dict(r))
+        return out
+    finally:
+        conn.close()
+
+
+def get_spread_entry_credit_mid(spread_id: int, *, db_path: Optional[Path] = None) -> Optional[float]:
+    path = db_path or _default_db_path()
+    if not path.exists():
+        return None
+    conn = sqlite3.connect(str(path))
+    try:
+        row = conn.execute(
+            f"SELECT entry_credit_mid FROM {SPREADS_TABLE} WHERE spread_id = ?",
+            (int(spread_id),),
+        ).fetchone()
+        if not row or row[0] is None:
+            return None
+        return float(row[0])
+    finally:
+        conn.close()

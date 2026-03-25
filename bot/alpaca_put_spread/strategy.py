@@ -26,11 +26,14 @@ from bot.alpaca_put_spread.call_credit_spread_selector import select_bear_call_c
 from bot.alpaca_put_spread.config import AlpacaPutSpreadConfig
 from bot.alpaca_put_spread.db import (
     close_spread as db_close_spread,
+    find_open_spread_id_by_legs,
     get_daily_pnl,
     get_pnl_by_underlying_today,
+    get_spread_entry_credit_mid,
     init_alpaca_db,
     insert_order as db_insert_order,
     insert_spread as db_insert_spread,
+    list_filled_close_orders_without_spread_link,
     log_event,
     update_order_status as db_update_order_status,
 )
@@ -1034,6 +1037,126 @@ class AlpacaPutSpreadRunner:
                         order_id,
                         status,
                     )
+
+        # Fallback reconciliation: if a close order filled but JSON state lost pending_close metadata,
+        # alpaca_spreads never gets closed and TP/SL can refire. Link any filled close orders that
+        # are not yet referenced by alpaca_spreads.close_order_id by matching (underlying, strategy_type, legs).
+        self._reconcile_filled_close_orders_without_spread_link()
+
+    def _reconcile_filled_close_orders_without_spread_link(self) -> None:
+        # Keep bounded: only look back a week to avoid scanning entire history each loop.
+        since_ts = time.time() - 7 * 24 * 3600
+        rows = list_filled_close_orders_without_spread_link(since_ts=since_ts)
+        if not rows:
+            return
+        import json
+
+        for r in rows:
+            order_id = str(r.get("order_id") or "")
+            underlying = str(r.get("underlying") or "")
+            strategy_type = str(r.get("strategy_type") or "")
+            if not order_id or not underlying or not strategy_type:
+                continue
+
+            legs_raw = r.get("legs")
+            try:
+                legs = json.loads(legs_raw) if legs_raw else None
+            except Exception:
+                legs = None
+            if not isinstance(legs, list) or not legs:
+                logger.warning(
+                    "[%s][%s] reconcile: filled close order missing legs; order_id=%s",
+                    underlying,
+                    strategy_type,
+                    order_id,
+                )
+                continue
+            legs = [str(x) for x in legs]
+
+            spread_id = find_open_spread_id_by_legs(
+                underlying=underlying,
+                strategy_type=strategy_type,
+                legs=legs,
+            )
+            if not spread_id:
+                logger.warning(
+                    "[%s][%s] reconcile: filled close order has no open spread match; order_id=%s legs=%s",
+                    underlying,
+                    strategy_type,
+                    order_id,
+                    legs,
+                )
+                continue
+
+            favg = r.get("filled_avg_price")
+            limit_price = r.get("limit_price")
+            try:
+                debit = abs(float(favg)) if favg is not None else abs(float(limit_price))
+            except Exception:
+                debit = 0.0
+            if debit <= 0:
+                logger.warning(
+                    "[%s][%s] reconcile: cannot compute close debit; order_id=%s favg=%s limit=%s",
+                    underlying,
+                    strategy_type,
+                    order_id,
+                    favg,
+                    limit_price,
+                )
+                continue
+
+            # Prefer entry credit from in-memory open_positions if it matches this spread_id.
+            entry_credit = None
+            open_spread = get_nested(self.state, "open_positions", underlying, strategy_type)
+            if isinstance(open_spread, dict) and int(open_spread.get("spread_id") or 0) == int(spread_id):
+                try:
+                    entry_credit = float(open_spread.get("entry_net_credit_mid") or 0.0)
+                except Exception:
+                    entry_credit = None
+            if entry_credit is None or entry_credit <= 0:
+                entry_credit = get_spread_entry_credit_mid(int(spread_id))
+            if entry_credit is None or entry_credit <= 0:
+                logger.warning(
+                    "[%s][%s] reconcile: missing entry credit; spread_id=%s order_id=%s",
+                    underlying,
+                    strategy_type,
+                    spread_id,
+                    order_id,
+                )
+                continue
+
+            close_reason = "reconciled_close_filled"
+            db_close_spread(
+                int(spread_id),
+                order_id,
+                float(debit),
+                close_reason,
+                float(entry_credit),
+                self.cfg.order_qty,
+                filled_avg_price=float(debit),
+            )
+            db_update_order_status(order_id, "filled", filled_avg_price=float(debit))
+            log_event(
+                "close_filled_reconciled",
+                f"order_id={order_id} spread_id={spread_id}",
+                underlying=underlying,
+                extra={"order_id": order_id, "spread_id": int(spread_id), "strategy_type": strategy_type},
+            )
+
+            # Prevent refiring: only clear state if it matches this exact spread_id.
+            if isinstance(open_spread, dict) and int(open_spread.get("spread_id") or 0) == int(spread_id):
+                pop_nested(self.state, "open_positions", underlying, strategy_type)
+                ec = _exit_cfg(self.cfg, strategy_type)
+                cooldown_until = time.time() + int(ec.exit_cooldown_minutes) * 60
+                set_nested(self.state, COOLDOWN, underlying, strategy_type, cooldown_until)
+                save_state(self.state)
+                logger.info(
+                    "[%s][%s] reconcile: closed spread_id=%s via order_id=%s; state cleared",
+                    underlying,
+                    strategy_type,
+                    spread_id,
+                    order_id,
+                )
 
     def run_forever(self) -> None:
         while True:
