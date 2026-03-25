@@ -37,7 +37,8 @@ alpaca_options:
 
   # ---------------------------------------------------------------------------
   # PRODUCTION "SNIPER" PROFILE — High probability, strict filters, low churn.
-  # Re-enabled distance gating, target deltas ~10–20Δ, strictly limited widths.
+  # distance_buffer_otm_fraction_of_min_short_otm is active.
+  # min_short_otm_percent is set to 0.4% to perfectly align with 0DTE 15-Delta.
   # ---------------------------------------------------------------------------
   strategies:
     put_credit_spread:
@@ -45,8 +46,8 @@ alpaca_options:
       options:
         dte_min: 0
         dte_max: 0
-        spread_pct_max: 0.30   # SNIPER: reject illiquid chains with wide bid/ask
-        iv_max: 2.5            # SNIPER: avoid extreme market panic/spikes
+        spread_pct_max: 0.30   # Reject illiquid chains with wide bid/ask
+        iv_max: 2.5            # Avoid extreme market panic/spikes
 
         long_put:
           delta_abs_min: 0.02
@@ -54,24 +55,22 @@ alpaca_options:
           target_delta: -0.05  # Cheap protection
 
         short_put:
-          delta_abs_min: 0.10  # SNIPER: far OTM, high win-rate
+          delta_abs_min: 0.10  # Far OTM, high win-rate (~85% probability)
           delta_abs_max: 0.20
           target_delta: -0.15
 
       entry:
-        target_credit: 0.15    # Demand meaningful credit vs risk (per $/share mid)
+        target_credit: 0.15    # Demand at least $15 per spread
         entry_operator: ">="
         put_spread_width_points_min: 1.0
-        put_spread_width_points_max: 5.0  # Keep max risk tight on ETF spreads
-        min_short_otm_percent: 0.015      # Short strike at least ~1.5% OTM
+        put_spread_width_points_max: 5.0  # Cap max risk tightly
+        min_short_otm_percent: 0.004      # FIXED: Require short strike to be at least 0.4% OTM
 
       exit:
-        tp_pct: 0.60           # SNIPER: Let theta decay — exit when mark <= 40% of entry credit mid
-        sl_pct: 2.0            # Stop when mark >= 3× entry credit mid (1 + sl_pct)
+        tp_pct: 0.60           # Let theta decay burn off 60% of the premium
+        sl_pct: 2.0            # Stop out if mark hits 3x our entry credit
         exit_cooldown_minutes: 15
-
-        # Gate: TP/SL only after underlying is within (min_otm × fraction) of short (see strategy.py)
-        distance_buffer_otm_fraction_of_min_short_otm: 0.50
+        distance_buffer_otm_fraction_of_min_short_otm: 0.50  # Gate opens if stock drops within 0.2% of strike
         exit_before_minutes: 3
         close_limit_slippage_pct: 0.02
 
@@ -83,6 +82,7 @@ alpaca_options:
         spread_pct_max: 0.30
         iv_max: 2.5
 
+        # Call deltas skewed slightly further OTM due to "melt-up" risk and skew
         long_call:
           delta_abs_min: 0.02
           delta_abs_max: 0.06
@@ -98,7 +98,7 @@ alpaca_options:
         entry_operator: ">="
         call_spread_width_points_min: 1.0
         call_spread_width_points_max: 5.0
-        min_short_otm_percent: 0.015
+        min_short_otm_percent: 0.004      # FIXED: Aligned with 0DTE call pricing
 
       exit:
         tp_pct: 0.60
@@ -113,7 +113,7 @@ alpaca_options:
       options:
         dte_min: 0
         dte_max: 0
-        spread_pct_max: 0.35   # Slightly looser for 4 legs
+        spread_pct_max: 0.35   # Slightly looser here to account for 4-leg slippage
         iv_max: 2.5
 
         long_legs:
@@ -123,22 +123,22 @@ alpaca_options:
 
         short_legs:
           delta_abs_min: 0.09
-          delta_abs_max: 0.15  # Tighter shorts for a wide body sandbox
+          delta_abs_max: 0.15  # Tighter shorts to ensure a wide "sandbox" for the stock
           target_delta: 0.12
 
       entry:
-        target_credit: 0.30
+        target_credit: 0.30    # Combined premium from both wings
         entry_operator: ">="
         wing_width_points_min: 2.0
         wing_width_points_max: 5.0
-        min_short_otm_percent: 0.015
+        min_short_otm_percent: 0.004      # FIXED: Gate distance
 
       exit:
-        tp_pct: 0.50
-        sl_pct: 1.5
+        tp_pct: 0.50           # ICs are harder to close cleanly. Take profit at 50%.
+        sl_pct: 1.5            # Tighter stop loss on ICs to prevent gamma pin risk
         exit_cooldown_minutes: 30
         distance_buffer_otm_fraction_of_min_short_otm: 0.50
-        exit_before_minutes: 5
+        exit_before_minutes: 5 # 4 legs take longer to fill, start trying to exit 5 mins before expiry
         close_limit_slippage_pct: 0.03
 
   # Backward compatibility: if you omit strategies.put_credit_spread, you may keep flat
