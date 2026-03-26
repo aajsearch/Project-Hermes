@@ -27,7 +27,7 @@ hourly:
     # Regular legacy hourly loop: eligible tickers near spot, farthest (or all-in-range) selection,
     # risk guards, and hourly exit criteria.
     hourly_signals_farthest:
-      enabled: false
+      enabled: true
       entry_window:
         late_window_minutes: 20
         late_interval_seconds: 1
@@ -62,7 +62,7 @@ hourly:
         distance_buffer:
           enabled: true
           assets:
-            btc: { pct: 0.025, floor_usd: 350 }
+            btc: { pct: 0.025, floor_usd: 500 }
             eth: { pct: 0.005, floor_usd: 50 }
         anchor_one_per_side:
           enabled: true
