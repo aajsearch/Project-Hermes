@@ -71,7 +71,7 @@ alpaca_options:
         sl_pct: 1.5            # Stop out if mark hits ~2.5x our entry credit (1 + 1.5)
         exit_cooldown_minutes: 15
         distance_buffer_otm_fraction_of_min_short_otm: 0.80  # Gate unlocks at ~0.32% OTM (0.004 * 0.80)
-        exit_before_minutes: 3
+        exit_before_minutes: 15
         close_limit_slippage_pct: 0.02
 
     call_credit_spread:
@@ -105,7 +105,7 @@ alpaca_options:
         sl_pct: 1.5
         exit_cooldown_minutes: 15
         distance_buffer_otm_fraction_of_min_short_otm: 0.80
-        exit_before_minutes: 3
+        exit_before_minutes: 15
         close_limit_slippage_pct: 0.02
 
     iron_condor:
@@ -138,7 +138,7 @@ alpaca_options:
         sl_pct: 1.5            # Tighter stop loss on ICs to prevent gamma pin risk
         exit_cooldown_minutes: 30
         distance_buffer_otm_fraction_of_min_short_otm: 0.80  # Gate unlocks at ~0.32% OTM (0.004 * 0.80)
-        exit_before_minutes: 5 # 4 legs take longer to fill, start trying to exit 5 mins before expiry
+        exit_before_minutes: 15 # 4 legs take longer to fill, start trying to exit 15 mins before expiry
         close_limit_slippage_pct: 0.03
 
   # Backward compatibility: if you omit strategies.put_credit_spread, you may keep flat
