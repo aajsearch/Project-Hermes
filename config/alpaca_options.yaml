@@ -65,8 +65,8 @@ alpaca_options:
       entry:
         target_credit: 0.15    # Demand at least $15 per spread
         entry_operator: ">="
-        put_spread_width_points_min: 1.0
-        put_spread_width_points_max: 5.0  # Cap max risk tightly
+        put_spread_width_points_min: 4.0
+        put_spread_width_points_max: 10.0  # Cap max risk tightly
         min_short_otm_percent: 0.004      # FIXED: Require short strike to be at least 0.4% OTM
 
       exit:
