@@ -33,8 +33,10 @@ from bot.alpaca_put_spread.db import (
     init_alpaca_db,
     insert_order as db_insert_order,
     insert_spread as db_insert_spread,
+    insert_telemetry as db_insert_telemetry,
     list_filled_close_orders_without_spread_link,
     log_event,
+    merge_order_raw_snapshot,
     update_order_status as db_update_order_status,
 )
 from bot.alpaca_put_spread.domain import Leg
@@ -49,7 +51,7 @@ from bot.alpaca_put_spread.pricing_logic import (
     estimate_close_debit_natural_from_open_legs,
     tp_sl_triggered,
 )
-from bot.alpaca_put_spread.put_spread_selector import _get_chain_silent, select_bull_put_credit_spread
+from bot.alpaca_put_spread.put_spread_selector import _get_chain_silent, _safe_get, select_bull_put_credit_spread
 from bot.alpaca_put_spread.state import (
     ensure_state_shape,
     get_nested,
@@ -68,6 +70,7 @@ logger = logging.getLogger(__name__)
 
 # Minimum dollar slippage buffer on close (avoids zero debit limit when mark is tiny).
 _MIN_CLOSE_SLIPPAGE_DOLLARS = 0.01
+_TELEMETRY_INTERVAL_SEC = 300.0
 
 
 def _close_debit_limit_with_min_slippage(current_net: float, slippage_pct: float) -> float:
@@ -403,6 +406,122 @@ def _distance_gate_met(
     return False, None
 
 
+def _chain_snap_for_symbol(chain: Any, sym: str) -> Any:
+    if isinstance(chain, dict):
+        return chain.get(sym)
+    snaps = getattr(chain, "snapshots", None)
+    if isinstance(snaps, dict):
+        return snaps.get(sym)
+    return None
+
+
+def _snap_delta_iv(snap: Any) -> Tuple[Optional[float], Optional[float]]:
+    if not snap:
+        return (None, None)
+    try:
+        d = _safe_get(snap, ["greeks", "delta"])
+        iv = _safe_get(snap, ["implied_volatility"])
+        d_f = float(d) if d is not None else None
+        iv_f = float(iv) if iv is not None else None
+        return (d_f, iv_f)
+    except (TypeError, ValueError):
+        return (None, None)
+
+
+def _mean_optional(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    if a is None and b is None:
+        return None
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return (a + b) / 2.0
+
+
+def _distance_to_short_pct_for_open(
+    open_spread: Dict[str, Any],
+    underlying_mid: float,
+    strategy_type: str,
+) -> Optional[float]:
+    """Single % distance metric aligned with the distance gate (short strike vs spot)."""
+    if strategy_type == _STRATEGY_PCS:
+        return _compute_otm_percent_put_short(open_spread["short_put_symbol"], underlying_mid)
+    if strategy_type == _STRATEGY_CCS:
+        return _compute_otm_percent_call_short(open_spread["short_call_symbol"], underlying_mid)
+    if strategy_type == _STRATEGY_IC:
+        op = _compute_otm_percent_put_short(open_spread["short_put_symbol"], underlying_mid)
+        oc = _compute_otm_percent_call_short(open_spread["short_call_symbol"], underlying_mid)
+        if op is None:
+            return oc
+        if oc is None:
+            return op
+        return min(op, oc)
+    return None
+
+
+def _entry_raw_snapshot_signature(
+    option_client: Any,
+    underlying: str,
+    strategy_type: str,
+    pending: Dict[str, Any],
+    underlying_mid: float,
+) -> Dict[str, Any]:
+    """At fill time: short/long delta, OTM %, chain IV from option chain snapshots."""
+    out: Dict[str, Any] = {
+        "strategy_type": strategy_type,
+        "underlying_mid": float(underlying_mid) if underlying_mid > 0 else None,
+        "entry_ts": time.time(),
+    }
+    try:
+        chain = _get_chain_silent(option_client, underlying)
+    except Exception:
+        return out
+
+    if strategy_type == _STRATEGY_PCS:
+        ss = str(pending.get("short_put_symbol") or "")
+        ls = str(pending.get("long_put_symbol") or "")
+        sd, s_iv = _snap_delta_iv(_chain_snap_for_symbol(chain, ss))
+        ld, l_iv = _snap_delta_iv(_chain_snap_for_symbol(chain, ls))
+        out["short_delta"] = sd
+        out["long_delta"] = ld
+        out["otm_percent"] = (
+            _compute_otm_percent_put_short(ss, underlying_mid) if ss and underlying_mid > 0 else None
+        )
+        out["chain_iv"] = s_iv if s_iv is not None else l_iv
+    elif strategy_type == _STRATEGY_CCS:
+        ss = str(pending.get("short_call_symbol") or "")
+        ls = str(pending.get("long_call_symbol") or "")
+        sd, s_iv = _snap_delta_iv(_chain_snap_for_symbol(chain, ss))
+        ld, l_iv = _snap_delta_iv(_chain_snap_for_symbol(chain, ls))
+        out["short_delta"] = sd
+        out["long_delta"] = ld
+        out["otm_percent"] = (
+            _compute_otm_percent_call_short(ss, underlying_mid) if ss and underlying_mid > 0 else None
+        )
+        out["chain_iv"] = s_iv if s_iv is not None else l_iv
+    elif strategy_type == _STRATEGY_IC:
+        lp = str(pending.get("long_put_symbol") or "")
+        sp = str(pending.get("short_put_symbol") or "")
+        sc = str(pending.get("short_call_symbol") or "")
+        lc = str(pending.get("long_call_symbol") or "")
+        d_sp, iv_sp = _snap_delta_iv(_chain_snap_for_symbol(chain, sp))
+        d_sc, iv_sc = _snap_delta_iv(_chain_snap_for_symbol(chain, sc))
+        d_lp, _ = _snap_delta_iv(_chain_snap_for_symbol(chain, lp))
+        d_lc, _ = _snap_delta_iv(_chain_snap_for_symbol(chain, lc))
+        out["short_delta"] = _mean_optional(d_sp, d_sc)
+        out["long_delta"] = _mean_optional(d_lp, d_lc)
+        otm_p = _compute_otm_percent_put_short(sp, underlying_mid) if sp and underlying_mid > 0 else None
+        otm_c = _compute_otm_percent_call_short(sc, underlying_mid) if sc and underlying_mid > 0 else None
+        if otm_p is None:
+            out["otm_percent"] = otm_c
+        elif otm_c is None:
+            out["otm_percent"] = otm_p
+        else:
+            out["otm_percent"] = min(otm_p, otm_c)
+        out["chain_iv"] = _mean_optional(iv_sp, iv_sc)
+    return out
+
+
 def _expiry_symbol_for_open(open_spread: Dict[str, Any]) -> str:
     st = _open_spread_strategy_type(open_spread)
     if st == _STRATEGY_CCS:
@@ -429,6 +548,8 @@ class AlpacaPutSpreadRunner:
         ensure_state_shape(self.state)
         # Log INFO once per (underlying, strategy) when entry_disabled blocks; DEBUG every loop if enabled.
         self._entry_disabled_notice_keys: Set[Tuple[str, str]] = set()
+        self.last_telemetry_ts: Dict[int, float] = {}
+        self.last_gate_open_by_spread: Dict[int, bool] = {}
 
     def _enabled_strategies(self) -> List[str]:
         out: List[str] = []
@@ -532,8 +653,63 @@ class AlpacaPutSpreadRunner:
         all_flat = all(float(open_positions.get(s, {}).get("qty", 0.0) or 0.0) == 0.0 for s in syms)
         if all_flat:
             logger.info("[%s][%s] Clearing stale open state (legs flat)", underlying, strategy_type)
+            self._telemetry_clear_for_spread(open_spread.get("spread_id"))
             pop_nested(self.state, "open_positions", underlying, strategy_type)
             save_state(self.state)
+
+    def _telemetry_clear_for_spread(self, spread_id: Optional[Any]) -> None:
+        if spread_id is None:
+            return
+        try:
+            sid = int(spread_id)
+        except (TypeError, ValueError):
+            return
+        if sid <= 0:
+            return
+        self.last_telemetry_ts.pop(sid, None)
+        self.last_gate_open_by_spread.pop(sid, None)
+
+    def _maybe_log_spread_telemetry(
+        self,
+        underlying: str,
+        open_spread: Dict[str, Any],
+        strategy_type: str,
+        underlying_mid: float,
+        distance_gate_met: bool,
+    ) -> None:
+        try:
+            sid = int(open_spread.get("spread_id") or 0)
+        except (TypeError, ValueError):
+            return
+        if sid <= 0:
+            return
+        legs_p = _pricing_legs_from_open(open_spread)
+        quotes = lambda sym: _option_bid_ask(self.option_data_client, sym)
+        mark_mid = current_net_credit_mid_from_legs(legs_p, quotes)
+        natural_ask = estimate_close_debit_natural_from_open_legs(legs_p, quotes)
+        dist_pct = _distance_to_short_pct_for_open(open_spread, underlying_mid, strategy_type)
+
+        now = time.time()
+        prev_gate = self.last_gate_open_by_spread.get(sid)
+        gate_edge = distance_gate_met and prev_gate is not True
+        last_ts = self.last_telemetry_ts.get(sid, 0.0)
+        should_log = gate_edge or (now - last_ts >= _TELEMETRY_INTERVAL_SEC)
+
+        if should_log:
+            try:
+                db_insert_telemetry(
+                    sid,
+                    underlying_price=float(underlying_mid),
+                    current_mark_mid=mark_mid,
+                    current_natural_ask=natural_ask,
+                    distance_to_short_pct=dist_pct,
+                    gate_open=distance_gate_met,
+                )
+                self.last_telemetry_ts[sid] = now
+            except Exception as e:
+                logger.debug("[%s] telemetry insert failed: %s", underlying, e)
+
+        self.last_gate_open_by_spread[sid] = distance_gate_met
 
     def _maybe_close(self, underlying: str, open_spread: Dict[str, Any], strategy_type: str) -> bool:
         st = _open_spread_strategy_type(open_spread)
@@ -546,6 +722,9 @@ class AlpacaPutSpreadRunner:
         if underlying_mid <= 0:
             return False
 
+        distance_gate_met, _ = _distance_gate_met(open_spread, underlying_mid, strategy_type, ec)
+        self._maybe_log_spread_telemetry(underlying, open_spread, strategy_type, underlying_mid, distance_gate_met)
+
         # Expiry cutoff closes regardless of distance gate or TP/SL.
         exp_sym = _expiry_symbol_for_open(open_spread)
         expiry_utc = option_expiry_utc(exp_sym)
@@ -557,7 +736,6 @@ class AlpacaPutSpreadRunner:
 
         # Distance / OTM gate only unlocks TP/SL; proximity alone must not force a close.
         if reason is None:
-            distance_gate_met, _ = _distance_gate_met(open_spread, underlying_mid, strategy_type, ec)
             if distance_gate_met:
                 legs = _pricing_legs_from_open(open_spread)
                 entry_credit = float(open_spread["entry_net_credit_mid"])
@@ -865,6 +1043,7 @@ class AlpacaPutSpreadRunner:
         log_event("close_filled", f"order_id={order_id}", underlying=underlying, extra={"order_id": order_id, "strategy_type": strategy_type})
 
         pop_nested(self.state, PENDING_CLOSE, underlying, strategy_type)
+        self._telemetry_clear_for_spread(open_spread.get("spread_id"))
         pop_nested(self.state, "open_positions", underlying, strategy_type)
         cooldown_until = time.time() + int(ec.exit_cooldown_minutes) * 60
         set_nested(self.state, COOLDOWN, underlying, strategy_type, cooldown_until)
@@ -1071,6 +1250,17 @@ class AlpacaPutSpreadRunner:
             entry_credit_mid = float(recalc)
 
         underlying_mid = get_latest_mid(self.stock_data_client, underlying)
+        try:
+            um = float(underlying_mid) if underlying_mid else 0.0
+        except (TypeError, ValueError):
+            um = 0.0
+        entry_sig = _entry_raw_snapshot_signature(
+            self.option_data_client,
+            underlying,
+            strategy_type,
+            pending_entry,
+            um,
+        )
         spread_id = db_insert_spread(
             underlying=underlying,
             entry_credit_mid=entry_credit_mid,
@@ -1079,7 +1269,9 @@ class AlpacaPutSpreadRunner:
             legs=syms,
             short_put_symbol=pending_entry.get("short_put_symbol"),
             long_put_symbol=pending_entry.get("long_put_symbol"),
+            raw_snapshot=entry_sig,
         )
+        merge_order_raw_snapshot(order_id, entry_sig)
         favg = _filled_avg_price_from_order(order_obj) if order_obj is not None else None
         db_update_order_status(order_id, "filled", filled_avg_price=favg)
         open_spread = _open_spread_from_pending(strategy_type, pending_entry, spread_id, entry_credit_mid, underlying_mid)
@@ -1316,6 +1508,7 @@ class AlpacaPutSpreadRunner:
 
             # Prevent refiring: only clear state if it matches this exact spread_id.
             if isinstance(open_spread, dict) and int(open_spread.get("spread_id") or 0) == int(spread_id):
+                self._telemetry_clear_for_spread(spread_id)
                 pop_nested(self.state, "open_positions", underlying, strategy_type)
                 ec = _exit_cfg(self.cfg, strategy_type)
                 cooldown_until = time.time() + int(ec.exit_cooldown_minutes) * 60

@@ -16,6 +16,7 @@ _DB_INIT_LOGGED_PATHS: set[str] = set()
 ORDERS_TABLE = "alpaca_orders"
 SPREADS_TABLE = "alpaca_spreads"
 EVENTS_TABLE = "alpaca_events"
+TELEMETRY_TABLE = "spread_telemetry"
 
 
 def _default_db_path() -> Path:
@@ -85,6 +86,28 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     cols_orders = _table_columns(conn, ORDERS_TABLE)
     if "filled_avg_price" not in cols_orders:
         conn.execute(f"ALTER TABLE {ORDERS_TABLE} ADD COLUMN filled_avg_price REAL")
+
+    cols_spreads = _table_columns(conn, SPREADS_TABLE)
+    if "raw_snapshot_json" not in cols_spreads:
+        conn.execute(f"ALTER TABLE {SPREADS_TABLE} ADD COLUMN raw_snapshot_json TEXT")
+
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {TELEMETRY_TABLE} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            spread_id INTEGER NOT NULL,
+            timestamp REAL NOT NULL,
+            underlying_price REAL,
+            current_mark_mid REAL,
+            current_natural_ask REAL,
+            distance_to_short_pct REAL,
+            gate_open INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_telemetry_spread_ts ON {TELEMETRY_TABLE}(spread_id, timestamp)"
+    )
     conn.commit()
 
 
@@ -129,7 +152,8 @@ def init_alpaca_db(db_path: Optional[Path] = None) -> None:
                 pnl_dollars REAL,
                 opened_at REAL,
                 closed_at REAL,
-                close_reason TEXT
+                close_reason TEXT,
+                raw_snapshot_json TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_spreads_underlying ON {SPREADS_TABLE}(underlying);
             CREATE INDEX IF NOT EXISTS idx_spreads_opened_at ON {SPREADS_TABLE}(opened_at);
@@ -145,6 +169,18 @@ def init_alpaca_db(db_path: Optional[Path] = None) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_events_type ON {EVENTS_TABLE}(event_type);
             CREATE INDEX IF NOT EXISTS idx_events_created_at ON {EVENTS_TABLE}(created_at);
+
+            CREATE TABLE IF NOT EXISTS {TELEMETRY_TABLE} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                spread_id INTEGER NOT NULL,
+                timestamp REAL NOT NULL,
+                underlying_price REAL,
+                current_mark_mid REAL,
+                current_natural_ask REAL,
+                distance_to_short_pct REAL,
+                gate_open INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_telemetry_spread_ts ON {TELEMETRY_TABLE}(spread_id, timestamp);
             """
         )
         conn.commit()
@@ -257,20 +293,23 @@ def insert_spread(
     legs: Optional[List[str]] = None,
     short_put_symbol: Optional[str] = None,
     long_put_symbol: Optional[str] = None,
+    raw_snapshot: Optional[Dict[str, Any]] = None,
     db_path: Optional[Path] = None,
 ) -> int:
     import time
 
     path = db_path or _default_db_path()
+    init_alpaca_db(path)
     legs_val = _legs_json(legs, short_put_symbol, long_put_symbol)
+    raw_json = json.dumps(raw_snapshot, separators=(",", ":")) if raw_snapshot else None
     conn = sqlite3.connect(str(path))
     try:
         cur = conn.execute(
             f"""
             INSERT INTO {SPREADS_TABLE}
             (underlying, legs, strategy_type,
-             entry_order_id, entry_credit_mid, opened_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+             entry_order_id, entry_credit_mid, opened_at, raw_snapshot_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 underlying,
@@ -279,6 +318,7 @@ def insert_spread(
                 entry_order_id,
                 entry_credit_mid,
                 time.time(),
+                raw_json,
             ),
         )
         conn.commit()
@@ -315,6 +355,85 @@ def close_spread(
             WHERE spread_id = ?
             """,
             (close_order_id, debit_for_pnl, pnl, time.time(), close_reason, spread_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def merge_order_raw_snapshot(
+    order_id: str,
+    extra: Dict[str, Any],
+    *,
+    db_path: Optional[Path] = None,
+) -> None:
+    """Merge keys into alpaca_orders.raw_snapshot_json (e.g. entry greeks at fill)."""
+    import time
+
+    path = db_path or _default_db_path()
+    init_alpaca_db(path)
+    conn = sqlite3.connect(str(path))
+    try:
+        row = conn.execute(
+            f"SELECT raw_snapshot_json FROM {ORDERS_TABLE} WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+        base: Dict[str, Any] = {}
+        if row and row[0]:
+            try:
+                parsed = json.loads(str(row[0]))
+                if isinstance(parsed, dict):
+                    base = parsed
+            except Exception:
+                base = {}
+        base.update(extra)
+        conn.execute(
+            f"""
+            UPDATE {ORDERS_TABLE}
+            SET raw_snapshot_json = ?, updated_at = ?
+            WHERE order_id = ?
+            """,
+            (json.dumps(base, separators=(",", ":")), time.time(), order_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def insert_telemetry(
+    spread_id: int,
+    *,
+    underlying_price: float,
+    current_mark_mid: Optional[float],
+    current_natural_ask: Optional[float],
+    distance_to_short_pct: Optional[float],
+    gate_open: bool,
+    db_path: Optional[Path] = None,
+) -> None:
+    """Append one row to spread_telemetry for MAE/MFE-style analysis."""
+    import time
+
+    ts = time.time()
+    path = db_path or _default_db_path()
+    init_alpaca_db(path)
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            f"""
+            INSERT INTO {TELEMETRY_TABLE}
+            (spread_id, timestamp, underlying_price, current_mark_mid,
+             current_natural_ask, distance_to_short_pct, gate_open)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(spread_id),
+                ts,
+                float(underlying_price),
+                current_mark_mid,
+                current_natural_ask,
+                distance_to_short_pct,
+                1 if gate_open else 0,
+            ),
         )
         conn.commit()
     finally:
