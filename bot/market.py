@@ -6,7 +6,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
@@ -63,6 +63,63 @@ def get_market_hour_la() -> datetime:
     return datetime.now(LA_TZ)
 
 
+# Cache discovered current event tickers by (series_ticker_upper) for a short time to avoid
+# hitting the public markets endpoint on every tick when naming formats shift.
+_SERIES_EVENT_CACHE: Dict[str, Tuple[str, float]] = {}
+_SERIES_EVENT_CACHE_TTL_SECONDS = 60.0
+
+
+def _discover_current_event_ticker_from_series(series_ticker: str) -> Optional[str]:
+    """
+    Discover the nearest-future event_ticker for a given series_ticker by querying /markets?series_ticker=...
+    and selecting the market with the smallest close_time >= now (UTC).
+    Returns event_ticker or None if discovery fails.
+    """
+    st = (series_ticker or "").strip().upper()
+    if not st:
+        return None
+    now = time.time()
+    cached = _SERIES_EVENT_CACHE.get(st)
+    if cached and (now - float(cached[1] or 0.0)) < _SERIES_EVENT_CACHE_TTL_SECONDS:
+        return cached[0]
+    try:
+        resp = requests.get(KALSHI_API_URL, params={"limit": 200, "series_ticker": st}, timeout=10)
+        resp.raise_for_status()
+        data = resp.json() if resp is not None else {}
+        markets = (data or {}).get("markets", [])
+        if not isinstance(markets, list) or not markets:
+            return None
+        now_utc = datetime.now(timezone.utc)
+        best: Optional[Tuple[float, str]] = None  # (close_ts, event_ticker)
+        for m in markets:
+            if not isinstance(m, dict):
+                continue
+            ev = m.get("event_ticker")
+            if not ev:
+                continue
+            ct = m.get("close_time")
+            try:
+                if isinstance(ct, (int, float)):
+                    close_ts = float(ct)
+                else:
+                    dt = datetime.fromisoformat(str(ct).replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    close_ts = float(dt.timestamp())
+            except Exception:
+                continue
+            if close_ts < now_utc.timestamp():
+                continue
+            if best is None or close_ts < best[0]:
+                best = (close_ts, str(ev).strip().upper())
+        if best is None:
+            return None
+        _SERIES_EVENT_CACHE[st] = (best[1], now)
+        return best[1]
+    except Exception:
+        return None
+
+
 def get_current_hour_market_id(asset: str = "btc") -> str:
     """
     Get the event ticker for the current hourly market (above/below).
@@ -71,7 +128,15 @@ def get_current_hour_market_id(asset: str = "btc") -> str:
     now_utc = datetime.now(pytz.utc)
     target = now_utc.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     slug = generate_kalshi_slug(target, asset=asset)
-    return slug.upper()
+    guess = slug.upper()
+    # If Kalshi naming shifts or the guess is not yet listed, fall back to series discovery.
+    asset_l = str(asset).lower()
+    prefix = ASSET_PREFIXES.get(asset_l)
+    if prefix:
+        discovered = _discover_current_event_ticker_from_series(prefix)
+        if discovered:
+            return discovered
+    return guess
 
 
 def get_previous_hour_market_id(asset: str = "btc") -> str:
@@ -87,19 +152,23 @@ def get_current_hour_market_ids(asset: str) -> List[str]:
     All current-hour market IDs for this asset (9 total across assets: 2 each btc/eth/sol/xrp, 1 doge).
     Returns [above_below_slug, range_slug] for btc/eth/sol/xrp, [range_slug] for doge.
     """
-    now_utc = datetime.now(pytz.utc)
-    target = now_utc.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     asset_l = str(asset).lower()
     ids: List[str] = []
     if asset_l in ("btc", "eth", "sol", "xrp"):
-        ids.append(generate_kalshi_slug(target, asset=asset_l).upper())
-        range_slug = generate_kalshi_slug_range(target, asset_l)
-        if range_slug:
-            ids.append(range_slug.upper())
+        # Primary above/below
+        ids.append(get_current_hour_market_id(asset=asset_l))
+        # Range series discovery
+        range_prefix = ASSET_PREFIXES_HOURLY_RANGE.get(asset_l)
+        if range_prefix:
+            discovered_range = _discover_current_event_ticker_from_series(range_prefix)
+            if discovered_range:
+                ids.append(discovered_range)
     elif asset_l == "doge":
-        range_slug = generate_kalshi_slug_range(target, asset_l)
-        if range_slug:
-            ids.append(range_slug.upper())
+        range_prefix = ASSET_PREFIXES_HOURLY_RANGE.get(asset_l)
+        if range_prefix:
+            discovered_range = _discover_current_event_ticker_from_series(range_prefix)
+            if discovered_range:
+                ids.append(discovered_range)
     return ids
 
 
