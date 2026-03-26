@@ -31,6 +31,8 @@ hourly:
       # Position sizing + spend cap (same idea as v2_fifteen_min.yaml)
       order_count: { btc: 1, eth: 1, sol: 1, xrp: 1, doge: 1 }
       max_cost_cents: 500
+      # Max entry orders this strategy may place per (asset, hourly window).
+      max_orders_per_window: 5
       entry_window:
         late_window_minutes: 20
         late_interval_seconds: 1
