@@ -16,7 +16,7 @@ intervals:
     assets: [btc, eth, sol, xrp]
     mode: TRADE
   hourly:
-    enabled: true
+    enabled: false
     assets: [btc]
     mode: TRADE
 
