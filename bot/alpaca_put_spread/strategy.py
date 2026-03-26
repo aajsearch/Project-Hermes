@@ -46,6 +46,7 @@ from bot.alpaca_put_spread.pricing_logic import (
     IronCondorCandidate,
     PutSpreadCandidate,
     current_net_credit_mid_from_legs,
+    estimate_close_debit_natural_from_open_legs,
     tp_sl_triggered,
 )
 from bot.alpaca_put_spread.put_spread_selector import _get_chain_silent, select_bull_put_credit_spread
@@ -555,19 +556,25 @@ class AlpacaPutSpreadRunner:
             return self._poll_pending_close(underlying, open_spread, strategy_type, pending_close, ec)
 
         legs_p = _pricing_legs_from_open(open_spread)
-        current_net = current_net_credit_mid_from_legs(
-            legs_p,
-            lambda sym: _option_bid_ask(self.option_data_client, sym),
-        )
+        quotes = lambda sym: _option_bid_ask(self.option_data_client, sym)
+        current_net = current_net_credit_mid_from_legs(legs_p, quotes)
         if current_net is None or current_net <= 0:
             current_net = float(open_spread.get("entry_net_credit_mid", 0.0))
         if current_net <= 0:
             logger.warning("[%s][%s] Cannot compute positive debit to close; skip", underlying, strategy_type)
             return False
 
-        close_debit_limit_raw = _close_debit_limit_with_min_slippage(
-            float(current_net), ec.close_limit_slippage_pct
-        )
+        # Expiry cutoff: use aggressive close pricing based on natural debit (ask(sells) - bid(buys))
+        # and keep a slightly larger slippage buffer to avoid end-of-day widening causing no fills.
+        if (reason or "") == "expiry_cutoff":
+            natural_debit = estimate_close_debit_natural_from_open_legs(legs_p, quotes)
+            base = float(natural_debit) if natural_debit is not None and natural_debit > 0 else float(current_net)
+            slip_pct = max(float(ec.close_limit_slippage_pct), 0.05)
+            close_debit_limit_raw = _close_debit_limit_with_min_slippage(base, slip_pct)
+        else:
+            close_debit_limit_raw = _close_debit_limit_with_min_slippage(
+                float(current_net), ec.close_limit_slippage_pct
+            )
         close_debit_limit = _alpaca_limit_price(close_debit_limit_raw, is_credit=False)
         close_legs = _exit_legs_from_open(open_spread)
         client_order_id = f"alpaca_{strategy_type.lower()}_close:{underlying}:{int(time.time())}"
@@ -608,6 +615,9 @@ class AlpacaPutSpreadRunner:
                 "submitted_at_ts": time.time(),
                 "close_debit_limit": close_debit_limit,
                 "close_reason": reason,
+                # Anti-spam for expiry cutoff repricing (cancel/replace loop control).
+                "replace_count": 0,
+                "last_replace_ts": 0.0,
             },
         )
         save_state(self.state)
@@ -651,6 +661,9 @@ class AlpacaPutSpreadRunner:
     ) -> bool:
         order_id = pending_close.get("order_id")
         submitted_at_ts = float(pending_close.get("submitted_at_ts", 0.0) or 0.0)
+        close_reason = str(pending_close.get("close_reason") or "")
+        replace_count = int(pending_close.get("replace_count") or 0)
+        last_replace_ts = float(pending_close.get("last_replace_ts", 0.0) or 0.0)
         if not order_id:
             pop_nested(self.state, PENDING_CLOSE, underlying, strategy_type)
             save_state(self.state)
@@ -680,7 +693,88 @@ class AlpacaPutSpreadRunner:
             logger.warning("[%s][%s] Close terminal status=%s", underlying, strategy_type, status)
             return False
 
-        if submitted_at_ts and (time.time() - submitted_at_ts) >= self.cfg.order_fill_timeout_seconds:
+        # Expiry cutoff anti-spam:
+        # - let the aggressive order sit for at least 60s before any cancel/replace
+        # - cap replacements to avoid hundreds of orders near expiry
+        if close_reason == "expiry_cutoff" and submitted_at_ts:
+            age = time.time() - submitted_at_ts
+            if age < 60.0:
+                return False
+            if replace_count < 3 and (not last_replace_ts or (time.time() - last_replace_ts) >= 60.0):
+                try:
+                    legs_p = _pricing_legs_from_open(open_spread)
+                    quotes = lambda sym: _option_bid_ask(self.option_data_client, sym)
+                    natural_debit = estimate_close_debit_natural_from_open_legs(legs_p, quotes)
+                    if natural_debit is not None and natural_debit > 0:
+                        base = float(natural_debit)
+                        slip_pct = max(float(ec.close_limit_slippage_pct), 0.05)
+                        new_raw = _close_debit_limit_with_min_slippage(base, slip_pct)
+                        new_limit = _alpaca_limit_price(new_raw, is_credit=False)
+                    else:
+                        new_limit = None
+                except Exception:
+                    new_limit = None
+
+                # Only replace if we can compute a new aggressive limit.
+                if new_limit is not None:
+                    try:
+                        cancel_order(self.trading_client, order_id)
+                    except Exception:
+                        pass
+                    close_legs = _exit_legs_from_open(open_spread)
+                    client_order_id = f"alpaca_{strategy_type.lower()}_close:{underlying}:{int(time.time())}"
+                    new_order_id = submit_mleg_limit_order(
+                        self.trading_client,
+                        qty=int(self.cfg.order_qty),
+                        limit_price=float(new_limit),
+                        legs=close_legs,
+                        client_order_id=client_order_id,
+                    )
+                    logger.warning(
+                        "[%s][%s] Expiry cutoff replace close order %s -> %s debit_limit=%.4f (replace_count=%s)",
+                        underlying,
+                        strategy_type,
+                        order_id,
+                        new_order_id,
+                        float(new_limit),
+                        replace_count + 1,
+                    )
+                    # Record the new order in DB/state; old order status will be reconciled later.
+                    db_update_order_status(str(order_id), "canceled")
+                    db_insert_order(
+                        order_id=new_order_id,
+                        underlying=underlying,
+                        side="close",
+                        status="submitted",
+                        client_order_id=client_order_id,
+                        strategy_type=strategy_type,
+                        legs=_spread_legs_from_state(open_spread) or None,
+                        short_put_symbol=open_spread.get("short_put_symbol"),
+                        long_put_symbol=open_spread.get("long_put_symbol"),
+                        limit_price=float(new_limit),
+                        qty=self.cfg.order_qty,
+                        raw_snapshot={"strategy_type": strategy_type, "legs": _spread_legs_from_state(open_spread)},
+                    )
+                    log_event(
+                        "close_submitted",
+                        f"order_id={new_order_id}",
+                        underlying=underlying,
+                        extra={"order_id": new_order_id, "strategy_type": strategy_type, "replaced": True},
+                    )
+                    pending_close["order_id"] = new_order_id
+                    pending_close["submitted_at_ts"] = time.time()
+                    pending_close["close_debit_limit"] = float(new_limit)
+                    pending_close["replace_count"] = replace_count + 1
+                    pending_close["last_replace_ts"] = time.time()
+                    set_nested(self.state, PENDING_CLOSE, underlying, strategy_type, pending_close)
+                    save_state(self.state)
+                    return False
+
+        # For expiry_cutoff, avoid aggressive timeout-driven cancel loops; let it rest longer.
+        timeout = float(self.cfg.order_fill_timeout_seconds)
+        if close_reason == "expiry_cutoff":
+            timeout = max(timeout, 600.0)
+        if submitted_at_ts and (time.time() - submitted_at_ts) >= timeout:
             try:
                 cancel_order(self.trading_client, order_id)
             except Exception:

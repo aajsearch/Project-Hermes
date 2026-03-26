@@ -101,6 +101,36 @@ def current_net_credit_mid_from_legs(legs: Sequence[Leg], bid_ask_for: BidAskFor
     return total
 
 
+def estimate_close_debit_natural_from_open_legs(legs: Sequence[Leg], bid_ask_for: BidAskFor) -> Optional[float]:
+    """
+    Conservative "natural" debit to close a position described by *opening* legs.
+
+    For each opening leg:
+    - opening SELL -> closing BUY at ASK (pay ask)
+    - opening BUY  -> closing SELL at BID (receive bid)
+
+    Returns the net debit (>= 0) to close, or None if any leg is missing the required quote side.
+    """
+    debit = 0.0
+    for leg in legs:
+        bid, ask = bid_ask_for(leg.symbol)
+        r = int(leg.ratio) if getattr(leg, "ratio", None) not in (None, 0) else 1
+        if r <= 0:
+            r = 1
+        side_raw = (leg.side or "").strip().lower()
+        if side_raw in ("sell", "s") or "sell" in side_raw:
+            if ask is None:
+                return None
+            debit += float(r) * float(ask)
+        elif side_raw in ("buy", "b") or "buy" in side_raw:
+            if bid is None:
+                return None
+            debit -= float(r) * float(bid)
+        else:
+            return None
+    return float(debit) if debit >= 0 else 0.0
+
+
 def net_credit_mid(short_put_mid: float, long_put_mid: float) -> float:
     """PCS helper: net credit from short and long put mids (sell short, buy long)."""
     legs = (
@@ -145,16 +175,26 @@ def tp_sl_triggered(
     bid_ask_for: Optional[BidAskFor] = None,
 ) -> tuple[bool, str]:
     """
-    For credit spreads we expect net credit mid to DECAY in profit.
-    - Take profit: current_net_credit_mid <= entry_net_credit_mid * (1 - tp_pct)
-    - Stop loss:   current_net_credit_mid >= entry_net_credit_mid * (1 + sl_pct)
+    TP/SL evaluation for credit structures.
+
+    We estimate the *debit to close* (buy-to-close net) conservatively using the "natural" price:
+    ask(opening-sell legs) minus bid(opening-buy legs). This avoids firing TP based purely on mid
+    when spreads widen and the executable close price is materially worse than the mark.
+
+    Thresholds are expressed in terms of debit-to-close:
+    - Take profit: est_close_debit <= entry_net_credit_mid * (1 - tp_pct)
+    - Stop loss:   est_close_debit >= entry_net_credit_mid * (1 + sl_pct)
 
     If ``legs`` and ``bid_ask_for`` are provided, ``current_net_credit_mid`` is
     ignored and the combined total from :func:`current_net_credit_mid_from_legs` is used.
     """
     current: Optional[float] = current_net_credit_mid
     if legs is not None and bid_ask_for is not None:
-        current = current_net_credit_mid_from_legs(legs, bid_ask_for)
+        # Mark (mid) is useful for logging/diagnostics but not safe for TP in wide spreads.
+        mark_credit = current_net_credit_mid_from_legs(legs, bid_ask_for)
+        natural_debit = estimate_close_debit_natural_from_open_legs(legs, bid_ask_for)
+        # Fall back to mark when natural is unavailable (missing bid/ask).
+        current = natural_debit if natural_debit is not None else mark_credit
     if current is None:
         return (False, "")
     if entry_net_credit_mid <= 0:

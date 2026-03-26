@@ -14,7 +14,7 @@ fifteen_min:
       limit_price_cents: 99
       min_bid_cents: { btc: 96, eth: 96, sol: 97, xrp: 96 }
       
-      order_count: { btc: 100, eth: 100, sol: 100, xrp: 100 }
+      order_count: { btc: 150, eth: 150, sol: 150, xrp: 150 }
       max_cost_cents: 50000
       side: auto
       
@@ -23,11 +23,11 @@ fifteen_min:
       # mark while ref_dist stayed large, so distance gate blocked 15% until catastrophic. SOL/XRP refs
       # are tiny so distance arms easily; a few rows show <15% exit PnL (fills vs mark / timing).
       stop_loss_pct: 15
-      distance_decay_pct: { btc: 0.88, eth: 0.82, sol: 0.88, xrp: 0.92 }
+      distance_decay_pct: { btc: 0.88, eth: 0.88, sol: 0.88, xrp: 0.92 }
       # Hard ceiling before deep bleed (observed exits clustered under old 30%)
       catastrophic_loss_pct: 22
       # null = no distance gate for that asset → normal SL is mark-based 15% + persistence (last_90s.py)
-      stop_loss_absolute_buffer: { btc: 15, eth: 1.0, sol: 0.04, xrp: 0.0008 }
+      stop_loss_absolute_buffer: { btc: 15, eth: 0.5, sol: 0.04, xrp: 0.0008 }
       # --- ENTRY PREVENTION (Filtering out the noise) ---
       min_distance_at_placement: { btc: 55.0, eth: 2.0, sol: 0.1, xrp: 0.0025 }
       # Cancel resting entry if distance decays too much before fill (pre-fill adverse selection protection)
