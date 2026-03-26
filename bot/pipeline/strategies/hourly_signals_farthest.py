@@ -325,6 +325,26 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
                 except Exception:
                     entry_dist = None
 
+            # Log the choice so it matches the fifteen_min style.
+            yes_bid = int(getattr(q, "yes_bid", 0) or 0) if q is not None else 0
+            no_bid = int(getattr(q, "no_bid", 0) or 0) if q is not None else 0
+            chosen_bid = int(placement_bid or 0)
+            logger.info(
+                "[hourly_signals_v2_choice] [%s] sec_to_close=%.0f mode=%s yes_bid=%s no_bid=%s chosen=%s bid=%s "
+                "yes_band=[%s,%s] no_band=[%s,%s]",
+                (ctx.asset or "").upper(),
+                float(ctx.seconds_to_close or -1),
+                ("all_in_range" if pick_all else "farthest"),
+                yes_bid,
+                no_bid,
+                side,
+                chosen_bid,
+                thresholds.get("yes_min"),
+                thresholds.get("yes_max"),
+                thresholds.get("no_min"),
+                thresholds.get("no_max"),
+            )
+
             window_id = f"{ctx.interval}_{logical_window_slot(ctx.market_id)}"
             client_order_id = f"v2:{self.strategy_id}:{ctx.asset}:{window_id}:{uuid.uuid4().hex[:10]}"
 
@@ -409,6 +429,16 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
 
             if panic:
                 exits.append(ExitAction(order_id=str(o.order_id), action="stop_loss", reason="panic_stop_loss"))
+                logger.info(
+                    "[hourly_signals_v2_sl] [%s] order_id=%s ticker=%s side=%s reason=panic_stop_loss entry_bid=%s cur_bid=%s loss_frac=%.4f",
+                    (ctx.asset or "").upper(),
+                    str(o.order_id),
+                    t,
+                    side,
+                    entry_bid,
+                    cur_bid,
+                    loss_frac,
+                )
                 _log_telemetry(
                     window_id=window_id,
                     asset=ctx.asset,
@@ -422,6 +452,16 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
 
             if persistence <= 1:
                 exits.append(ExitAction(order_id=str(o.order_id), action="stop_loss", reason="stop_loss"))
+                logger.info(
+                    "[hourly_signals_v2_sl] [%s] order_id=%s ticker=%s side=%s reason=stop_loss entry_bid=%s cur_bid=%s loss_frac=%.4f",
+                    (ctx.asset or "").upper(),
+                    str(o.order_id),
+                    t,
+                    side,
+                    entry_bid,
+                    cur_bid,
+                    loss_frac,
+                )
                 _log_telemetry(
                     window_id=window_id,
                     asset=ctx.asset,
@@ -443,6 +483,18 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
                         action="stop_loss",
                         reason=f"stop_loss_persist_{nxt}",
                     )
+                )
+                logger.info(
+                    "[hourly_signals_v2_sl] [%s] order_id=%s ticker=%s side=%s reason=stop_loss_persist polls=%s/%s entry_bid=%s cur_bid=%s loss_frac=%.4f",
+                    (ctx.asset or "").upper(),
+                    str(o.order_id),
+                    t,
+                    side,
+                    nxt,
+                    persistence,
+                    entry_bid,
+                    cur_bid,
+                    loss_frac,
                 )
                 _log_telemetry(
                     window_id=window_id,

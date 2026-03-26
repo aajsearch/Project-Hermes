@@ -296,6 +296,21 @@ class HourlyLast90sLimit99Strategy(BaseV2Strategy):
                 )
                 continue
 
+            # Log intent choice in the same style as fifteen_min last_90s.
+            yes_bid = int(mkt.get("yes_bid") or 0)
+            no_bid = int(mkt.get("no_bid") or 0)
+            logger.info(
+                "[hourly_last_90s_v2_side] [%s] sec_to_close=%.0f side_cfg=%s yes_bid=%s no_bid=%s chosen=%s bid=%s min_bid_cents=%s",
+                (ctx.asset or "").upper(),
+                float(ctx.seconds_to_close or -1),
+                side_mode,
+                yes_bid,
+                no_bid,
+                side,
+                bid,
+                min_bid,
+            )
+
             client_order_id = f"v2:{self.strategy_id}:{ctx.asset}:{window_id}:{uuid.uuid4().hex[:10]}"
             _log(
                 window_id=window_id,
@@ -374,6 +389,20 @@ class HourlyLast90sLimit99Strategy(BaseV2Strategy):
                 continue
 
             exits.append(ExitAction(order_id=str(o.order_id), action="stop_loss", reason="stop_loss"))
+            logger.info(
+                "[hourly_last_90s_v2_sl] [%s] order_id=%s ticker=%s side=%s entry_bid=%s cur_bid=%s loss_pct=%.2f "
+                "entry_dist=%s cur_dist=%.4f dist_factor=%.2f",
+                (ctx.asset or "").upper(),
+                str(o.order_id),
+                t,
+                side,
+                entry_bid,
+                cur_bid,
+                loss_pct,
+                (base_dist if base_dist is not None else "NA"),
+                float(cur_dist),
+                float(dist_factor),
+            )
             _log(
                 window_id=window_id,
                 asset=ctx.asset,
