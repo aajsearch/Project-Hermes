@@ -225,10 +225,25 @@ def run_pipeline_cycle(
                 # Hourly has multiple event tickers (above/below + range) per asset. We attach all markets
                 # so hourly strategies can replicate legacy selection across tickers without refetching.
                 extra_hourly_event_ids: List[str] = []
+                # Config-driven event inclusion per asset.
+                interval_slice = config.get("hourly") or {}
+                pipeline_cfg = (interval_slice.get("pipeline") or {}) if isinstance(interval_slice, dict) else {}
+                event_mode_by_asset = pipeline_cfg.get("event_mode_by_asset") if isinstance(pipeline_cfg, dict) else None
+                mode = None
+                if isinstance(event_mode_by_asset, dict):
+                    mode = event_mode_by_asset.get(asset, event_mode_by_asset.get(asset.upper()))
+                mode_s = str(mode).strip().lower() if mode is not None else "both"
                 try:
-                    extra_hourly_event_ids = get_current_hour_market_ids(asset=asset)
+                    ids = get_current_hour_market_ids(asset=asset)
+                    if mode_s == "primary_only":
+                        extra_hourly_event_ids = [market_id]
+                    elif mode_s == "range_only":
+                        extra_hourly_event_ids = [x for x in ids if x and x != market_id]
+                    else:
+                        # both (default)
+                        extra_hourly_event_ids = ids
                 except Exception:
-                    extra_hourly_event_ids = []
+                    extra_hourly_event_ids = [market_id] if mode_s == "primary_only" else []
                 if use_kalshi_ws:
                     try:
                         from bot.kalshi_ws_manager import get_safe_market

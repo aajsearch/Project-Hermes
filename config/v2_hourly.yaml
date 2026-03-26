@@ -2,6 +2,23 @@
 hourly:
   pipeline:
     run_interval_seconds: 1
+    # For hourly events, Kalshi often has multiple event tickers per asset:
+    # - primary (above/below)
+    # - range (bucketed band)
+    # Configure which event(s) to include per asset.
+    #
+    # Modes:
+    # - primary_only: only the primary hourly event (get_current_hour_market_id)
+    # - range_only: only the range hourly event (when it exists)
+    # - both: include both primary + range (default legacy-like for btc/eth/sol/xrp)
+    #
+    # NOTE: doge often only has a range event; primary_only will effectively evaluate nothing for doge.
+    event_mode_by_asset:
+      btc: both
+      eth: both
+      sol: both
+      xrp: both
+      doge: range_only
     # Priority order when multiple hourly strategies emit intents on the same tick.
     # Put last-window strategy first so it wins during the closing seconds.
     strategy_priority: [hourly_last_90s_limit_99, hourly_signals_farthest]

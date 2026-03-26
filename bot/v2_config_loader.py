@@ -124,6 +124,18 @@ def _validate_hourly(config: Dict[str, Any]) -> None:
         )
     if "run_interval_seconds" not in pipeline:
         raise ValueError("Invalid V2 Config Schema: missing 'hourly.pipeline.run_interval_seconds' in v2_hourly.yaml")
+    # Optional: event_mode_by_asset controls primary vs range event selection.
+    event_mode = pipeline.get("event_mode_by_asset")
+    if event_mode is not None:
+        if not isinstance(event_mode, dict) or any(not isinstance(k, str) for k in event_mode.keys()):
+            raise ValueError("Invalid V2 Config Schema: 'hourly.pipeline.event_mode_by_asset' must be a dict[str, str]")
+        allowed = {"primary_only", "range_only", "both"}
+        for a, mode in event_mode.items():
+            if not isinstance(mode, str) or mode.strip().lower() not in allowed:
+                raise ValueError(
+                    "Invalid V2 Config Schema: hourly.pipeline.event_mode_by_asset values must be one of "
+                    f"{sorted(allowed)}; got {a}={mode!r}"
+                )
     if not isinstance(pipeline.get("strategy_priority"), list):
         raise ValueError("Invalid V2 Config Schema: 'hourly.pipeline.strategy_priority' must be a list")
     if "strategies" not in hourly or not isinstance(hourly["strategies"], dict):
