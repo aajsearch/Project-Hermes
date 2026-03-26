@@ -29,8 +29,8 @@ hourly:
     hourly_signals_farthest:
       enabled: true
       # Position sizing + spend cap (same idea as v2_fifteen_min.yaml)
-      order_count: { btc: 150, eth: 150, sol: 150, xrp: 150, doge: 150 }
-      max_cost_cents: 50000
+      order_count: { btc: 1, eth: 1, sol: 1, xrp: 1, doge: 1 }
+      max_cost_cents: 500
       entry_window:
         late_window_minutes: 20
         late_interval_seconds: 1
