@@ -264,6 +264,10 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
         cfg = _get_cfg(ctx, self.strategy_id)
         if not cfg.get("enabled", False):
             return None
+        # Hard cap: at most one order per (window, asset) for this strategy.
+        # This mirrors fifteen_min last_90s behavior (single bullet; no averaging up).
+        if my_orders and len(my_orders) > 0:
+            return None
         ew = cfg.get("entry_window") or {}
         late_window_minutes = _parse_float(ew.get("late_window_minutes"), 20.0)
         if (ctx.seconds_to_close / 60.0) > late_window_minutes:
