@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pytz
 from alpaca.data.requests import OptionLatestQuoteRequest
@@ -427,6 +427,8 @@ class AlpacaPutSpreadRunner:
         self.cfg = cfg
         self.state = load_state()
         ensure_state_shape(self.state)
+        # Log INFO once per (underlying, strategy) when entry_disabled blocks; DEBUG every loop if enabled.
+        self._entry_disabled_notice_keys: Set[Tuple[str, str]] = set()
 
     def _enabled_strategies(self) -> List[str]:
         out: List[str] = []
@@ -833,11 +835,26 @@ class AlpacaPutSpreadRunner:
         return True
 
     def _maybe_open(self, underlying: str, strategy_type: str, chain: Optional[Any] = None) -> None:
-        logger.info("[%s][%s] scanning for candidate...", underlying, strategy_type)
         if get_nested(self.state, "open_positions", underlying, strategy_type):
             return
         if get_nested(self.state, ENTRY_DISABLED, underlying, strategy_type):
+            logger.debug(
+                "[%s][%s] Entry disabled in state file; skipping options scan.",
+                underlying,
+                strategy_type,
+            )
+            key = (underlying, strategy_type)
+            if key not in self._entry_disabled_notice_keys:
+                self._entry_disabled_notice_keys.add(key)
+                logger.info(
+                    "[%s][%s] Entry disabled in state (entry_disabled). Skipping scan; "
+                    "set logger DEBUG for bot.alpaca_put_spread.strategy to see each loop.",
+                    underlying,
+                    strategy_type,
+                )
             return
+
+        logger.info("[%s][%s] scanning for candidate...", underlying, strategy_type)
 
         pending_entry = get_nested(self.state, PENDING_ENTRY, underlying, strategy_type)
         if pending_entry:
