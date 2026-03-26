@@ -209,6 +209,23 @@ class HourlyLast90sLimit99Strategy(BaseV2Strategy):
         min_bid = _parse_int(cfg.get("min_bid_cents"), 94)
         side_mode = str(cfg.get("side") or "both").strip().lower()
 
+        order_count = int(_get_asset_cfg(cfg.get("order_count"), ctx.asset, 1) or 1)
+        if order_count < 1:
+            order_count = 1
+        max_cost = _get_asset_cfg(cfg.get("max_cost_cents_by_asset"), ctx.asset, None)
+        if max_cost is None:
+            max_cost = _get_asset_cfg(cfg.get("max_cost_cents"), ctx.asset, 50000)
+        max_cost_i = int(max_cost or 0)
+        if max_cost_i > 0 and (order_count * int(limit_price)) > max_cost_i:
+            _log(
+                window_id=window_id,
+                asset=ctx.asset,
+                action="skip",
+                reason="max_cost_cents",
+                details={"order_count": order_count, "limit_price_cents": int(limit_price), "max_cost_cents": max_cost_i},
+            )
+            return None
+
         max_yes = _parse_int(cfg.get("max_yes_per_market"), 0)
         max_no = _parse_int(cfg.get("max_no_per_market"), 0)
 
@@ -327,7 +344,7 @@ class HourlyLast90sLimit99Strategy(BaseV2Strategy):
             return OrderIntent(
                 side=side,
                 price_cents=int(limit_price),
-                count=1,
+                count=int(order_count),
                 order_type="limit",
                 client_order_id=client_order_id,
                 placement_bid_cents=int(bid) if bid > 0 else None,

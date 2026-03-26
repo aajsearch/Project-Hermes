@@ -28,6 +28,9 @@ hourly:
     # risk guards, and hourly exit criteria.
     hourly_signals_farthest:
       enabled: true
+      # Position sizing + spend cap (same idea as v2_fifteen_min.yaml)
+      order_count: { btc: 150, eth: 150, sol: 150, xrp: 150, doge: 150 }
+      max_cost_cents: 50000
       entry_window:
         late_window_minutes: 20
         late_interval_seconds: 1
@@ -93,6 +96,9 @@ hourly:
       limit_price_cents: 99
       min_bid_cents: 94
       side: both
+
+      # Position sizing + spend cap (same idea as v2_fifteen_min.yaml)
+      order_count: { btc: 150, eth: 150, sol: 150, xrp: 150, doge: 150 }
 
       stop_loss_pct: 15
       stop_loss_distance_factor: 0.75

@@ -152,6 +152,15 @@ def _thresholds(cfg: dict) -> Dict[str, int]:
     }
 
 
+def _get_asset_cfg(value: Any, asset: str, default: Any) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, dict):
+        a = _asset_lower(asset)
+        return value.get(a, value.get(a.upper(), default))
+    return value
+
+
 def _normalize_event_quotes(ctx: WindowContext, spot: float, window: float) -> List[TickerQuote]:
     out: List[TickerQuote] = []
     for m in ctx.event_markets or []:
@@ -316,6 +325,22 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
             # limit at 99c (same as fifteen_min limit-99 style).
             price = 99
 
+            order_count = int(_get_asset_cfg(cfg.get("order_count"), ctx.asset, 1) or 1)
+            if order_count < 1:
+                order_count = 1
+            max_cost = int(_get_asset_cfg(cfg.get("max_cost_cents"), ctx.asset, 50000) or 50000)
+            if max_cost > 0 and (order_count * int(price)) > max_cost:
+                _log_telemetry(
+                    window_id=f"{ctx.interval}_{logical_window_slot(ctx.market_id)}",
+                    asset=ctx.asset,
+                    action="skip",
+                    ticker=str(s.ticker),
+                    side=side,
+                    reason="max_cost_cents",
+                    details={"order_count": order_count, "price_cents": int(price), "max_cost_cents": max_cost},
+                )
+                return None
+
             # placement bid for stop-loss baseline (match V2 executor expectations)
             q = next((qq for qq in quotes if qq.ticker == s.ticker), None)
             placement_bid = None
@@ -361,6 +386,7 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
                 reason=str(s.reason),
                 details={
                     "price_cents": price,
+                    "order_count": order_count,
                     "placement_bid_cents": placement_bid,
                     "entry_distance": entry_dist,
                     "pick_all_in_range": pick_all,
@@ -370,7 +396,7 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
             return OrderIntent(
                 side=side,
                 price_cents=int(price),
-                count=1,
+                count=int(order_count),
                 order_type="limit",
                 client_order_id=client_order_id,
                 placement_bid_cents=placement_bid,
