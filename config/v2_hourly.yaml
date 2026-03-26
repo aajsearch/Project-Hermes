@@ -14,7 +14,7 @@ hourly:
     #
     # NOTE: doge often only has a range event; primary_only will effectively evaluate nothing for doge.
     event_mode_by_asset:
-      btc: both
+      btc: primary_only
       eth: both
       sol: both
       xrp: both
@@ -34,7 +34,7 @@ hourly:
 
       selection:
         # Mirror legacy config/hourly.yaml + common.yaml
-        pick_all_in_range: true
+        pick_all_in_range: false
         spot_window_default: 1500
         spot_window_by_asset:
           btc: 1500

@@ -16,8 +16,8 @@ intervals:
     assets: [btc, eth, sol, xrp]
     mode: TRADE
   hourly:
-    enabled: false
-    assets: [btc, eth, sol, xrp]
+    enabled: true
+    assets: [btc]
     mode: TRADE
 
 caps:
@@ -34,20 +34,9 @@ no_trade_windows:
   timezone: America/Los_Angeles
   windows: []
 
-# Feature flags (V2-only). Default safe: nothing enabled.
 feature_flags:
   v2_hourly:
-    # Enable V2 hourly trading per asset (e.g. [btc] for canary). Empty = off.
-    enabled_assets: []
-    # When true, V2 hourly evaluates and logs but does not place orders (in addition to global dry_run).
-    shadow_mode: false
-
-# Rollout controls (default: V2 hourly disabled everywhere)
-feature_flags:
-  v2_hourly:
-    # When non-empty: only these assets run V2 hourly strategies (per-asset canary).
-    # Example: [btc] to canary BTC only.
-    enabled_assets: []
-    # When true: hourly pipeline runs but executor is forced to dry-run for hourly only,
-    # and the strategy logs parity/decision telemetry for comparison.
+    # Enable V2 hourly per asset (canary list). Empty = off.
+    enabled_assets: [btc]
+    # When true, V2 hourly evaluates and logs but does not place orders (hourly-only dry-run).
     shadow_mode: false
