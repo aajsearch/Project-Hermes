@@ -308,9 +308,9 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
             side = str(s.side).lower()
             if side not in ("yes", "no"):
                 continue
-            price = _parse_int(s.price, 0)
-            if price <= 0:
-                continue
+            # Selection uses legacy thresholds (ask/bid qualification), but execution places a fixed
+            # limit at 99c (same as fifteen_min limit-99 style).
+            price = 99
 
             # placement bid for stop-loss baseline (match V2 executor expectations)
             q = next((qq for qq in quotes if qq.ticker == s.ticker), None)
