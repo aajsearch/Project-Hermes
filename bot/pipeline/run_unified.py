@@ -15,6 +15,7 @@ from bot.market import (
     fetch_markets_for_event,
     get_current_15min_market_id,
     get_current_hour_market_id,
+    get_current_hour_market_ids,
     get_minutes_to_close,
     get_minutes_to_close_15min,
 )
@@ -31,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 # Log WS→REST fallback reason once per (market_id, "market"|"quote") per window; cleared on window transition
 _ws_fallback_logged: set = set()
+_hourly_feature_flag_logged: bool = False
 
 
 def _close_ts_from_market(market: Dict[str, Any]) -> Optional[int]:
@@ -191,26 +193,61 @@ def run_pipeline_cycle(
 
     for asset in assets:
         asset = str(asset).strip().lower()
+        if interval == "hourly":
+            ff = config.get("feature_flags") or {}
+            v2h = ff.get("v2_hourly") if isinstance(ff, dict) else None
+            enabled_assets = (v2h or {}).get("enabled_assets", []) if isinstance(v2h, dict) else []
+            if isinstance(enabled_assets, list) and enabled_assets:
+                allow = {str(a).strip().lower() for a in enabled_assets if str(a).strip()}
+                if asset not in allow:
+                    continue
+            else:
+                # Default safe: hourly does nothing unless enabled_assets is non-empty.
+                global _hourly_feature_flag_logged
+                if not _hourly_feature_flag_logged:
+                    logger.info(
+                        "[hourly] Feature flag disabled: set config.feature_flags.v2_hourly.enabled_assets to enable hourly per asset."
+                    )
+                    _hourly_feature_flag_logged = True
+                continue
         if not kalshi_client:
             logger.warning("[%s] [%s] No Kalshi client, skipping asset", interval, asset.upper())
             continue
         try:
             market_source = "REST"
+            markets: Optional[List[Dict[str, Any]]] = None
             if interval == "fifteen_min":
                 market_id = get_current_15min_market_id(asset=asset)
                 # Short-lived 15m markets: market_lifecycle_v2 often fires before we connect; rely on REST for market metadata.
                 market = fetch_15min_market(market_id)
             else:
                 market_id = get_current_hour_market_id(asset=asset)
+                # Hourly has multiple event tickers (above/below + range) per asset. We attach all markets
+                # so hourly strategies can replicate legacy selection across tickers without refetching.
+                extra_hourly_event_ids: List[str] = []
+                try:
+                    extra_hourly_event_ids = get_current_hour_market_ids(asset=asset)
+                except Exception:
+                    extra_hourly_event_ids = []
                 if use_kalshi_ws:
                     try:
                         from bot.kalshi_ws_manager import get_safe_market
                         market = get_safe_market(market_id)
                         if market and isinstance(market, dict) and market.get("ticker") and market.get("close_time") is not None:
                             market_source = "WS"
+                            markets = [market]
                         else:
                             markets, _ = fetch_markets_for_event(market_id)
                             market = markets[0] if markets else None
+                            # Merge in range-event markets when present (best-effort).
+                            for eid in extra_hourly_event_ids:
+                                if eid and eid != market_id:
+                                    try:
+                                        more, _ = fetch_markets_for_event(eid)
+                                        if more:
+                                            markets.extend(more)
+                                    except Exception:
+                                        pass
                             key = (market_id, "market")
                             if key not in _ws_fallback_logged:
                                 _ws_fallback_logged.add(key)
@@ -222,6 +259,14 @@ def run_pipeline_cycle(
                     except Exception as e:
                         markets, _ = fetch_markets_for_event(market_id)
                         market = markets[0] if markets else None
+                        for eid in extra_hourly_event_ids:
+                            if eid and eid != market_id:
+                                try:
+                                    more, _ = fetch_markets_for_event(eid)
+                                    if more:
+                                        markets.extend(more)
+                                except Exception:
+                                    pass
                         key = (market_id, "market")
                         if key not in _ws_fallback_logged:
                             _ws_fallback_logged.add(key)
@@ -229,6 +274,14 @@ def run_pipeline_cycle(
                 else:
                     markets, _ = fetch_markets_for_event(market_id)
                     market = markets[0] if markets else None
+                    for eid in extra_hourly_event_ids:
+                        if eid and eid != market_id:
+                            try:
+                                more, _ = fetch_markets_for_event(eid)
+                                if more:
+                                    markets.extend(more)
+                            except Exception:
+                                pass
             if not market or not isinstance(market, dict):
                 logger.warning("[%s] [%s] No active market, skipping asset", interval, asset.upper())
                 continue
@@ -288,12 +341,19 @@ def run_pipeline_cycle(
             positions_raw = kalshi_client.get_positions(limit=200)
             positions_list = positions_raw.get("positions", []) if isinstance(positions_raw, dict) else []
             positions = []
+            tickers_in_event: Optional[set] = None
+            if interval != "fifteen_min":
+                tickers_in_event = {m.get("ticker") for m in (markets or []) if isinstance(m, dict) and m.get("ticker")}
             for p in positions_list:
                 if not isinstance(p, dict):
                     continue
                 pt = p.get("ticker") or p.get("market_ticker")
-                if pt != ticker:
-                    continue
+                if interval == "fifteen_min":
+                    if pt != ticker:
+                        continue
+                else:
+                    if tickers_in_event is not None and pt not in tickers_in_event:
+                        continue
                 norm = _normalize_position(p)
                 if norm:
                     positions.append(norm)
@@ -315,12 +375,16 @@ def run_pipeline_cycle(
             open_orders=open_orders,
             config=config,
             market_data=market_data,
+            event_markets=markets,
         )
-        if ctx.distance is None:
+        if interval == "fifteen_min" and ctx.distance is None:
             logger.warning(
                 "[%s] [%s] Distance is None (no strike or spot), skipping asset — strike=%s spot=%s",
                 interval, asset.upper(), ctx.strike, ctx.spot,
             )
+            continue
+        if interval != "fifteen_min" and ctx.spot is None:
+            logger.warning("[%s] [%s] Spot is None, skipping asset (hourly requires spot)", interval, asset.upper())
             continue
 
         # Tick logger: one row per asset per window (tick history as JSON). Use logical slot so all assets share same window key.

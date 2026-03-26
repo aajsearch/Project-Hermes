@@ -24,6 +24,8 @@ from bot.pipeline.registry import OrderRegistry, init_v2_db
 from bot.pipeline.run_unified import run_pipeline_cycle
 from bot.pipeline.tick_logger import TickLogger
 from bot.pipeline.strategies.atm_breakout import AtmBreakoutStrategy
+from bot.pipeline.strategies.hourly_last_90s_limit_99 import HourlyLast90sLimit99Strategy
+from bot.pipeline.strategies.hourly_signals_farthest import HourlySignalsFarthestStrategy
 from bot.pipeline.strategies.knife_catcher import KnifeCatcherStrategy
 from bot.pipeline.strategies.last_90s import Last90sStrategy
 from bot.v2_config_loader import load_v2_config
@@ -99,16 +101,31 @@ def main() -> None:
         logger.debug("Oracle WS not started: %s", e)
     aggregator = OrderAggregator()
     executor = PipelineExecutor(registry, dry_run=dry_run, kalshi_client=kalshi_client)
+    ff = config.get("feature_flags") or {}
+    v2h = ff.get("v2_hourly") if isinstance(ff, dict) else {}
+    shadow_mode = bool(v2h.get("shadow_mode", False)) if isinstance(v2h, dict) else False
+    hourly_executor = PipelineExecutor(
+        registry,
+        dry_run=(True if shadow_mode else dry_run),
+        kalshi_client=kalshi_client,
+    )
     tick_logger = TickLogger()
 
     strat_last90s = Last90sStrategy(config)
     strat_atm = AtmBreakoutStrategy(config)
     strat_knife_catcher = KnifeCatcherStrategy(config)
+    strat_hourly_last90s = HourlyLast90sLimit99Strategy(config)
+    strat_hourly_regular = HourlySignalsFarthestStrategy(config)
 
     fifteen_min_strats = [strat_last90s, strat_knife_catcher, strat_atm]
-    hourly_strats: list = []
+    hourly_strats: list = [strat_hourly_last90s, strat_hourly_regular]
 
-    def run_interval_loop(interval: str, strategies: list, kalshi_client: KalshiClient) -> None:
+    def run_interval_loop(
+        interval: str,
+        strategies: list,
+        kalshi_client: KalshiClient,
+        executor: PipelineExecutor,
+    ) -> None:
         interval_cfg = (config.get(interval) or {}).get("pipeline") or {}
         sleep_secs = float(interval_cfg.get("run_interval_seconds", 1))
         while True:
@@ -133,7 +150,7 @@ def main() -> None:
     if intervals_cfg.get("fifteen_min", {}).get("enabled", False):
         t = threading.Thread(
             target=run_interval_loop,
-            args=("fifteen_min", fifteen_min_strats, kalshi_client),
+            args=("fifteen_min", fifteen_min_strats, kalshi_client, executor),
             name="v2_fifteen_min",
             daemon=True,
         )
@@ -143,7 +160,7 @@ def main() -> None:
     if intervals_cfg.get("hourly", {}).get("enabled", False):
         t = threading.Thread(
             target=run_interval_loop,
-            args=("hourly", hourly_strats, kalshi_client),
+            args=("hourly", hourly_strats, kalshi_client, hourly_executor),
             name="v2_hourly",
             daemon=True,
         )

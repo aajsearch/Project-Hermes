@@ -334,6 +334,8 @@ class DataLayer:
         open_orders: List[Any],
         config: Dict[str, Any],
         market_data: Dict[str, Any],
+        *,
+        event_markets: Optional[List[Dict[str, Any]]] = None,
     ) -> WindowContext:
         """
         Build a WindowContext for the current tick: single spot (Coinbase), distance = abs(spot - strike).
@@ -360,6 +362,7 @@ class DataLayer:
             asset=asset,
             seconds_to_close=seconds_to_close,
             quote=quote_normalized,
+            event_markets=list(event_markets or []),
             spot=spot_price,
             spot_source=spot_source,
             spot_age_s=spot_age_s,

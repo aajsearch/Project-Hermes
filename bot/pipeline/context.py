@@ -30,6 +30,9 @@ class WindowContext:
     asset: str
     seconds_to_close: float
     quote: Dict[str, int] = field(default_factory=_default_quote)  # yes_bid, yes_ask, no_bid, no_ask (cents)
+    # Hourly events have many tickers (strikes/ranges). For hourly strategies that need parity with legacy
+    # selection and per-ticker exit checks, we attach the full event market list (REST or WS seed).
+    event_markets: List[Dict[str, Any]] = field(default_factory=list)
     # Single spot source (provider-agnostic: currently Coinbase; swap to Kraken by changing data layer + oracle).
     spot: float | None = None
     spot_source: str = "?"  # "WS" (oracle WebSocket) or "REST"

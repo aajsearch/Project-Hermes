@@ -4,6 +4,7 @@ Summarize V2 dry-run capture and pipeline health.
 
 Reads data/v2_state.db (v2_telemetry_last_90s, v2_order_registry) and prints:
 - Telemetry summary: counts by reason and asset for last_90s_limit_99.
+- Hourly telemetry summaries when present (v2_telemetry_hourly_signals, v2_telemetry_hourly_last90s).
 - Recent telemetry rows (optional).
 - Registry row count (in dry run usually 0 new orders).
 - Short checklist of what to verify in logs.
@@ -94,6 +95,34 @@ def main() -> int:
         print()
     except sqlite3.OperationalError:
         pass
+
+    # --- Hourly telemetry (if hourly strategies were enabled) ---
+    def _try_hourly_summary(table: str, label: str) -> None:
+        try:
+            cur = conn.execute(
+                f"""
+                SELECT action, reason, asset, COUNT(*) AS n
+                FROM {table}
+                GROUP BY action, reason, asset
+                ORDER BY asset, action, reason
+                """
+            )
+            rows = cur.fetchall()
+        except sqlite3.OperationalError as e:
+            if "no such table" in str(e).lower():
+                return
+            print(f"{label} query failed:", e)
+            return
+        print(f"--- {label} ({table}) ---")
+        if not rows:
+            print("  No rows yet.")
+        else:
+            for r in rows:
+                print(f"  asset={r['asset']} action={r['action']} reason={r['reason']} count={r['n']}")
+        print()
+
+    _try_hourly_summary("v2_telemetry_hourly_signals", "hourly_signals_farthest telemetry")
+    _try_hourly_summary("v2_telemetry_hourly_last90s", "hourly_last_90s_limit_99 telemetry")
 
     conn.close()
 

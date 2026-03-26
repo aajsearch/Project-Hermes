@@ -2,6 +2,96 @@
 hourly:
   pipeline:
     run_interval_seconds: 1
-    strategy_priority: []
+    # Priority order when multiple hourly strategies emit intents on the same tick.
+    # Put last-window strategy first so it wins during the closing seconds.
+    strategy_priority: [hourly_last_90s_limit_99, hourly_signals_farthest]
 
-  strategies: {}
+  strategies:
+    # Regular legacy hourly loop: eligible tickers near spot, farthest (or all-in-range) selection,
+    # risk guards, and hourly exit criteria.
+    hourly_signals_farthest:
+      enabled: false
+      entry_window:
+        late_window_minutes: 20
+        late_interval_seconds: 1
+
+      selection:
+        # Mirror legacy config/hourly.yaml + common.yaml
+        pick_all_in_range: true
+        spot_window_default: 1500
+        spot_window_by_asset:
+          btc: 1500
+          eth: 200
+          sol: 50
+          xrp: 1
+          doge: 0.005
+        thresholds_yes: { min: 92, max: 99 }
+        thresholds_no: { min: 92, max: 99 }
+
+      guards:
+        enabled: true
+        no_new_entry_cutoff_seconds: 60
+        persistence_polls: 1
+        late_persistence_override:
+          enabled: false
+        stop_once_disable:
+          enabled: true
+          max_stopouts_per_ticker: 1
+        recent_cross:
+          enabled: true
+          from_below_cents: 90
+          to_at_least_cents: 94
+          extra_persistence_polls: 1
+        distance_buffer:
+          enabled: true
+          assets:
+            btc: { pct: 0.025, floor_usd: 350 }
+            eth: { pct: 0.005, floor_usd: 50 }
+        anchor_one_per_side:
+          enabled: true
+          lock_per_window: true
+          lock_on_stop_loss_only: true
+          recent_cross_penalty: 999
+        stoploss_roll_reentry:
+          enabled: true
+          ask_min_cents: 75
+          ask_max_cents: 98
+          order_size_multiplier: 5
+
+      exit:
+        stop_loss_pct: 0.30
+        panic_stop_loss_pct: 0.30
+        stop_loss_persistence_polls: 1
+        evaluation_interval_seconds: 1
+        hard_flip_exit:
+          enabled: false
+          enable_only_if_seconds_to_close_lte: 120
+
+    # Hourly last-90s limit strategy (legacy: hourly_last_90s_limit_99 thread)
+    hourly_last_90s_limit_99:
+      enabled: false
+      window_seconds: 75
+      run_interval_seconds: 1
+
+      limit_price_cents: 99
+      min_bid_cents: 94
+      side: both
+
+      stop_loss_pct: 15
+      stop_loss_distance_factor: 0.75
+
+      max_yes_per_market: 3
+      max_no_per_market: 3
+      max_cost_cents: 100
+      max_cost_cents_by_asset:
+        btc: 100
+        eth: 100
+        sol: 100
+        xrp: 100
+        doge: 100
+      min_distance_at_placement:
+        btc: 80
+        eth: 7.5
+        sol: 0.3
+        xrp: 0.07
+        doge: 0.0017

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import yaml
 
@@ -54,6 +54,46 @@ def _validate_common(config: Dict[str, Any]) -> None:
         raise ValueError("Invalid V2 Config Schema: missing 'caps' in common")
     if "no_trade_windows" not in config:
         raise ValueError("Invalid V2 Config Schema: missing 'no_trade_windows' in common")
+    # Optional but strongly recommended: feature_flags shape (used for safe rollouts)
+    ff = config.get("feature_flags")
+    if ff is not None and not isinstance(ff, dict):
+        raise ValueError("Invalid V2 Config Schema: 'feature_flags' must be a dict when present")
+    if isinstance(ff, dict):
+        v2h = ff.get("v2_hourly")
+        if v2h is not None and not isinstance(v2h, dict):
+            raise ValueError("Invalid V2 Config Schema: 'feature_flags.v2_hourly' must be a dict when present")
+        if isinstance(v2h, dict):
+            enabled_assets = v2h.get("enabled_assets", [])
+            if enabled_assets is not None and not isinstance(enabled_assets, list):
+                raise ValueError("Invalid V2 Config Schema: 'feature_flags.v2_hourly.enabled_assets' must be a list")
+            shadow = v2h.get("shadow_mode", False)
+            if shadow is not None and not isinstance(shadow, bool):
+                raise ValueError("Invalid V2 Config Schema: 'feature_flags.v2_hourly.shadow_mode' must be a bool")
+    _validate_feature_flags(config)
+
+
+def _validate_feature_flags(config: Dict[str, Any]) -> None:
+    """
+    Optional, but validated when present:
+      feature_flags.v2_hourly.enabled_assets: list[str]
+      feature_flags.v2_hourly.shadow_mode: bool
+    """
+    ff = config.get("feature_flags")
+    if ff is None:
+        return
+    if not isinstance(ff, dict):
+        raise ValueError("Invalid V2 Config Schema: 'feature_flags' must be a dict when present")
+    v2h = ff.get("v2_hourly")
+    if v2h is None:
+        return
+    if not isinstance(v2h, dict):
+        raise ValueError("Invalid V2 Config Schema: 'feature_flags.v2_hourly' must be a dict when present")
+    ea = v2h.get("enabled_assets", [])
+    if not isinstance(ea, list) or any(not isinstance(x, str) for x in ea):
+        raise ValueError("Invalid V2 Config Schema: 'feature_flags.v2_hourly.enabled_assets' must be a list[str]")
+    sm = v2h.get("shadow_mode", False)
+    if not isinstance(sm, bool):
+        raise ValueError("Invalid V2 Config Schema: 'feature_flags.v2_hourly.shadow_mode' must be a bool")
 
 
 def _validate_fifteen_min(config: Dict[str, Any]) -> None:
@@ -82,10 +122,38 @@ def _validate_hourly(config: Dict[str, Any]) -> None:
         raise ValueError(
             "Invalid V2 Config Schema: missing 'hourly.pipeline.strategy_priority' in v2_hourly.yaml"
         )
+    if "run_interval_seconds" not in pipeline:
+        raise ValueError("Invalid V2 Config Schema: missing 'hourly.pipeline.run_interval_seconds' in v2_hourly.yaml")
+    if not isinstance(pipeline.get("strategy_priority"), list):
+        raise ValueError("Invalid V2 Config Schema: 'hourly.pipeline.strategy_priority' must be a list")
     if "strategies" not in hourly or not isinstance(hourly["strategies"], dict):
         raise ValueError(
             "Invalid V2 Config Schema: missing 'hourly.strategies' in v2_hourly.yaml"
         )
+    # Ensure priority references valid strategies (avoids silent no-op).
+    strategies = hourly.get("strategies") or {}
+    for sid in pipeline.get("strategy_priority") or []:
+        if sid not in strategies:
+            raise ValueError(
+                f"Invalid V2 Config Schema: hourly.pipeline.strategy_priority references missing strategy '{sid}'"
+            )
+
+    pr = pipeline.get("strategy_priority")
+    if not isinstance(pr, list) or any(not isinstance(x, str) for x in pr):
+        raise ValueError("Invalid V2 Config Schema: 'hourly.pipeline.strategy_priority' must be a list[str]")
+    strategies = hourly.get("strategies") or {}
+    for sid in pr:
+        if sid not in strategies:
+            raise ValueError(
+                f"Invalid V2 Config Schema: hourly.pipeline.strategy_priority contains {sid!r} "
+                f"but hourly.strategies has no block for it"
+            )
+    # Validate basic per-strategy contract (enabled bool) when blocks exist.
+    for sid, block in strategies.items():
+        if not isinstance(block, dict):
+            raise ValueError(f"Invalid V2 Config Schema: hourly.strategies.{sid} must be a dict")
+        if "enabled" not in block or not isinstance(block.get("enabled"), bool):
+            raise ValueError(f"Invalid V2 Config Schema: hourly.strategies.{sid}.enabled must be a bool")
 
 
 def load_v2_config(config_dir: str | Path = "config") -> Dict[str, Any]:
