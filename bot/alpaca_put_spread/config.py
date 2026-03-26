@@ -171,6 +171,8 @@ class AlpacaPutSpreadConfig:
 
     max_daily_loss_dollars: float
     max_loss_per_underlying_dollars: float
+    # 0 = no numeric cap; >=1 caps total active slots (open or pending entry) per underlying.
+    max_open_spreads_per_underlying: int
 
     put_credit_spread: PutCreditSpreadStrategyConfig
     call_credit_spread: CallCreditSpreadStrategyConfig
@@ -534,6 +536,9 @@ def load_alpaca_options_config(config_dir: str | Path = "config") -> AlpacaPutSp
 
     max_daily_loss_dollars = float(risk.get("max_daily_loss_dollars", 0))
     max_loss_per_underlying_dollars = float(risk.get("max_loss_per_underlying_dollars", 0))
+    max_open_spreads_per_underlying = int(risk.get("max_open_spreads_per_underlying", 1))
+    if max_open_spreads_per_underlying < 0:
+        raise ValueError("alpaca_options.risk.max_open_spreads_per_underlying must be >= 0")
 
     put_credit_spread = _load_put_credit_spread_block(cfg)
     call_credit_spread = _load_call_credit_spread_block(cfg)
@@ -555,6 +560,7 @@ def load_alpaca_options_config(config_dir: str | Path = "config") -> AlpacaPutSp
         trade_window_weekdays=trade_window_weekdays,
         max_daily_loss_dollars=max_daily_loss_dollars,
         max_loss_per_underlying_dollars=max_loss_per_underlying_dollars,
+        max_open_spreads_per_underlying=max_open_spreads_per_underlying,
         put_credit_spread=put_credit_spread,
         call_credit_spread=call_credit_spread,
         iron_condor=iron_condor,

@@ -19,6 +19,9 @@ alpaca_options:
   risk:
     max_daily_loss_dollars: 5000
     max_loss_per_underlying_dollars: 2000
+    # Max concurrent spreads per underlying counting open + pending entry across PCS/CCS/IC.
+    # Set to 0 to disable only the numeric cap (no-mixing rule still applies when any slot is active).
+    max_open_spreads_per_underlying: 1
     # Only hunt/open new positions within this Pacific time window.
     # Timezone is DST-aware via America/Los_Angeles.
     trade_window_timezone: "America/Los_Angeles"

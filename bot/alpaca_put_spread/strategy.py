@@ -440,14 +440,52 @@ class AlpacaPutSpreadRunner:
             out.append(_STRATEGY_IC)
         return out
 
+    @staticmethod
+    def _all_strategy_type_keys() -> Tuple[str, str, str]:
+        return (_STRATEGY_PCS, _STRATEGY_CCS, _STRATEGY_IC)
+
+    def _underlying_active_entry_count(self, underlying: str) -> int:
+        """
+        Number of strategies with an open spread or a pending entry on this underlying
+        (each strategy counts at most once).
+        """
+        n = 0
+        for st in self._all_strategy_type_keys():
+            if get_nested(self.state, "open_positions", underlying, st):
+                n += 1
+            elif get_nested(self.state, PENDING_ENTRY, underlying, st):
+                n += 1
+        return n
+
+    def _underlying_active_strategy_types(self, underlying: str) -> Set[str]:
+        """Strategy types that currently have an open spread or pending entry."""
+        out: Set[str] = set()
+        for st in self._all_strategy_type_keys():
+            if get_nested(self.state, "open_positions", underlying, st) or get_nested(
+                self.state, PENDING_ENTRY, underlying, st
+            ):
+                out.add(st)
+        return out
+
     def _underlying_may_hunt_entry(self, underlying: str) -> bool:
-        """True if any enabled strategy could reach chain selection (no open, no pending, not disabled)."""
+        """
+        True if prefetching a shared option chain might lead to a new entry for some enabled strategy.
+        Respects ``max_open_spreads_per_underlying`` (0 = no numeric cap) and blocks cross-strategy
+        mixing while any slot is active on this underlying.
+        """
+        cap = int(getattr(self.cfg, "max_open_spreads_per_underlying", 1) or 0)
+        count = self._underlying_active_entry_count(underlying)
+        if self.cfg.max_open_spreads_per_underlying > 0 and count >= self.cfg.max_open_spreads_per_underlying:
+            return False
+        active = self._underlying_active_strategy_types(underlying)
         for st in self._enabled_strategies():
+            if get_nested(self.state, ENTRY_DISABLED, underlying, st):
+                continue
             if get_nested(self.state, "open_positions", underlying, st):
                 continue
             if get_nested(self.state, PENDING_ENTRY, underlying, st):
                 continue
-            if get_nested(self.state, ENTRY_DISABLED, underlying, st):
+            if active and st not in active:
                 continue
             return True
         return False
@@ -837,6 +875,33 @@ class AlpacaPutSpreadRunner:
     def _maybe_open(self, underlying: str, strategy_type: str, chain: Optional[Any] = None) -> None:
         if get_nested(self.state, "open_positions", underlying, strategy_type):
             return
+
+        pending_entry = get_nested(self.state, PENDING_ENTRY, underlying, strategy_type)
+        if pending_entry:
+            self._handle_pending_entry(underlying, strategy_type, pending_entry)
+            return
+
+        cap = int(self.cfg.max_open_spreads_per_underlying)
+        count = self._underlying_active_entry_count(underlying)
+        if cap > 0 and count >= cap:
+            logger.debug(
+                "[%s][%s] max_open_spreads_per_underlying=%s reached (active_slots=%s); skip new entry.",
+                underlying,
+                strategy_type,
+                cap,
+                count,
+            )
+            return
+        active_st = self._underlying_active_strategy_types(underlying)
+        if active_st and strategy_type not in active_st:
+            logger.debug(
+                "[%s][%s] Active spread/pending on %s; no cross-strategy mix on same underlying.",
+                underlying,
+                strategy_type,
+                ",".join(sorted(active_st)),
+            )
+            return
+
         if get_nested(self.state, ENTRY_DISABLED, underlying, strategy_type):
             logger.debug(
                 "[%s][%s] Entry disabled in state file; skipping options scan.",
@@ -855,11 +920,6 @@ class AlpacaPutSpreadRunner:
             return
 
         logger.info("[%s][%s] scanning for candidate...", underlying, strategy_type)
-
-        pending_entry = get_nested(self.state, PENDING_ENTRY, underlying, strategy_type)
-        if pending_entry:
-            self._handle_pending_entry(underlying, strategy_type, pending_entry)
-            return
 
         if not self._within_hunt_window():
             logger.info("[%s][%s] gated by trade window", underlying, strategy_type)
