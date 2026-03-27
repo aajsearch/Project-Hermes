@@ -812,10 +812,20 @@ class PipelineExecutor:
         if not self._kalshi_client:
             logger.error("[EXECUTION FATAL] No Kalshi client for place intent strategy_id=%s", strategy_id)
             return
-        ticker_place = ticker or market_id
+        selected_ticker = (getattr(intent, "ticker", None) or "").strip()
+        context_ticker = (ticker or "").strip()
+        ticker_place = selected_ticker or context_ticker or market_id
         if not ticker_place:
             logger.error("[EXECUTION FATAL] No ticker for place intent strategy_id=%s", strategy_id)
             return
+        logger.info(
+            "[EXECUTION] Ticker resolution — strategy_id=%s selected_ticker=%s context_ticker=%s market_id=%s used_ticker=%s",
+            strategy_id,
+            (selected_ticker or "-"),
+            (context_ticker or "-"),
+            market_id,
+            ticker_place,
+        )
         try:
             resp = self._kalshi_client.place_limit_order(
                 ticker=ticker_place,

@@ -36,6 +36,7 @@ _ws_task: Optional[threading.Thread] = None
 _ws_running = False
 _cmd_id = 0
 _current_ws: Any = None  # set in loop so stop() can close and unblock
+_ws_control_lock = threading.Lock()
 _debug_msg_count = 0
 _debug_msg_limit = 50  # log first N message types to see what server sends
 _logged_orderbook_miss: set = set()  # tickers we've already logged miss for (reset when snapshot received)
@@ -406,15 +407,13 @@ def subscribe_to_tickers(tickers: List[str]) -> None:
             return
         _subscribed_tickers = list(tickers_list)
         # Force reconnect so WS subscribes to the new ticker list
-        if _current_ws is not None and _loop is not None:
+        with _ws_control_lock:
+            ws = _current_ws
+            loop = _loop
+        if ws is not None and loop is not None:
             try:
-                def _close_and_reconnect():
-                    if _current_ws is not None:
-                        try:
-                            asyncio.ensure_future(_current_ws.close(), loop=_loop)
-                        except Exception:
-                            pass
-                _loop.call_soon_threadsafe(_close_and_reconnect)
+                # Close on the owning loop; avoids "Future attached to a different loop".
+                asyncio.run_coroutine_threadsafe(ws.close(), loop)
             except Exception as e:
                 logger.warning("[kalshi_ws] Failed to trigger reconnect on ticker change: %s", e)
 
@@ -449,7 +448,8 @@ async def _kalshi_ws_loop() -> None:
                 ssl=True,
             ) as ws:
                 backoff = 1.0
-                _current_ws = ws
+                with _ws_control_lock:
+                    _current_ws = ws
                 logger.debug("[kalshi_ws] Connected successfully to %s", WS_URL)
                 try:
                     tickers = _get_subscribed_tickers_snapshot()
@@ -508,7 +508,9 @@ async def _kalshi_ws_loop() -> None:
                             logger.error("[kalshi_ws] Message processing error: %s; continuing", inner_e)
                             continue
                 finally:
-                    _current_ws = None
+                    with _ws_control_lock:
+                        if _current_ws is ws:
+                            _current_ws = None
         except Exception as e:
             if isinstance(e, websockets.exceptions.ConnectionClosed):
                 logger.error("[kalshi_ws] Connection closed: code=%s reason=%s", e.code, e.reason)
@@ -535,23 +537,22 @@ def _run_loop_in_thread(loop: asyncio.AbstractEventLoop) -> None:
 def stop_kalshi_ws() -> None:
     """Stop Kalshi WebSocket: close connection and join thread (prevents zombie processes)."""
     global _loop, _ws_task, _current_ws
-    if _loop is None:
+    with _ws_control_lock:
+        loop = _loop
+        ws = _current_ws
+        task = _ws_task
+        _ws_task = None
+        _loop = None
+        _current_ws = None
+
+    if loop is None:
         return
     try:
-        def _close_ws():
-            global _current_ws
-            if _current_ws is not None:
-                try:
-                    asyncio.ensure_future(_current_ws.close(), loop=_loop)
-                except Exception:
-                    pass
-        _loop.call_soon_threadsafe(_close_ws)
+        if ws is not None:
+            # Ensure close coroutine runs on the same loop that owns the websocket.
+            asyncio.run_coroutine_threadsafe(ws.close(), loop)
     except Exception:
         pass
-    task = _ws_task
-    _ws_task = None
-    _loop = None
-    _current_ws = None
     if task is not None and task.is_alive():
         task.join(timeout=10)
     logger.debug("[kalshi_ws] Kalshi WebSocket stopped.")
@@ -560,16 +561,20 @@ def stop_kalshi_ws() -> None:
 def start_kalshi_ws() -> None:
     """Start Kalshi orderbook WebSocket in a background thread. Idempotent."""
     global _loop, _ws_task
-    if _loop is not None and _ws_task is not None:
-        return
+    with _ws_control_lock:
+        if _loop is not None and _ws_task is not None and _ws_task.is_alive():
+            return
     try:
         import websockets
     except ImportError:
         logger.warning("[kalshi_ws] websockets not installed; pip install websockets. Kalshi WS disabled.")
         return
-    _loop = asyncio.new_event_loop()
-    _ws_task = threading.Thread(target=_run_loop_in_thread, args=(_loop,), daemon=True)
-    _ws_task.start()
+    loop = asyncio.new_event_loop()
+    task = threading.Thread(target=_run_loop_in_thread, args=(loop,), daemon=True)
+    with _ws_control_lock:
+        _loop = loop
+        _ws_task = task
+    task.start()
     logger.debug("[kalshi_ws] Kalshi orderbook WebSocket started.")
 
 

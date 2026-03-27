@@ -21,6 +21,8 @@ class OrderIntent:
     count: int
     order_type: str  # e.g. "limit" | "market"
     client_order_id: str
+    # Optional instrument chosen by strategy. Executor should prioritize this over context ticker.
+    ticker: Optional[str] = None
     # Bid at placement time (yes_bid or no_bid for chosen side). Used as entry cost for stop-loss.
     placement_bid_cents: Optional[int] = None
     # Actual distance-to-strike at placement. Used for trailing stop (distance_decay) so decay is vs real entry, not config minimum.
@@ -84,6 +86,8 @@ class OrderRecord:
     placed_at: float
     # Bid at placement (ctx.quote). Used for stop-loss loss_pct so we don't use limit_price (99¢) as entry.
     placement_bid_cents: Optional[int] = None
+    # Actual average fill price (cents per contract) once known.
+    entry_fill_price_cents: Optional[int] = None
     # Actual distance-to-strike at placement. Used for distance_decay trailing stop (decay threshold = entry_distance * distance_decay_pct).
     entry_distance: Optional[float] = None
     # Actual distance-to-strike when the order becomes filled (used as trailing stop base).

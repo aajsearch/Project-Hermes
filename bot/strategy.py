@@ -71,6 +71,14 @@ def generate_signals_farthest(
     for q in quotes:
         yes_qual = _in_range(q.yes_ask, yes_lo, yes_hi) or _bid_ok("yes", q)
         no_qual = _in_range(q.no_ask, no_lo, no_hi) or _bid_ok("no", q)
+        if filter_side_by_spot_strike:
+            # Above/below directional filter:
+            # strike < spot => YES only; strike > spot => NO only.
+            strike = float(q.strike or 0.0)
+            if strike > spot:
+                yes_qual = False
+            elif strike < spot:
+                no_qual = False
         if not yes_qual and not no_qual:
             continue
         distance = abs(float(q.strike or 0) - spot)

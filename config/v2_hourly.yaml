@@ -32,10 +32,10 @@ hourly:
       order_count: { btc: 1, eth: 1, sol: 1, xrp: 1, doge: 1 }
       max_cost_cents: 500
       # Max entry orders this strategy may place per (asset, hourly window).
-      max_orders_per_window: 5
+      max_orders_per_window: 10
       entry_window:
-        late_window_minutes: 20
-        late_interval_seconds: 1
+        late_window_minutes: 10
+        late_interval_seconds: 10
 
       selection:
         # Mirror legacy config/hourly.yaml + common.yaml
@@ -47,8 +47,8 @@ hourly:
           sol: 50
           xrp: 1
           doge: 0.005
-        thresholds_yes: { min: 92, max: 99 }
-        thresholds_no: { min: 92, max: 99 }
+        thresholds_yes: { min: 92, max: 98 }
+        thresholds_no: { min: 92, max: 98 }
 
       guards:
         enabled: true
@@ -67,7 +67,7 @@ hourly:
         distance_buffer:
           enabled: true
           assets:
-            btc: { pct: 0.025, floor_usd: 500 }
+            btc: { pct: 0.025, floor_usd: 100 }
             eth: { pct: 0.005, floor_usd: 50 }
         anchor_one_per_side:
           enabled: true

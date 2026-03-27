@@ -161,7 +161,54 @@ def _get_asset_cfg(value: Any, asset: str, default: Any) -> Any:
     return value
 
 
+def _distance_buffer_min_required(cfg: dict, asset: str, spot: float) -> Optional[float]:
+    guards = cfg.get("guards") or {}
+    dist_cfg = guards.get("distance_buffer") or {}
+    if not isinstance(dist_cfg, dict) or not dist_cfg.get("enabled", False):
+        return None
+    assets_cfg = dist_cfg.get("assets") or {}
+    if not isinstance(assets_cfg, dict):
+        return None
+    a_cfg = assets_cfg.get(_asset_lower(asset), assets_cfg.get(str(asset).upper()))
+    if not isinstance(a_cfg, dict):
+        return None
+    try:
+        pct = float(a_cfg.get("pct")) if a_cfg.get("pct") is not None else 0.0
+    except Exception:
+        pct = 0.0
+    try:
+        floor_usd = float(a_cfg.get("floor_usd")) if a_cfg.get("floor_usd") is not None else 0.0
+    except Exception:
+        floor_usd = 0.0
+    if pct <= 0 and floor_usd <= 0:
+        return None
+    return max(abs(float(spot)) * max(0.0, pct), max(0.0, floor_usd))
+
+
 def _normalize_event_quotes(ctx: WindowContext, spot: float, window: float) -> List[TickerQuote]:
+    def _to_cents(v: Any) -> Optional[int]:
+        if v is None:
+            return None
+        try:
+            f = float(v)
+        except Exception:
+            return None
+        # Kalshi may return either cents (0..100) or dollars (0.00..1.00)
+        if 0.0 <= f <= 1.0:
+            c = int(round(f * 100.0))
+        else:
+            c = int(round(f))
+        if c < 0:
+            return None
+        return c
+
+    def _pick_price(m: Dict[str, Any], keys: List[str]) -> Optional[int]:
+        for k in keys:
+            c = _to_cents(m.get(k))
+            if c is not None:
+                return c
+        return None
+
     out: List[TickerQuote] = []
     for m in ctx.event_markets or []:
         if not isinstance(m, dict):
@@ -184,14 +231,19 @@ def _normalize_event_quotes(ctx: WindowContext, spot: float, window: float) -> L
             except Exception:
                 range_low = None
                 range_high = None
+        # Use strict ask fields only (avoid ambiguous last-trade style price keys).
+        yes_ask = _pick_price(m, ["yes_ask", "yes_ask_price", "yes_ask_dollars"])
+        no_ask = _pick_price(m, ["no_ask", "no_ask_price", "no_ask_dollars"])
+        yes_bid = _pick_price(m, ["yes_bid", "yes_bid_price", "yes_bid_dollars"])
+        no_bid = _pick_price(m, ["no_bid", "no_bid_price", "no_bid_dollars"])
         out.append(
             TickerQuote(
                 ticker=str(t),
                 strike=float(strike),
-                yes_ask=m.get("yes_ask"),
-                no_ask=m.get("no_ask"),
-                yes_bid=m.get("yes_bid"),
-                no_bid=m.get("no_bid"),
+                yes_ask=yes_ask,
+                no_ask=no_ask,
+                yes_bid=yes_bid,
+                no_bid=no_bid,
                 subtitle=str(m.get("subtitle") or ""),
                 range_low=range_low,
                 range_high=range_high,
@@ -273,17 +325,39 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
         cfg = _get_cfg(ctx, self.strategy_id)
         if not cfg.get("enabled", False):
             return None
+        sec_to_close = float(ctx.seconds_to_close or 0.0)
+        logger.info(
+            "[hourly_signals_v2_tick] [%s] sec_to_close=%.0f enabled=true",
+            (ctx.asset or "").upper(),
+            sec_to_close,
+        )
         max_orders_per_window = int(_get_asset_cfg(cfg.get("max_orders_per_window"), ctx.asset, 1) or 1)
         if max_orders_per_window < 1:
             max_orders_per_window = 1
         # Cap entry rate per (window, asset) for this strategy.
         if my_orders and len(my_orders) >= max_orders_per_window:
+            logger.info(
+                "[hourly_signals_v2_tick] [%s] skip=max_orders_per_window open_orders=%s cap=%s",
+                (ctx.asset or "").upper(),
+                len(my_orders or []),
+                max_orders_per_window,
+            )
             return None
         ew = cfg.get("entry_window") or {}
         late_window_minutes = _parse_float(ew.get("late_window_minutes"), 20.0)
-        if (ctx.seconds_to_close / 60.0) > late_window_minutes:
+        if (sec_to_close / 60.0) > late_window_minutes:
+            logger.info(
+                "[hourly_signals_v2_tick] [%s] skip=outside_late_window sec_to_close=%.0f late_window_minutes=%.1f",
+                (ctx.asset or "").upper(),
+                sec_to_close,
+                late_window_minutes,
+            )
             return None
         if ctx.spot is None:
+            logger.info(
+                "[hourly_signals_v2_tick] [%s] skip=spot_none",
+                (ctx.asset or "").upper(),
+            )
             return None
 
         spot = float(ctx.spot)
@@ -302,6 +376,12 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
         sel = cfg.get("selection") or {}
         pick_all = bool(sel.get("pick_all_in_range", False))
         thresholds = _thresholds(cfg)
+        min_dist_required = _distance_buffer_min_required(cfg, ctx.asset, spot)
+        # Primary above/below hourly series must obey directional side:
+        # strike < spot => YES only, strike > spot => NO only.
+        # Detect primary from market id prefix (e.g., KXBTCD/KXETHD/KXSOLD/KXXRPD).
+        mid = str(ctx.market_id or "").upper()
+        directional_filter = mid.startswith(("KXBTCD-", "KXETHD-", "KXSOLD-", "KXXRPD-"))
 
         # For hourly range/above-below markets, legacy uses strike vs spot; we keep filter_side_by_spot_strike=False
         # because hourly includes range markets. generate_signals_farthest handles range bounds when present.
@@ -311,8 +391,59 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
             ctx_late_window=True,
             thresholds=thresholds,
             pick_all_in_range=pick_all,
+            filter_side_by_spot_strike=directional_filter,
         )
         if not signals:
+            yes_lo = int(thresholds.get("yes_min", 92))
+            yes_hi = int(thresholds.get("yes_max", 99))
+            no_lo = int(thresholds.get("no_min", 92))
+            no_hi = int(thresholds.get("no_max", 99))
+            ask_yes_in_band = 0
+            ask_no_in_band = 0
+            bid_yes_in_band = 0
+            bid_no_in_band = 0
+            best_yes_ask = None
+            best_no_ask = None
+            best_yes_bid = None
+            best_no_bid = None
+            for qq in quotes:
+                ya = int(getattr(qq, "yes_ask", 0) or 0)
+                na = int(getattr(qq, "no_ask", 0) or 0)
+                yb = int(getattr(qq, "yes_bid", 0) or 0)
+                nb = int(getattr(qq, "no_bid", 0) or 0)
+                best_yes_ask = ya if best_yes_ask is None else max(best_yes_ask, ya)
+                best_no_ask = na if best_no_ask is None else max(best_no_ask, na)
+                best_yes_bid = yb if best_yes_bid is None else max(best_yes_bid, yb)
+                best_no_bid = nb if best_no_bid is None else max(best_no_bid, nb)
+                if yes_lo <= ya <= yes_hi:
+                    ask_yes_in_band += 1
+                if no_lo <= na <= no_hi:
+                    ask_no_in_band += 1
+                if yes_lo <= yb <= yes_hi:
+                    bid_yes_in_band += 1
+                if no_lo <= nb <= no_hi:
+                    bid_no_in_band += 1
+            logger.info(
+                "[hourly_signals_v2_tick] [%s] skip=no_signals quotes=%s sec_to_close=%.0f "
+                "yes_band=[%s,%s] no_band=[%s,%s] "
+                "ask_in_band(yes=%s,no=%s) bid_in_band(yes=%s,no=%s) "
+                "best(yes_ask=%s,no_ask=%s,yes_bid=%s,no_bid=%s)",
+                (ctx.asset or "").upper(),
+                len(quotes),
+                sec_to_close,
+                yes_lo,
+                yes_hi,
+                no_lo,
+                no_hi,
+                ask_yes_in_band,
+                ask_no_in_band,
+                bid_yes_in_band,
+                bid_no_in_band,
+                best_yes_ask,
+                best_no_ask,
+                best_yes_bid,
+                best_no_bid,
+            )
             return None
 
         already = _already_traded_tickers(my_orders)
@@ -355,15 +486,128 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
                     entry_dist = abs(float(q.strike) - float(spot))
                 except Exception:
                     entry_dist = None
+                # Final hard directional guard (defensive): never allow opposite side on primary above/below.
+                if directional_filter:
+                    strike_v = float(q.strike or 0.0)
+                    if strike_v > 0:
+                        expected_side = "yes" if float(spot) > strike_v else "no" if float(spot) < strike_v else side
+                        if side != expected_side:
+                            logger.info(
+                                "[hourly_signals_v2_tick] [%s] skip=direction_mismatch ticker=%s strike=%.2f spot=%.2f chosen=%s expected=%s",
+                                (ctx.asset or "").upper(),
+                                str(s.ticker),
+                                strike_v,
+                                float(spot),
+                                side,
+                                expected_side,
+                            )
+                            _log_telemetry(
+                                window_id=f"{ctx.interval}_{logical_window_slot(ctx.market_id)}",
+                                asset=ctx.asset,
+                                action="skip",
+                                ticker=str(s.ticker),
+                                side=side,
+                                reason="direction_mismatch",
+                                details={
+                                    "strike": strike_v,
+                                    "spot": float(spot),
+                                    "expected_side": expected_side,
+                                },
+                            )
+                            continue
 
-            # Log the choice so it matches the fifteen_min style.
+                # Distance buffer guard (directional): YES needs spot-strike >= min_dist,
+                # NO needs strike-spot >= min_dist.
+                if min_dist_required is not None:
+                    distance_dir = (float(spot) - strike_v) if side == "yes" else (strike_v - float(spot))
+                    if distance_dir < float(min_dist_required):
+                        logger.info(
+                            "[hourly_signals_v2_tick] [%s] skip=distance_buffer ticker=%s side=%s strike=%.2f spot=%.2f distance=%.2f min_required=%.2f",
+                            (ctx.asset or "").upper(),
+                            str(s.ticker),
+                            side,
+                            strike_v,
+                            float(spot),
+                            distance_dir,
+                            float(min_dist_required),
+                        )
+                        _log_telemetry(
+                            window_id=f"{ctx.interval}_{logical_window_slot(ctx.market_id)}",
+                            asset=ctx.asset,
+                            action="skip",
+                            ticker=str(s.ticker),
+                            side=side,
+                            reason="distance_buffer",
+                            details={
+                                "strike": strike_v,
+                                "spot": float(spot),
+                                "distance": distance_dir,
+                                "min_required": float(min_dist_required),
+                            },
+                        )
+                        continue
+
+            # Require chosen side bid to be in configured band before placement.
+            # This makes side execution explicitly bid-aware (not ask-only).
+            bid_lo = int(thresholds.get("yes_min")) if side == "yes" else int(thresholds.get("no_min"))
+            bid_hi = int(thresholds.get("yes_max")) if side == "yes" else int(thresholds.get("no_max"))
+            chosen_bid_for_gate = int(placement_bid or 0)
+            if chosen_bid_for_gate <= 0 or chosen_bid_for_gate < bid_lo or chosen_bid_for_gate > bid_hi:
+                logger.info(
+                    "[hourly_signals_v2_tick] [%s] skip=chosen_bid_out_of_band ticker=%s side=%s bid=%s band=[%s,%s]",
+                    (ctx.asset or "").upper(),
+                    str(s.ticker),
+                    side,
+                    chosen_bid_for_gate,
+                    bid_lo,
+                    bid_hi,
+                )
+                _log_telemetry(
+                    window_id=f"{ctx.interval}_{logical_window_slot(ctx.market_id)}",
+                    asset=ctx.asset,
+                    action="skip",
+                    ticker=str(s.ticker),
+                    side=side,
+                    reason="chosen_bid_out_of_band",
+                    details={
+                        "bid": chosen_bid_for_gate,
+                        "band_lo": bid_lo,
+                        "band_hi": bid_hi,
+                    },
+                )
+                continue
+
+            # Always log signal-side resolution for observability, even if we may skip later on cost/order caps.
             yes_bid = int(getattr(q, "yes_bid", 0) or 0) if q is not None else 0
             no_bid = int(getattr(q, "no_bid", 0) or 0) if q is not None else 0
             chosen_bid = int(placement_bid or 0)
             logger.info(
-                "[hourly_signals_v2_choice] [%s] sec_to_close=%.0f mode=%s yes_bid=%s no_bid=%s chosen=%s bid=%s "
+                "[hourly_signals_v2_side] [%s] ticker=%s sec_to_close=%.0f side_cfg=auto strike=%.2f spot=%.2f "
+                "yes_ask=%s no_ask=%s yes_bid=%s no_bid=%s chosen=%s bid=%s "
                 "yes_band=[%s,%s] no_band=[%s,%s]",
                 (ctx.asset or "").upper(),
+                str(s.ticker),
+                float(ctx.seconds_to_close or -1),
+                float(getattr(q, "strike", 0.0) or 0.0) if q is not None else 0.0,
+                float(spot),
+                int(getattr(q, "yes_ask", 0) or 0) if q is not None else 0,
+                int(getattr(q, "no_ask", 0) or 0) if q is not None else 0,
+                yes_bid,
+                no_bid,
+                side,
+                chosen_bid,
+                thresholds.get("yes_min"),
+                thresholds.get("yes_max"),
+                thresholds.get("no_min"),
+                thresholds.get("no_max"),
+            )
+
+            # Log the choice so it matches the fifteen_min style.
+            logger.info(
+                "[hourly_signals_v2_choice] [%s] ticker=%s sec_to_close=%.0f mode=%s yes_bid=%s no_bid=%s chosen=%s bid=%s "
+                "yes_band=[%s,%s] no_band=[%s,%s]",
+                (ctx.asset or "").upper(),
+                str(s.ticker),
                 float(ctx.seconds_to_close or -1),
                 ("all_in_range" if pick_all else "farthest"),
                 yes_bid,
@@ -401,6 +645,7 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
                 count=int(order_count),
                 order_type="limit",
                 client_order_id=client_order_id,
+                ticker=str(s.ticker),
                 placement_bid_cents=placement_bid,
                 entry_distance=entry_dist,
             )
@@ -445,7 +690,11 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
             cur_bid = _get_current_bid_for_side(mkt, side)
             if cur_bid is None:
                 continue
-            entry_bid = o.placement_bid_cents or o.limit_price_cents
+            entry_bid = (
+                o.entry_fill_price_cents
+                or o.placement_bid_cents
+                or o.limit_price_cents
+            )
             if not entry_bid or entry_bid <= 0:
                 continue
 

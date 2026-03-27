@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -15,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 REGISTRY_TABLE = "v2_order_registry"
 REPORTS_TABLE = "v2_strategy_reports"
+SQLITE_TIMEOUT_SECONDS = 10.0
+SQLITE_BUSY_TIMEOUT_MS = 5000
 
 
 def _default_db_path() -> Path:
@@ -28,8 +32,10 @@ def init_v2_db(db_path: Optional[Path] = None) -> None:
     """
     path = db_path or _default_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), check_same_thread=False)
+    conn = sqlite3.connect(str(path), check_same_thread=False, timeout=SQLITE_TIMEOUT_SECONDS)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     try:
         conn.executescript(
             f"""
@@ -45,6 +51,7 @@ def init_v2_db(db_path: Optional[Path] = None) -> None:
                 filled_count INTEGER DEFAULT 0,
                 count INTEGER NOT NULL,
                 limit_price_cents INTEGER,
+                entry_fill_price_cents INTEGER,
                 placed_at REAL NOT NULL,
                 client_order_id TEXT,
                 placement_bid_cents INTEGER,
@@ -103,6 +110,13 @@ def init_v2_db(db_path: Optional[Path] = None) -> None:
         except sqlite3.OperationalError as e:
             if "duplicate column" not in str(e).lower():
                 logger.warning("V2 DB migration entry_distance_at_fill: %s", e)
+        try:
+            conn.execute(f"ALTER TABLE {REGISTRY_TABLE} ADD COLUMN entry_fill_price_cents INTEGER")
+            conn.commit()
+            logger.info("V2 DB: added entry_fill_price_cents to %s", REGISTRY_TABLE)
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                logger.warning("V2 DB migration entry_fill_price_cents: %s", e)
         logger.info("V2 DB initialized at %s", path)
     finally:
         conn.close()
@@ -111,15 +125,78 @@ def init_v2_db(db_path: Optional[Path] = None) -> None:
 class OrderRegistry:
     """
     CRUD for v2_order_registry and v2_strategy_reports.
-    Uses a single connection with check_same_thread=False for use from multiple threads.
+    Uses short-lived per-operation connections (V1-style) for thread safety and resilience.
     """
 
     def __init__(self, db_path: Optional[Path] = None) -> None:
         self._path = Path(db_path) if db_path else _default_db_path()
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self._path), check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.row_factory = sqlite3.Row
+        self._lock = threading.RLock()
+
+    def _new_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self._path), check_same_thread=False, timeout=SQLITE_TIMEOUT_SECONDS)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _recover_malformed_db(self) -> None:
+        """
+        Rotate malformed DB files and recreate schema so loops can continue.
+        """
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        db = self._path
+        db_corrupt = db.with_name(f"{db.stem}.corrupt.{stamp}{db.suffix}")
+        wal = Path(str(db) + "-wal")
+        shm = Path(str(db) + "-shm")
+        wal_corrupt = Path(str(db_corrupt) + "-wal")
+        shm_corrupt = Path(str(db_corrupt) + "-shm")
+
+        if db.exists():
+            db.rename(db_corrupt)
+        if wal.exists():
+            wal.rename(wal_corrupt)
+        if shm.exists():
+            shm.rename(shm_corrupt)
+
+        logger.error(
+            "Detected malformed sqlite DB. Rotated to %s and recreating fresh %s",
+            db_corrupt,
+            db,
+        )
+        init_v2_db(db_path=db)
+    def _execute(
+        self,
+        query: str,
+        params: tuple = (),
+        *,
+        commit: bool = False,
+        fetch: str = "none",
+    ):
+        """
+        Execute query with thread serialization and one-shot recovery on malformed DB.
+        fetch: "none" | "one" | "all"
+        """
+        with self._lock:
+            for attempt in (1, 2):
+                try:
+                    conn = self._new_conn()
+                    try:
+                        cur = conn.execute(query, params)
+                        if commit:
+                            conn.commit()
+                        if fetch == "one":
+                            return cur.fetchone()
+                        if fetch == "all":
+                            return cur.fetchall()
+                        return None
+                    finally:
+                        conn.close()
+                except sqlite3.DatabaseError as e:
+                    if "malformed" not in str(e).lower() or attempt == 2:
+                        raise
+                    self._recover_malformed_db()
 
     def register_order(
         self,
@@ -138,11 +215,11 @@ class OrderRegistry:
         entry_distance: Optional[float] = None,
     ) -> None:
         """Insert a new order into v2_order_registry (status=resting, filled_count=0)."""
-        self._conn.execute(
+        self._execute(
             f"""
             INSERT INTO {REGISTRY_TABLE}
-            (order_id, strategy_id, interval, market_id, asset, ticker, side, status, filled_count, count, limit_price_cents, placed_at, client_order_id, placement_bid_cents, entry_distance)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'resting', 0, ?, ?, ?, ?, ?, ?)
+            (order_id, strategy_id, interval, market_id, asset, ticker, side, status, filled_count, count, limit_price_cents, entry_fill_price_cents, placed_at, client_order_id, placement_bid_cents, entry_distance)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'resting', 0, ?, ?, NULL, ?, ?, ?, ?)
             """,
             (
                 order_id,
@@ -159,8 +236,8 @@ class OrderRegistry:
                 placement_bid_cents,
                 entry_distance,
             ),
+            commit=True,
         )
-        self._conn.commit()
         logger.debug("Registered order %s for %s/%s", order_id, strategy_id, interval)
 
     def update_order_status(
@@ -169,29 +246,26 @@ class OrderRegistry:
         status: str,
         filled_count: Optional[int] = None,
         entry_distance_at_fill: Optional[float] = None,
+        entry_fill_price_cents: Optional[int] = None,
     ) -> None:
         """Update status and optionally filled_count and/or entry_distance_at_fill for an order."""
-        if filled_count is not None and entry_distance_at_fill is not None:
-            self._conn.execute(
-                f"UPDATE {REGISTRY_TABLE} SET status = ?, filled_count = ?, entry_distance_at_fill = ? WHERE order_id = ?",
-                (status, filled_count, entry_distance_at_fill, order_id),
-            )
-        elif filled_count is not None:
-            self._conn.execute(
-                f"UPDATE {REGISTRY_TABLE} SET status = ?, filled_count = ? WHERE order_id = ?",
-                (status, filled_count, order_id),
-            )
-        elif entry_distance_at_fill is not None:
-            self._conn.execute(
-                f"UPDATE {REGISTRY_TABLE} SET status = ?, entry_distance_at_fill = ? WHERE order_id = ?",
-                (status, entry_distance_at_fill, order_id),
-            )
-        else:
-            self._conn.execute(
-                f"UPDATE {REGISTRY_TABLE} SET status = ? WHERE order_id = ?",
-                (status, order_id),
-            )
-        self._conn.commit()
+        set_parts = ["status = ?"]
+        params: List[object] = [status]
+        if filled_count is not None:
+            set_parts.append("filled_count = ?")
+            params.append(filled_count)
+        if entry_distance_at_fill is not None:
+            set_parts.append("entry_distance_at_fill = ?")
+            params.append(entry_distance_at_fill)
+        if entry_fill_price_cents is not None:
+            set_parts.append("entry_fill_price_cents = ?")
+            params.append(entry_fill_price_cents)
+        params.append(order_id)
+        self._execute(
+            f"UPDATE {REGISTRY_TABLE} SET {', '.join(set_parts)} WHERE order_id = ?",
+            tuple(params),
+            commit=True,
+        )
         logger.debug("Updated order %s -> status=%s filled_count=%s", order_id, status, filled_count)
 
     def get_orders_by_strategy(
@@ -205,7 +279,7 @@ class OrderRegistry:
         """Return OrderRecords for the given strategy/interval, optionally filtered by market_id/asset."""
         query = f"""
             SELECT order_id, strategy_id, interval, market_id, asset, ticker, side, status,
-                   filled_count, count, limit_price_cents, placed_at, placement_bid_cents, entry_distance, entry_distance_at_fill
+                   filled_count, count, limit_price_cents, entry_fill_price_cents, placed_at, placement_bid_cents, entry_distance, entry_distance_at_fill
             FROM {REGISTRY_TABLE}
             WHERE strategy_id = ? AND interval = ?
             """
@@ -219,22 +293,21 @@ class OrderRegistry:
         if active_only:
             query += " AND status = 'resting'"
         query += " ORDER BY placed_at DESC"
-        cur = self._conn.execute(query, params)
-        rows = cur.fetchall()
+        rows = self._execute(query, tuple(params), fetch="all")
         return [self._row_to_order_record(dict(r)) for r in rows]
 
     def get_order_by_id(self, order_id: str) -> Optional[OrderRecord]:
         """Return the OrderRecord for the given order_id, or None if not in registry."""
-        cur = self._conn.execute(
+        row = self._execute(
             f"""
             SELECT order_id, strategy_id, interval, market_id, asset, ticker, side, status,
-                   filled_count, count, limit_price_cents, placed_at, placement_bid_cents, entry_distance, entry_distance_at_fill
+                   filled_count, count, limit_price_cents, entry_fill_price_cents, placed_at, placement_bid_cents, entry_distance, entry_distance_at_fill
             FROM {REGISTRY_TABLE}
             WHERE order_id = ?
             """,
             (order_id,),
+            fetch="one",
         )
-        row = cur.fetchone()
         if row is None:
             return None
         return self._row_to_order_record(dict(row))
@@ -250,7 +323,7 @@ class OrderRegistry:
         """
         query = f"""
             SELECT order_id, strategy_id, interval, market_id, asset, ticker, side, status,
-                   filled_count, count, limit_price_cents, placed_at, placement_bid_cents, entry_distance, entry_distance_at_fill
+                   filled_count, count, limit_price_cents, entry_fill_price_cents, placed_at, placement_bid_cents, entry_distance, entry_distance_at_fill
             FROM {REGISTRY_TABLE}
             WHERE interval = ? AND status = 'resting'
             """
@@ -258,8 +331,7 @@ class OrderRegistry:
         if market_id is not None:
             query += " AND market_id = ?"
             params.append(market_id)
-        cur = self._conn.execute(query, params)
-        rows = cur.fetchall()
+        rows = self._execute(query, tuple(params), fetch="all")
         return [self._row_to_order_record(dict(r)) for r in rows]
 
     def record_trade_outcome(
@@ -278,7 +350,7 @@ class OrderRegistry:
         resolved_at: float,
     ) -> None:
         """Insert a row into v2_strategy_reports for a closed trade."""
-        self._conn.execute(
+        self._execute(
             f"""
             INSERT OR REPLACE INTO {REPORTS_TABLE}
             (order_id, strategy_id, interval, window_id, asset, side, entry_price_cents, exit_price_cents, outcome, is_stop_loss, pnl_cents, resolved_at)
@@ -298,8 +370,8 @@ class OrderRegistry:
                 pnl_cents,
                 resolved_at,
             ),
+            commit=True,
         )
-        self._conn.commit()
         logger.debug("Recorded trade outcome for order %s: outcome=%s pnl_cents=%s", order_id, outcome, pnl_cents)
 
     def get_reports_by_strategy(
@@ -324,8 +396,7 @@ class OrderRegistry:
             params.append(asset)
         query += " ORDER BY resolved_at DESC LIMIT ?"
         params.append(limit)
-        cur = self._conn.execute(query, params)
-        rows = cur.fetchall()
+        rows = self._execute(query, tuple(params), fetch="all")
         return [dict(r) for r in rows]
 
     @staticmethod
@@ -342,6 +413,7 @@ class OrderRegistry:
             filled_count=row["filled_count"] or 0,
             count=row["count"] or 0,
             limit_price_cents=row.get("limit_price_cents"),
+            entry_fill_price_cents=row.get("entry_fill_price_cents"),
             placed_at=row["placed_at"],
             placement_bid_cents=row.get("placement_bid_cents"),
             entry_distance=float(row["entry_distance"]) if row.get("entry_distance") is not None else None,
@@ -349,6 +421,5 @@ class OrderRegistry:
         )
 
     def close(self) -> None:
-        """Close the database connection."""
-        self._conn.close()
+        """No-op: registry uses short-lived per-operation connections."""
         logger.debug("OrderRegistry closed for %s", self._path)

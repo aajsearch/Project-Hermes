@@ -416,6 +416,27 @@ def fetch_markets_for_event(event_ticker: str) -> Tuple[List[Dict], Optional[str
         return [], str(e)
 
 
+def fetch_market_by_ticker(ticker: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Fetch a single market by ticker from Kalshi API (public)."""
+    t = (ticker or "").strip()
+    if not t:
+        return None, "empty ticker"
+    try:
+        url = f"{KALSHI_API_URL}/{t}"
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        market = data.get("market") if isinstance(data, dict) else None
+        if market and isinstance(market, dict):
+            return market, None
+        # Some clients may return the market object directly.
+        if isinstance(data, dict) and data.get("ticker"):
+            return data, None
+        return None, "missing market payload"
+    except Exception as e:
+        return None, str(e)
+
+
 def fetch_markets_by_close_window(
     min_close_ts: int,
     max_close_ts: int,

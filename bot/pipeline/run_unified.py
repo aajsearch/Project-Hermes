@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from bot.market import (
+    fetch_market_by_ticker,
     fetch_15min_market,
     fetch_markets_for_event,
     get_current_15min_market_id,
@@ -90,6 +91,31 @@ def _normalize_position(p: dict) -> Optional[Dict[str, Any]]:
     return {"ticker": ticker, "side": side, "count": int(count), "entry_price_cents": price_cents}
 
 
+def _extract_order_fill_price_cents(order_payload: Optional[Dict[str, Any]]) -> Optional[int]:
+    """Best-effort parse of average fill price in cents from Kalshi order payload."""
+    if not isinstance(order_payload, dict):
+        return None
+    for key in ("average_fill_price", "avg_fill_price"):
+        v = order_payload.get(key)
+        if v is not None:
+            try:
+                c = int(round(float(v)))
+                if 0 <= c <= 100:
+                    return c
+            except (TypeError, ValueError):
+                pass
+    for key in ("average_fill_price_dollars", "avg_fill_price_dollars"):
+        v = order_payload.get(key)
+        if v is not None:
+            try:
+                c = int(round(float(v) * 100.0))
+                if 0 <= c <= 100:
+                    return c
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
 def run_pipeline_cycle(
     interval: str,
     config: dict,
@@ -149,8 +175,10 @@ def run_pipeline_cycle(
                         if interval == "fifteen_min":
                             m = fetch_15min_market(market_id)
                         else:
-                            markets_list, _ = fetch_markets_for_event(market_id)
-                            m = markets_list[0] if markets_list else None
+                            m, _ = fetch_market_by_ticker(market_id)
+                            if m is None:
+                                markets_list, _ = fetch_markets_for_event(market_id)
+                                m = markets_list[0] if markets_list else None
                         if m and isinstance(m, dict):
                             t = m.get("ticker") or market_id
                             markets_to_seed[t] = m
@@ -158,8 +186,14 @@ def run_pipeline_cycle(
                         seed_market_cache(markets_to_seed)
                 except Exception as seed_e:
                     logger.debug("[%s] Kalshi WS seed market cache skipped: %s", interval, seed_e)
-            # First cycle: give WS time to receive orderbook_snapshot before we read (avoids quote=REST on first run)
-            last_window_id = getattr(data_layer, "_last_window_id", None)
+            # First cycle for this interval: give WS time to receive orderbook_snapshot before we read
+            # (avoids quote=REST on first run). Track window state per interval to avoid cross-thread mixing
+            # between fifteen_min and hourly.
+            last_map = getattr(data_layer, "_last_window_id_by_interval", None)
+            if not isinstance(last_map, dict):
+                last_map = {}
+                setattr(data_layer, "_last_window_id_by_interval", last_map)
+            last_window_id = last_map.get(interval)
             if last_window_id is None and tickers_this_interval:
                 logger.info("[%s] Waiting 2s for Kalshi WS orderbook snapshots...", interval)
                 time.sleep(2)
@@ -173,7 +207,11 @@ def run_pipeline_cycle(
             current_window_id = get_current_15min_market_id(asset=first_asset)
         else:
             current_window_id = get_current_hour_market_id(asset=first_asset)
-        last_window_id = getattr(data_layer, "_last_window_id", None)
+        last_map = getattr(data_layer, "_last_window_id_by_interval", None)
+        if not isinstance(last_map, dict):
+            last_map = {}
+            setattr(data_layer, "_last_window_id_by_interval", last_map)
+        last_window_id = last_map.get(interval)
         if last_window_id is not None and current_window_id != last_window_id:
             _ws_fallback_logged.clear()
             flush_key = f"{interval}_{_logical_window_slot(last_window_id)}"
@@ -185,7 +223,7 @@ def run_pipeline_cycle(
             logger.info("[TRANSITION] Window expired. Initiating 20s cooldown and cache purge...")
             data_layer.clear_caches()
             time.sleep(20)
-        data_layer._last_window_id = current_window_id
+        last_map[interval] = current_window_id
         # Log start of window only when we actually enter a new window (first run or after transition)
         if last_window_id is None or last_window_id != current_window_id:
             window_key = f"{interval}_{_logical_window_slot(current_window_id)}"
@@ -250,10 +288,17 @@ def run_pipeline_cycle(
                         market = get_safe_market(market_id)
                         if market and isinstance(market, dict) and market.get("ticker") and market.get("close_time") is not None:
                             market_source = "WS"
-                            markets = [market]
+                            base_markets, _ = fetch_markets_for_event(market_id)
+                            markets = base_markets if base_markets else [market]
                         else:
-                            markets, _ = fetch_markets_for_event(market_id)
-                            market = markets[0] if markets else None
+                            m0, _ = fetch_market_by_ticker(market_id)
+                            market = m0 if (m0 and isinstance(m0, dict)) else None
+                            base_markets, _ = fetch_markets_for_event(market_id)
+                            markets = list(base_markets or [])
+                            if market is None:
+                                market = markets[0] if markets else None
+                            elif not markets:
+                                markets = [market]
                             # Merge in range-event markets when present (best-effort).
                             for eid in extra_hourly_event_ids:
                                 if eid and eid != market_id:
@@ -261,6 +306,10 @@ def run_pipeline_cycle(
                                         more, _ = fetch_markets_for_event(eid)
                                         if more:
                                             markets.extend(more)
+                                        else:
+                                            mx, _ = fetch_market_by_ticker(eid)
+                                            if mx and isinstance(mx, dict):
+                                                markets.append(mx)
                                     except Exception:
                                         pass
                             key = (market_id, "market")
@@ -272,14 +321,24 @@ def run_pipeline_cycle(
                                     interval, asset.upper(), reason, market_id,
                                 )
                     except Exception as e:
-                        markets, _ = fetch_markets_for_event(market_id)
-                        market = markets[0] if markets else None
+                        m0, _ = fetch_market_by_ticker(market_id)
+                        market = m0 if (m0 and isinstance(m0, dict)) else None
+                        base_markets, _ = fetch_markets_for_event(market_id)
+                        markets = list(base_markets or [])
+                        if market is None:
+                            market = markets[0] if markets else None
+                        elif not markets:
+                            markets = [market]
                         for eid in extra_hourly_event_ids:
                             if eid and eid != market_id:
                                 try:
                                     more, _ = fetch_markets_for_event(eid)
                                     if more:
                                         markets.extend(more)
+                                    else:
+                                        mx, _ = fetch_market_by_ticker(eid)
+                                        if mx and isinstance(mx, dict):
+                                            markets.append(mx)
                                 except Exception:
                                     pass
                         key = (market_id, "market")
@@ -287,14 +346,24 @@ def run_pipeline_cycle(
                             _ws_fallback_logged.add(key)
                             logger.warning("[%s] [%s] WS market error for market_id=%s; using REST: %s", interval, asset.upper(), market_id, e)
                 else:
-                    markets, _ = fetch_markets_for_event(market_id)
-                    market = markets[0] if markets else None
+                    m0, _ = fetch_market_by_ticker(market_id)
+                    market = m0 if (m0 and isinstance(m0, dict)) else None
+                    base_markets, _ = fetch_markets_for_event(market_id)
+                    markets = list(base_markets or [])
+                    if market is None:
+                        market = markets[0] if markets else None
+                    elif not markets:
+                        markets = [market]
                     for eid in extra_hourly_event_ids:
                         if eid and eid != market_id:
                             try:
                                 more, _ = fetch_markets_for_event(eid)
                                 if more:
                                     markets.extend(more)
+                                else:
+                                    mx, _ = fetch_market_by_ticker(eid)
+                                    if mx and isinstance(mx, dict):
+                                        markets.append(mx)
                             except Exception:
                                 pass
             if not market or not isinstance(market, dict):
@@ -467,6 +536,36 @@ def run_pipeline_cycle(
                 cancel_decay_pct = float(cancel_decay_pct_raw) if cancel_decay_pct_raw is not None else 0.0
             except (TypeError, ValueError):
                 cancel_decay_pct = 0.0
+            bad_fill_sl_pct_raw = None if not isinstance(strat_cfg, dict) else strat_cfg.get("stop_loss_bad_fill_pct", 0.10)
+            try:
+                bad_fill_sl_pct = float(bad_fill_sl_pct_raw) if bad_fill_sl_pct_raw is not None else 0.10
+            except (TypeError, ValueError):
+                bad_fill_sl_pct = 0.10
+            if bad_fill_sl_pct > 1.0:
+                bad_fill_sl_pct = bad_fill_sl_pct / 100.0
+            bad_fill_sl_pct = max(0.0, bad_fill_sl_pct)
+
+            def _current_bid_for_order(order_ticker: str, order_side: str) -> Optional[int]:
+                side_l = str(order_side or "").lower()
+                if side_l not in ("yes", "no"):
+                    return None
+                if order_ticker and str(order_ticker) == str(ctx.ticker):
+                    try:
+                        b = int((ctx.quote or {}).get("yes_bid" if side_l == "yes" else "no_bid") or 0)
+                        return b if b > 0 else None
+                    except Exception:
+                        return None
+                for m in (ctx.event_markets or []):
+                    if not isinstance(m, dict):
+                        continue
+                    if str(m.get("ticker") or "") != str(order_ticker):
+                        continue
+                    try:
+                        b = int(m.get("yes_bid" if side_l == "yes" else "no_bid") or 0)
+                        return b if b > 0 else None
+                    except Exception:
+                        return None
+                return None
 
             # If an order was previously registered as 'resting' but no longer appears in open_orders,
             # treat it as filled (best-effort) so exits can manage it.
@@ -497,11 +596,13 @@ def run_pipeline_cycle(
 
                                     filled_after_cancel = 0
                                     post_status = None
+                                    fill_price_cents = None
                                     try:
                                         info = kalshi_client.get_order(str(o.order_id))
                                         od = info.get("order", info) if isinstance(info, dict) else {}
                                         post_status = str(od.get("status") or "").lower()
                                         filled_after_cancel = int(od.get("fill_count") or od.get("filled_count") or 0)
+                                        fill_price_cents = _extract_order_fill_price_cents(od)
                                     except Exception as ve:
                                         logger.warning(
                                             "[EXECUTION] Post-cancel get_order failed: order_id=%s %s",
@@ -516,22 +617,50 @@ def run_pipeline_cycle(
                                             "filled",
                                             filled_after_cancel,
                                             entry_distance_at_fill=fill_dist,
+                                            entry_fill_price_cents=fill_price_cents,
                                         )
-                                        from bot.pipeline.intents import ExitAction
-
-                                        asset_exits.append(
-                                            ExitAction(
-                                                order_id=str(o.order_id),
-                                                action="stop_loss",
-                                                reason="post_cancel_fill_detected",
+                                        entry_baseline = (
+                                            fill_price_cents
+                                            or getattr(o, "entry_fill_price_cents", None)
+                                            or getattr(o, "placement_bid_cents", None)
+                                            or getattr(o, "limit_price_cents", None)
+                                        )
+                                        cur_bid = _current_bid_for_order(str(getattr(o, "ticker", "")), str(getattr(o, "side", "")))
+                                        sl_met = False
+                                        loss_frac = None
+                                        if entry_baseline is not None and int(entry_baseline) > 0 and cur_bid is not None:
+                                            loss_frac = max(0.0, (float(entry_baseline) - float(cur_bid)) / float(entry_baseline))
+                                            sl_met = loss_frac >= bad_fill_sl_pct
+                                        if sl_met:
+                                            from bot.pipeline.intents import ExitAction
+                                            asset_exits.append(
+                                                ExitAction(
+                                                    order_id=str(o.order_id),
+                                                    action="stop_loss",
+                                                    reason="post_cancel_fill_detected",
+                                                )
                                             )
-                                        )
-                                        logger.warning(
-                                            "[EXECUTION] Bad fill detected → immediate exit — order_id=%s status=%s fill_count=%s",
-                                            o.order_id,
-                                            post_status,
-                                            filled_after_cancel,
-                                        )
+                                            logger.warning(
+                                                "[EXECUTION] Bad fill detected → immediate exit — order_id=%s status=%s fill_count=%s "
+                                                "entry_baseline=%s cur_bid=%s loss_frac=%.4f threshold=%.4f",
+                                                o.order_id,
+                                                post_status,
+                                                filled_after_cancel,
+                                                entry_baseline,
+                                                cur_bid,
+                                                float(loss_frac or 0.0),
+                                                bad_fill_sl_pct,
+                                            )
+                                        else:
+                                            logger.info(
+                                                "[EXECUTION] Bad fill detected but SL gate not met — order_id=%s entry_baseline=%s cur_bid=%s "
+                                                "loss_frac=%s threshold=%.4f",
+                                                o.order_id,
+                                                entry_baseline,
+                                                cur_bid,
+                                                _fmt(loss_frac),
+                                                bad_fill_sl_pct,
+                                            )
                                         continue
 
                                     if not cancel_failed or post_status == "canceled":
@@ -560,11 +689,19 @@ def run_pipeline_cycle(
                         # Capture reference distance at the moment we learn the order is filled.
                         # This is used for distance-decay trailing stop so it's based on actual entry.
                         fill_dist = float(ctx.distance) if ctx.distance is not None else None
+                        fill_price_cents = None
+                        try:
+                            info = kalshi_client.get_order(str(o.order_id))
+                            od = info.get("order", info) if isinstance(info, dict) else {}
+                            fill_price_cents = _extract_order_fill_price_cents(od)
+                        except Exception:
+                            fill_price_cents = None
                         registry.update_order_status(
                             o.order_id,
                             "filled",
                             int(o.count or 0),
                             entry_distance_at_fill=fill_dist,
+                            entry_fill_price_cents=fill_price_cents,
                         )
                         # Mirror the "Order PLACED" logging style so we can correlate placed->filled->SL/TP.
                         logger.info(
@@ -607,26 +744,55 @@ def run_pipeline_cycle(
                                         should_bad_exit = should_bad_exit and (float(fill_dist) <= min_dist_at_placement)
 
                                     if should_bad_exit:
-                                        from bot.pipeline.intents import ExitAction
-                                        asset_exits.append(
-                                            ExitAction(
-                                                order_id=str(o.order_id),
-                                                action="stop_loss",
-                                                reason="bad_fill_decay",
+                                        entry_baseline = (
+                                            fill_price_cents
+                                            or getattr(o, "entry_fill_price_cents", None)
+                                            or getattr(o, "placement_bid_cents", None)
+                                            or getattr(o, "limit_price_cents", None)
+                                        )
+                                        cur_bid = _current_bid_for_order(str(getattr(o, "ticker", "")), str(getattr(o, "side", "")))
+                                        sl_met = False
+                                        loss_frac = None
+                                        if entry_baseline is not None and int(entry_baseline) > 0 and cur_bid is not None:
+                                            loss_frac = max(0.0, (float(entry_baseline) - float(cur_bid)) / float(entry_baseline))
+                                            sl_met = loss_frac >= bad_fill_sl_pct
+                                        if sl_met:
+                                            from bot.pipeline.intents import ExitAction
+                                            asset_exits.append(
+                                                ExitAction(
+                                                    order_id=str(o.order_id),
+                                                    action="stop_loss",
+                                                    reason="bad_fill_decay",
+                                                )
                                             )
-                                        )
-                                        logger.info(
-                                            "[EXECUTION] Bad fill detected → immediate exit — order_id=%s strategy_id=%s ticker=%s side=%s "
-                                            "placement_distance=%.4f fill_distance=%.4f threshold=%.4f decay_pct=%.2f",
-                                            o.order_id,
-                                            o.strategy_id,
-                                            o.ticker,
-                                            o.side,
-                                            placement_dist,
-                                            float(fill_dist),
-                                            bad_fill_threshold,
-                                            cancel_decay_pct,
-                                        )
+                                            logger.info(
+                                                "[EXECUTION] Bad fill detected → immediate exit — order_id=%s strategy_id=%s ticker=%s side=%s "
+                                                "placement_distance=%.4f fill_distance=%.4f threshold=%.4f decay_pct=%.2f "
+                                                "entry_baseline=%s cur_bid=%s loss_frac=%.4f sl_threshold=%.4f",
+                                                o.order_id,
+                                                o.strategy_id,
+                                                o.ticker,
+                                                o.side,
+                                                placement_dist,
+                                                float(fill_dist),
+                                                bad_fill_threshold,
+                                                cancel_decay_pct,
+                                                entry_baseline,
+                                                cur_bid,
+                                                float(loss_frac or 0.0),
+                                                bad_fill_sl_pct,
+                                            )
+                                        else:
+                                            logger.info(
+                                                "[EXECUTION] Bad fill decay detected but SL gate not met — order_id=%s strategy_id=%s "
+                                                "entry_baseline=%s cur_bid=%s loss_frac=%s sl_threshold=%.4f",
+                                                o.order_id,
+                                                o.strategy_id,
+                                                entry_baseline,
+                                                cur_bid,
+                                                _fmt(loss_frac),
+                                                bad_fill_sl_pct,
+                                            )
                             except Exception:
                                 pass
                     except Exception:
