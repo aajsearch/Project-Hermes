@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 from typing import Optional
 
 import pytz
@@ -65,4 +65,17 @@ def option_expiry_utc(symbol: str, expiry_time_et: time | None = None) -> Option
     et_time = expiry_time_et or time(16, 0)
     dt_et = tz.localize(datetime.combine(dt.date(), et_time))
     return dt_et.astimezone(pytz.utc)
+
+
+def minutes_to_expiry_utc(symbol: str, expiry_time_et: time | None = None) -> Optional[float]:
+    """
+    Minutes from now (UTC) until option expiry timestamp from :func:`option_expiry_utc`.
+    Negative if already past expiry clock.
+    """
+    exp = option_expiry_utc(symbol, expiry_time_et)
+    if exp is None:
+        return None
+    now = datetime.now(timezone.utc)
+    exp_utc = exp.astimezone(timezone.utc) if exp.tzinfo else exp.replace(tzinfo=timezone.utc)
+    return (exp_utc - now).total_seconds() / 60.0
 

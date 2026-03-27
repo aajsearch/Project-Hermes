@@ -96,6 +96,23 @@ class TestTradeWindowWeekdays(unittest.TestCase):
         self.assertTrue(cfg.trade_window_weekdays.issubset(frozenset(range(7))))
         if cfg.trade_window_timezone:
             self.assertEqual(cfg.trade_window_weekdays, frozenset(range(5)))
+        self.assertGreaterEqual(cfg.api_retry_attempts, 1)
+        self.assertGreaterEqual(cfg.min_minutes_to_expiry_for_new_entry, 0)
+
+
+class TestSpreadQtyFromBroker(unittest.TestCase):
+    def test_balanced_and_cap(self):
+        from bot.alpaca_put_spread.strategy import _spread_qty_from_broker
+
+        pos = {"A": {"qty": -10.0}, "B": {"qty": 10.0}}
+        self.assertEqual(_spread_qty_from_broker(["A", "B"], pos, 10), ("ok", 10))
+        self.assertEqual(_spread_qty_from_broker(["A", "B"], pos, 100), ("ok", 10))
+
+    def test_broken_unbalanced(self):
+        from bot.alpaca_put_spread.strategy import _spread_qty_from_broker
+
+        pos = {"A": {"qty": -3.0}, "B": {"qty": 10.0}}
+        self.assertEqual(_spread_qty_from_broker(["A", "B"], pos, 10), ("broken", 0))
 
 
 class TestCloseDebitSlippageFloor(unittest.TestCase):

@@ -40,9 +40,48 @@ from bot.alpaca_put_spread.db import (
     update_order_status as db_update_order_status,
 )
 from bot.alpaca_put_spread.domain import Leg
-from bot.alpaca_put_spread.execution import cancel_order, submit_mleg_limit_order, wait_for_order
+from bot.alpaca_put_spread.execution import (
+    cancel_order,
+    is_transient_request_error,
+    retry_transient,
+    submit_mleg_limit_order,
+    wait_for_order,
+)
+
+
+def _is_expected_broker_rejection(exc: BaseException) -> bool:
+    """
+    Alpaca rejections that indicate account/state mismatch or exchange rules — not code bugs.
+    Avoid logger.exception() spam for these.
+    """
+    text = str(exc).lower()
+    markers = (
+        "insufficient qty",
+        "40310000",
+        "position intent mismatch",
+        "42210000",
+        "expires soon",
+        "unable to open new positions",
+        "held_for_orders",
+    )
+    if any(m in text for m in markers):
+        return True
+    try:
+        from alpaca.common.exceptions import APIError as AlpacaAPIError
+
+        if isinstance(exc, AlpacaAPIError):
+            code = getattr(exc, "code", None)
+            try:
+                ic = int(code) if code is not None else None
+            except (TypeError, ValueError):
+                ic = None
+            if ic in (40310000, 42210000):
+                return True
+    except Exception:
+        pass
+    return False
 from bot.alpaca_put_spread.iron_condor_selector import select_iron_condor
-from bot.alpaca_put_spread.option_symbol import option_expiry_utc, parse_occ_option_symbol
+from bot.alpaca_put_spread.option_symbol import minutes_to_expiry_utc, option_expiry_utc, parse_occ_option_symbol
 from bot.alpaca_put_spread.pricing_logic import (
     CallSpreadCandidate,
     IronCondorCandidate,
@@ -137,6 +176,47 @@ def _spread_legs_from_state(open_spread: Dict[str, Any]) -> List[str]:
     if short_sym and long_sym:
         return [str(short_sym), str(long_sym)]
     return []
+
+
+def _expiry_symbol_for_candidate(strategy_type: str, candidate: Any) -> str:
+    if strategy_type == _STRATEGY_PCS:
+        return str(getattr(candidate, "short_put_symbol"))
+    if strategy_type == _STRATEGY_CCS:
+        return str(getattr(candidate, "short_call_symbol"))
+    return str(getattr(candidate, "short_put_symbol"))
+
+
+def _spread_qty_from_broker(
+    legs: List[str],
+    open_positions: Dict[str, Any],
+    configured_qty: int,
+) -> Tuple[str, int]:
+    """
+    Classify broker leg quantities vs a planned spread close size.
+
+    Returns:
+      ('flat', 0) — no contracts
+      ('broken', 0) — missing leg vs others or unbalanced qty
+      ('ok', q) — q = min(configured_qty, whole contracts common to all legs)
+    """
+    if not legs:
+        return ("flat", 0)
+    qtys: List[float] = []
+    for s in legs:
+        q = float(open_positions.get(s, {}).get("qty", 0.0) or 0.0)
+        qtys.append(abs(q))
+    mx = max(qtys)
+    mn = min(qtys)
+    if mx < 1e-9:
+        return ("flat", 0)
+    if mn < 1e-9:
+        return ("broken", 0)
+    if mx - mn > 0.01:
+        return ("broken", 0)
+    avail = int(min(float(configured_qty), mn))
+    if avail < 1:
+        return ("broken", 0)
+    return ("ok", avail)
 
 
 def _pricing_legs_from_open(open_spread: Dict[str, Any]) -> List[Leg]:
@@ -616,9 +696,22 @@ class AlpacaPutSpreadRunner:
         s = s.split(".")[-1]
         return s in ("filled", "canceled", "rejected", "expired")
 
+    def _retry_api(self, fn):
+        return retry_transient(
+            fn,
+            attempts=self.cfg.api_retry_attempts,
+            backoff_seconds=self.cfg.api_retry_backoff_seconds,
+        )
+
+    def _exec_retry_kw(self) -> Dict[str, Any]:
+        return {
+            "retry_attempts": self.cfg.api_retry_attempts,
+            "retry_backoff_seconds": self.cfg.api_retry_backoff_seconds,
+        }
+
     def _get_order_status(self, order_id: str) -> str:
         try:
-            o = self.trading_client.get_order_by_id(order_id)
+            o = self._retry_api(lambda: self.trading_client.get_order_by_id(order_id))
             s = str(getattr(o, "status", "")).lower()
             return s.split(".")[-1]
         except Exception:
@@ -644,14 +737,24 @@ class AlpacaPutSpreadRunner:
         if get_nested(self.state, PENDING_CLOSE, underlying, strategy_type):
             return
         try:
-            open_positions = list_open_positions(self.trading_client)
+            open_positions = self._retry_api(lambda: list_open_positions(self.trading_client))
         except Exception:
             return
         syms = _spread_legs_from_state(open_spread)
         if not syms:
             return
-        all_flat = all(float(open_positions.get(s, {}).get("qty", 0.0) or 0.0) == 0.0 for s in syms)
-        if all_flat:
+        qty_tag, _ = _spread_qty_from_broker(syms, open_positions, self.cfg.order_qty)
+        if qty_tag == "broken":
+            logger.warning(
+                "[%s][%s] Clearing open state (broker leg qty inconsistent with a balanced spread)",
+                underlying,
+                strategy_type,
+            )
+            self._telemetry_clear_for_spread(open_spread.get("spread_id"))
+            pop_nested(self.state, "open_positions", underlying, strategy_type)
+            save_state(self.state)
+            return
+        if qty_tag == "flat":
             logger.info("[%s][%s] Clearing stale open state (legs flat)", underlying, strategy_type)
             self._telemetry_clear_for_spread(open_spread.get("spread_id"))
             pop_nested(self.state, "open_positions", underlying, strategy_type)
@@ -773,6 +876,31 @@ class AlpacaPutSpreadRunner:
         if pending_close:
             return self._poll_pending_close(underlying, open_spread, strategy_type, pending_close, ec)
 
+        try:
+            open_positions = self._retry_api(lambda: list_open_positions(self.trading_client))
+        except Exception as e:
+            logger.warning("[%s][%s] Cannot load positions to validate close: %s", underlying, strategy_type, e)
+            return False
+
+        legs_syms = _spread_legs_from_state(open_spread)
+        qty_tag, close_qty = _spread_qty_from_broker(legs_syms, open_positions, self.cfg.order_qty)
+        if qty_tag == "broken":
+            logger.warning(
+                "[%s][%s] Clearing open state: broker legs inconsistent; cannot close safely",
+                underlying,
+                strategy_type,
+            )
+            self._telemetry_clear_for_spread(open_spread.get("spread_id"))
+            pop_nested(self.state, "open_positions", underlying, strategy_type)
+            save_state(self.state)
+            return False
+        if qty_tag == "flat":
+            logger.info("[%s][%s] Clearing open state: broker legs already flat", underlying, strategy_type)
+            self._telemetry_clear_for_spread(open_spread.get("spread_id"))
+            pop_nested(self.state, "open_positions", underlying, strategy_type)
+            save_state(self.state)
+            return False
+
         legs_p = _pricing_legs_from_open(open_spread)
         quotes = lambda sym: _option_bid_ask(self.option_data_client, sym)
         current_net = current_net_credit_mid_from_legs(legs_p, quotes)
@@ -798,12 +926,20 @@ class AlpacaPutSpreadRunner:
         client_order_id = f"alpaca_{strategy_type.lower()}_close:{underlying}:{int(time.time())}"
         order_id = submit_mleg_limit_order(
             self.trading_client,
-            qty=int(self.cfg.order_qty),
+            qty=int(close_qty),
             limit_price=float(close_debit_limit),
             legs=close_legs,
             client_order_id=client_order_id,
+            **self._exec_retry_kw(),
         )
-        logger.info("[%s][%s] Submitted close order_id=%s debit_limit=%.4f", underlying, strategy_type, order_id, close_debit_limit)
+        logger.info(
+            "[%s][%s] Submitted close order_id=%s qty=%s debit_limit=%.4f",
+            underlying,
+            strategy_type,
+            order_id,
+            close_qty,
+            close_debit_limit,
+        )
 
         db_syms = _spread_legs_from_state(open_spread)
         db_insert_order(
@@ -817,7 +953,7 @@ class AlpacaPutSpreadRunner:
             short_put_symbol=open_spread.get("short_put_symbol"),
             long_put_symbol=open_spread.get("long_put_symbol"),
             limit_price=close_debit_limit,
-            qty=self.cfg.order_qty,
+            qty=close_qty,
             raw_snapshot={"strategy_type": strategy_type, "legs": db_syms},
         )
         log_event("close_submitted", f"order_id={order_id}", underlying=underlying, extra={"order_id": order_id, "strategy_type": strategy_type})
@@ -833,6 +969,7 @@ class AlpacaPutSpreadRunner:
                 "submitted_at_ts": time.time(),
                 "close_debit_limit": close_debit_limit,
                 "close_reason": reason,
+                "close_qty": int(close_qty),
                 # Anti-spam for expiry cutoff repricing (cancel/replace loop control).
                 "replace_count": 0,
                 "last_replace_ts": 0.0,
@@ -844,11 +981,12 @@ class AlpacaPutSpreadRunner:
             self.trading_client,
             order_id,
             timeout_seconds=self.cfg.order_fill_timeout_seconds,
+            **self._exec_retry_kw(),
         )
         status = str(getattr(final, "status", "")).lower()
         if status != "filled":
             try:
-                cancel_order(self.trading_client, order_id)
+                cancel_order(self.trading_client, order_id, **self._exec_retry_kw())
             except Exception:
                 pass
             st = str(status).split(".")[-1].lower()
@@ -890,7 +1028,7 @@ class AlpacaPutSpreadRunner:
         status = self._get_order_status(order_id)
         if status == "filled":
             try:
-                o = self.trading_client.get_order_by_id(order_id)
+                o = self._retry_api(lambda: self.trading_client.get_order_by_id(order_id))
             except Exception:
                 o = None
             fill = _filled_avg_price_from_order(o) if o is not None else None
@@ -936,17 +1074,19 @@ class AlpacaPutSpreadRunner:
                 # Only replace if we can compute a new aggressive limit.
                 if new_limit is not None:
                     try:
-                        cancel_order(self.trading_client, order_id)
+                        cancel_order(self.trading_client, order_id, **self._exec_retry_kw())
                     except Exception:
                         pass
                     close_legs = _exit_legs_from_open(open_spread)
                     client_order_id = f"alpaca_{strategy_type.lower()}_close:{underlying}:{int(time.time())}"
+                    replace_qty = int(pending_close.get("close_qty") or self.cfg.order_qty)
                     new_order_id = submit_mleg_limit_order(
                         self.trading_client,
-                        qty=int(self.cfg.order_qty),
+                        qty=replace_qty,
                         limit_price=float(new_limit),
                         legs=close_legs,
                         client_order_id=client_order_id,
+                        **self._exec_retry_kw(),
                     )
                     logger.warning(
                         "[%s][%s] Expiry cutoff replace close order %s -> %s debit_limit=%.4f (replace_count=%s)",
@@ -970,7 +1110,7 @@ class AlpacaPutSpreadRunner:
                         short_put_symbol=open_spread.get("short_put_symbol"),
                         long_put_symbol=open_spread.get("long_put_symbol"),
                         limit_price=float(new_limit),
-                        qty=self.cfg.order_qty,
+                        qty=replace_qty,
                         raw_snapshot={"strategy_type": strategy_type, "legs": _spread_legs_from_state(open_spread)},
                     )
                     log_event(
@@ -994,11 +1134,11 @@ class AlpacaPutSpreadRunner:
             timeout = max(timeout, 600.0)
         if submitted_at_ts and (time.time() - submitted_at_ts) >= timeout:
             try:
-                cancel_order(self.trading_client, order_id)
+                cancel_order(self.trading_client, order_id, **self._exec_retry_kw())
             except Exception:
                 pass
             try:
-                o = self.trading_client.get_order_by_id(str(order_id))
+                o = self._retry_api(lambda: self.trading_client.get_order_by_id(str(order_id)))
                 st = str(getattr(o, "status", "canceled")).lower().split(".")[-1]
             except Exception:
                 st = "canceled"
@@ -1027,6 +1167,7 @@ class AlpacaPutSpreadRunner:
         debit_for_pnl = (
             abs(float(close_debit_filled_avg)) if close_debit_filled_avg is not None else float(limit_debit)
         )
+        close_qty = int(pending_close.get("close_qty") or self.cfg.order_qty)
         if spread_id and debit_for_pnl > 0:
             db_close_spread(
                 spread_id,
@@ -1034,10 +1175,10 @@ class AlpacaPutSpreadRunner:
                 limit_debit,
                 close_reason,
                 entry_credit,
-                self.cfg.order_qty,
+                close_qty,
                 filled_avg_price=close_debit_filled_avg,
             )
-            pnl = (entry_credit - debit_for_pnl) * 100.0 * self.cfg.order_qty
+            pnl = (entry_credit - debit_for_pnl) * 100.0 * close_qty
             alert_close_filled(underlying, order_id, close_reason, pnl)
         db_update_order_status(order_id, "filled", filled_avg_price=close_debit_filled_avg)
         log_event("close_filled", f"order_id={order_id}", underlying=underlying, extra={"order_id": order_id, "strategy_type": strategy_type})
@@ -1170,9 +1311,38 @@ class AlpacaPutSpreadRunner:
             logger.info("[%s][%s] no candidate", underlying, strategy_type)
             return
 
+        min_min = int(getattr(self.cfg, "min_minutes_to_expiry_for_new_entry", 0) or 0)
+        if min_min > 0:
+            exp_sym = _expiry_symbol_for_candidate(strategy_type, candidate)
+            m = minutes_to_expiry_utc(exp_sym)
+            if m is not None and m < float(min_min):
+                logger.info(
+                    "[%s][%s] skip entry: %.1f min to expiry < min_minutes_to_expiry_for_new_entry=%s",
+                    underlying,
+                    strategy_type,
+                    m,
+                    min_min,
+                )
+                return
+
         if not self.cfg.execute:
             logger.info("[%s][%s] execute=false; would submit entry", underlying, strategy_type)
             return
+
+        # Second expiry check immediately before submit (reduces "expires soon" races after selection).
+        min_min2 = int(getattr(self.cfg, "min_minutes_to_expiry_for_new_entry", 0) or 0)
+        if min_min2 > 0:
+            exp_sym2 = _expiry_symbol_for_candidate(strategy_type, candidate)
+            m2 = minutes_to_expiry_utc(exp_sym2)
+            if m2 is not None and m2 < float(min_min2):
+                logger.info(
+                    "[%s][%s] skip entry (pre-submit): %.1f min to expiry < %s",
+                    underlying,
+                    strategy_type,
+                    m2,
+                    min_min2,
+                )
+                return
 
         entry_net_credit_mid = float(getattr(candidate, "entry_net_credit_mid", 0.0) or 0.0)
         if entry_net_credit_mid <= 0:
@@ -1193,6 +1363,7 @@ class AlpacaPutSpreadRunner:
             limit_price=entry_limit_price,
             legs=entry_legs,
             client_order_id=client_order_id,
+            **self._exec_retry_kw(),
         )
 
         db_syms = _spread_legs_from_state(_open_dict_from_candidate(strategy_type, candidate))
@@ -1299,7 +1470,7 @@ class AlpacaPutSpreadRunner:
         status = self._get_order_status(order_id)
         if status == "filled":
             try:
-                o = self.trading_client.get_order_by_id(str(order_id))
+                o = self._retry_api(lambda: self.trading_client.get_order_by_id(str(order_id)))
             except Exception:
                 o = None
             self._complete_entry_fill(underlying, strategy_type, pending_entry, order_obj=o)
@@ -1332,7 +1503,7 @@ class AlpacaPutSpreadRunner:
                 if not order_id:
                     continue
                 try:
-                    o = self.trading_client.get_order_by_id(str(order_id))
+                    o = self._retry_api(lambda: self.trading_client.get_order_by_id(str(order_id)))
                 except Exception as e:
                     logger.debug("[%s][%s] sync close: get_order %s failed: %s", underlying, strategy_type, order_id, e)
                     continue
@@ -1380,7 +1551,7 @@ class AlpacaPutSpreadRunner:
                 if not order_id:
                     continue
                 try:
-                    o = self.trading_client.get_order_by_id(str(order_id))
+                    o = self._retry_api(lambda: self.trading_client.get_order_by_id(str(order_id)))
                 except Exception as e:
                     logger.debug("[%s][%s] sync entry: get_order %s failed: %s", underlying, strategy_type, order_id, e)
                     continue
@@ -1489,13 +1660,14 @@ class AlpacaPutSpreadRunner:
                 continue
 
             close_reason = "reconciled_close_filled"
+            recon_qty = int(r.get("qty") or self.cfg.order_qty)
             db_close_spread(
                 int(spread_id),
                 order_id,
                 float(debit),
                 close_reason,
                 float(entry_credit),
-                self.cfg.order_qty,
+                recon_qty,
                 filled_avg_price=float(debit),
             )
             db_update_order_status(order_id, "filled", filled_avg_price=float(debit))
@@ -1527,7 +1699,10 @@ class AlpacaPutSpreadRunner:
             try:
                 self.sync_pending_orders_with_broker()
             except Exception as e:
-                logger.exception("sync_pending_orders_with_broker failed: %s", e)
+                if is_transient_request_error(e):
+                    logger.warning("sync_pending_orders_with_broker failed (transient): %s", e)
+                else:
+                    logger.exception("sync_pending_orders_with_broker failed: %s", e)
             for underlying in self.cfg.get_underlyings_for_today():
                 shared_chain: Optional[Any] = None
                 if self._underlying_may_hunt_entry(underlying):
@@ -1550,7 +1725,17 @@ class AlpacaPutSpreadRunner:
                         else:
                             self._maybe_open(underlying, strategy_type, chain=shared_chain)
                     except Exception as e:
-                        logger.exception("[%s][%s] Loop error: %s", underlying, strategy_type, e)
+                        if is_transient_request_error(e):
+                            logger.warning("[%s][%s] Loop transient error: %s", underlying, strategy_type, e)
+                        elif _is_expected_broker_rejection(e):
+                            logger.warning(
+                                "[%s][%s] Broker rejected order (expected): %s",
+                                underlying,
+                                strategy_type,
+                                e,
+                            )
+                        else:
+                            logger.exception("[%s][%s] Loop error: %s", underlying, strategy_type, e)
             time.sleep(self.cfg.loop_sleep_seconds)
 
 

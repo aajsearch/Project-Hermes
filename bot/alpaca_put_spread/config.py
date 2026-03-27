@@ -163,6 +163,11 @@ class AlpacaPutSpreadConfig:
     max_entry_retries: int
     order_fill_timeout_seconds: int
     order_cancel_timeout_seconds: int
+    # Transient network / 5xx retries for Alpaca REST calls used by execution + position sync.
+    api_retry_attempts: int
+    api_retry_backoff_seconds: float
+    # Skip new entries when OCC expiry is within this many minutes (Alpaca rejects "expires soon").
+    min_minutes_to_expiry_for_new_entry: int
 
     trade_window_timezone: Optional[str]
     trade_window_start_time_local: Optional[str]
@@ -498,6 +503,15 @@ def load_alpaca_options_config(config_dir: str | Path = "config") -> AlpacaPutSp
     max_entry_retries = int(runtime.get("max_entry_retries", 1))
     order_fill_timeout_seconds = int(runtime.get("order_fill_timeout_seconds", 60))
     order_cancel_timeout_seconds = int(runtime.get("order_cancel_timeout_seconds", 5))
+    api_retry_attempts = int(runtime.get("api_retry_attempts", 3))
+    api_retry_backoff_seconds = float(runtime.get("api_retry_backoff_seconds", 0.5))
+    min_minutes_to_expiry_for_new_entry = int(runtime.get("min_minutes_to_expiry_for_new_entry", 120))
+    if api_retry_attempts < 1:
+        raise ValueError("alpaca_options.runtime.api_retry_attempts must be >= 1")
+    if api_retry_backoff_seconds < 0:
+        raise ValueError("alpaca_options.runtime.api_retry_backoff_seconds must be >= 0")
+    if min_minutes_to_expiry_for_new_entry < 0:
+        raise ValueError("alpaca_options.runtime.min_minutes_to_expiry_for_new_entry must be >= 0")
     order_qty = int(runtime.get("order_qty", 1))
     if order_qty <= 0:
         raise ValueError("alpaca_options.runtime.order_qty must be >= 1")
@@ -554,6 +568,9 @@ def load_alpaca_options_config(config_dir: str | Path = "config") -> AlpacaPutSp
         max_entry_retries=max_entry_retries,
         order_fill_timeout_seconds=order_fill_timeout_seconds,
         order_cancel_timeout_seconds=order_cancel_timeout_seconds,
+        api_retry_attempts=api_retry_attempts,
+        api_retry_backoff_seconds=api_retry_backoff_seconds,
+        min_minutes_to_expiry_for_new_entry=min_minutes_to_expiry_for_new_entry,
         trade_window_timezone=trade_window_timezone,
         trade_window_start_time_local=trade_window_start_time_local,
         trade_window_end_time_local=trade_window_end_time_local,

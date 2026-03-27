@@ -576,7 +576,7 @@ def list_filled_close_orders_without_spread_link(
             params.append(float(since_ts))
         rows = conn.execute(
             f"""
-            SELECT order_id, underlying, strategy_type, legs, limit_price, filled_avg_price, submitted_at
+            SELECT order_id, underlying, strategy_type, legs, limit_price, filled_avg_price, submitted_at, qty
             FROM {ORDERS_TABLE}
             WHERE side = 'close'
               AND status = 'filled'

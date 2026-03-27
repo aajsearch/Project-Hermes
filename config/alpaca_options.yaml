@@ -10,6 +10,12 @@ alpaca_options:
     max_entry_retries: 1
     order_fill_timeout_seconds: 60
     order_cancel_timeout_seconds: 5
+    # Retry Alpaca REST calls on transient network errors and HTTP 5xx (submit/cancel/order/positions).
+    api_retry_attempts: 3
+    api_retry_backoff_seconds: 0.5
+    # Do not open new spreads when OCC expiry is within this many minutes (Alpaca rejects "expires soon").
+    # Set to 0 to disable this guard.
+    min_minutes_to_expiry_for_new_entry: 120
     # Contract size for the spread (number of option contracts).
     # For bull put spreads with 1:1 leg ratios, this is qty applied to the mleg order.
     order_qty: 10
