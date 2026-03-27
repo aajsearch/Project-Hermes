@@ -15,7 +15,7 @@ alpaca_options:
     api_retry_backoff_seconds: 0.5
     # Do not open new spreads when OCC expiry is within this many minutes (Alpaca rejects "expires soon").
     # Set to 0 to disable this guard.
-    min_minutes_to_expiry_for_new_entry: 120
+    min_minutes_to_expiry_for_new_entry: 15
     # Contract size for the spread (number of option contracts).
     # For bull put spreads with 1:1 leg ratios, this is qty applied to the mleg order.
     order_qty: 10
