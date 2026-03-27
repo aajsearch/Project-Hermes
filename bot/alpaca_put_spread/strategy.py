@@ -47,6 +47,29 @@ from bot.alpaca_put_spread.execution import (
     submit_mleg_limit_order,
     wait_for_order,
 )
+from bot.alpaca_put_spread.iron_condor_selector import select_iron_condor
+from bot.alpaca_put_spread.option_symbol import minutes_to_expiry_utc, option_expiry_utc, parse_occ_option_symbol
+from bot.alpaca_put_spread.pricing_logic import (
+    CallSpreadCandidate,
+    IronCondorCandidate,
+    PutSpreadCandidate,
+    current_net_credit_mid_from_legs,
+    estimate_close_debit_natural_from_open_legs,
+    natural_close_debit_for_exit,
+)
+from bot.alpaca_put_spread.put_spread_selector import _get_chain_silent, _safe_get, select_bull_put_credit_spread
+from bot.alpaca_put_spread.state import (
+    ensure_state_shape,
+    get_nested,
+    load_state,
+    pop_nested,
+    save_state,
+    set_nested,
+)
+from bot.alpaca_put_spread.strategy_types import StrategyType
+
+from trading_assistant.broker.alpaca.market_data import get_latest_mid
+from trading_assistant.broker.alpaca.positions import list_open_positions
 
 
 def _is_expected_broker_rejection(exc: BaseException) -> bool:
@@ -80,29 +103,6 @@ def _is_expected_broker_rejection(exc: BaseException) -> bool:
     except Exception:
         pass
     return False
-from bot.alpaca_put_spread.iron_condor_selector import select_iron_condor
-from bot.alpaca_put_spread.option_symbol import minutes_to_expiry_utc, option_expiry_utc, parse_occ_option_symbol
-from bot.alpaca_put_spread.pricing_logic import (
-    CallSpreadCandidate,
-    IronCondorCandidate,
-    PutSpreadCandidate,
-    current_net_credit_mid_from_legs,
-    estimate_close_debit_natural_from_open_legs,
-    tp_sl_triggered,
-)
-from bot.alpaca_put_spread.put_spread_selector import _get_chain_silent, _safe_get, select_bull_put_credit_spread
-from bot.alpaca_put_spread.state import (
-    ensure_state_shape,
-    get_nested,
-    load_state,
-    pop_nested,
-    save_state,
-    set_nested,
-)
-from bot.alpaca_put_spread.strategy_types import StrategyType
-
-from trading_assistant.broker.alpaca.market_data import get_latest_mid
-from trading_assistant.broker.alpaca.positions import list_open_positions
 
 
 logger = logging.getLogger(__name__)
@@ -450,6 +450,11 @@ def _distance_gate_met(
     strategy_type: str,
     ec: SimpleNamespace,
 ) -> Tuple[bool, Optional[str]]:
+    """
+    True when spot has moved close enough to the short strike to allow *stop-loss* exits.
+
+    Take-profit and expiry-cutoff closes do not use this gate (see ``_maybe_close``).
+    """
     if ec.distance_buffer_otm_fraction is not None:
         threshold_otm_pct = float(ec.min_short_otm_percent) * float(ec.distance_buffer_otm_fraction)
         if strategy_type == _STRATEGY_PCS:
@@ -609,6 +614,60 @@ def _expiry_symbol_for_open(open_spread: Dict[str, Any]) -> str:
     if st == _STRATEGY_IC:
         return str(open_spread["short_put_symbol"])
     return str(open_spread["short_put_symbol"])
+
+
+def _close_reason_for_open_credit_spread(
+    underlying: str,
+    open_spread: Dict[str, Any],
+    strategy_type: str,
+    ec: SimpleNamespace,
+    distance_gate_met: bool,
+    legs_p: List[Leg],
+    bid_ask_for: Any,
+) -> Optional[str]:
+    """
+    Decide whether to close an open credit structure and why.
+
+    Priority (first match wins):
+      1. Take profit — natural debit-to-close <= entry * (1 - tp_pct). **Ignores distance gate.**
+      2. Expiry cutoff — now >= expiry - exit_before_minutes. **Ignores distance gate.**
+      3. Stop loss — natural debit-to-close >= entry * (1 + sl_pct) **only if distance_gate_met.**
+
+    Uses :func:`natural_close_debit_for_exit` (natural ask/bid), same convention as pricing_logic TP/SL.
+    """
+    entry_credit = float(open_spread["entry_net_credit_mid"])
+    current_debit = natural_close_debit_for_exit(None, legs=legs_p, bid_ask_for=bid_ask_for)
+
+    # (1) Take profit — always on executable close estimate; never blocked by distance gate.
+    if current_debit is not None and entry_credit > 0:
+        tp_thr = entry_credit * (1.0 - ec.tp_pct)
+        if float(current_debit) <= tp_thr:
+            return "tp"
+
+    # (2) Expiry cutoff — time-based; independent of distance gate.
+    exp_sym = _expiry_symbol_for_open(open_spread)
+    expiry_utc = option_expiry_utc(exp_sym)
+    if expiry_utc is not None:
+        now_utc = datetime.now(timezone.utc)
+        cutoff = expiry_utc - timedelta(minutes=ec.exit_before_minutes)
+        if now_utc >= cutoff:
+            return "expiry_cutoff"
+
+    # (3) Stop loss — requires distance gate so we do not stop out while spot is still "far" from short.
+    if current_debit is not None and entry_credit > 0:
+        sl_thr = entry_credit * (1.0 + ec.sl_pct)
+        if float(current_debit) >= sl_thr:
+            if distance_gate_met:
+                return "sl"
+            logger.debug(
+                "[%s][%s] SL threshold hit (est_close_debit=%.4f >= %.4f) but distance gate closed; holding",
+                underlying,
+                strategy_type,
+                float(current_debit),
+                sl_thr,
+            )
+
+    return None
 
 
 class AlpacaPutSpreadRunner:
@@ -819,7 +878,6 @@ class AlpacaPutSpreadRunner:
         if st != strategy_type:
             logger.warning("[%s] strategy_type mismatch open=%s loop=%s", underlying, st, strategy_type)
         ec = _exit_cfg(self.cfg, strategy_type)
-        reason: Optional[str] = None
 
         underlying_mid = get_latest_mid(self.stock_data_client, underlying)
         if underlying_mid <= 0:
@@ -828,30 +886,17 @@ class AlpacaPutSpreadRunner:
         distance_gate_met, _ = _distance_gate_met(open_spread, underlying_mid, strategy_type, ec)
         self._maybe_log_spread_telemetry(underlying, open_spread, strategy_type, underlying_mid, distance_gate_met)
 
-        # Expiry cutoff closes regardless of distance gate or TP/SL.
-        exp_sym = _expiry_symbol_for_open(open_spread)
-        expiry_utc = option_expiry_utc(exp_sym)
-        if expiry_utc is not None:
-            now_utc = datetime.now(timezone.utc)
-            cutoff = expiry_utc - timedelta(minutes=ec.exit_before_minutes)
-            if now_utc >= cutoff:
-                reason = "expiry_cutoff"
-
-        # Distance / OTM gate only unlocks TP/SL; proximity alone must not force a close.
-        if reason is None:
-            if distance_gate_met:
-                legs = _pricing_legs_from_open(open_spread)
-                entry_credit = float(open_spread["entry_net_credit_mid"])
-                triggered, tp_sl_tag = tp_sl_triggered(
-                    None,
-                    entry_credit,
-                    ec.tp_pct,
-                    ec.sl_pct,
-                    legs=legs,
-                    bid_ask_for=lambda sym: _option_bid_ask(self.option_data_client, sym),
-                )
-                if triggered:
-                    reason = tp_sl_tag
+        legs_p = _pricing_legs_from_open(open_spread)
+        bid_ask_for = lambda sym: _option_bid_ask(self.option_data_client, sym)
+        reason = _close_reason_for_open_credit_spread(
+            underlying,
+            open_spread,
+            strategy_type,
+            ec,
+            distance_gate_met,
+            legs_p,
+            bid_ask_for,
+        )
 
         if not reason:
             return False

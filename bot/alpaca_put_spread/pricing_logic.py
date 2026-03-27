@@ -165,6 +165,26 @@ def entry_condition_met(
     return False
 
 
+def natural_close_debit_for_exit(
+    current_net_credit_mid: Optional[float],
+    *,
+    legs: Optional[Sequence[Leg]] = None,
+    bid_ask_for: Optional[BidAskFor] = None,
+) -> Optional[float]:
+    """
+    Debit-to-close estimate used for TP/SL: natural ask/bid where possible, else mark mid.
+
+    When *legs* and *bid_ask_for* are provided, *current_net_credit_mid* is ignored (same rule as
+    :func:`tp_sl_triggered`).
+    """
+    current: Optional[float] = current_net_credit_mid
+    if legs is not None and bid_ask_for is not None:
+        mark_credit = current_net_credit_mid_from_legs(legs, bid_ask_for)
+        natural_debit = estimate_close_debit_natural_from_open_legs(legs, bid_ask_for)
+        current = natural_debit if natural_debit is not None else mark_credit
+    return current
+
+
 def tp_sl_triggered(
     current_net_credit_mid: Optional[float],
     entry_net_credit_mid: float,
@@ -187,14 +207,14 @@ def tp_sl_triggered(
 
     If ``legs`` and ``bid_ask_for`` are provided, ``current_net_credit_mid`` is
     ignored and the combined total from :func:`current_net_credit_mid_from_legs` is used.
+
+    The Alpaca options runner evaluates TP without the distance gate; SL uses the same thresholds
+    but only fires when the distance gate is open. This helper returns the first of TP/SL that
+    would match if both were evaluated without gating.
     """
-    current: Optional[float] = current_net_credit_mid
-    if legs is not None and bid_ask_for is not None:
-        # Mark (mid) is useful for logging/diagnostics but not safe for TP in wide spreads.
-        mark_credit = current_net_credit_mid_from_legs(legs, bid_ask_for)
-        natural_debit = estimate_close_debit_natural_from_open_legs(legs, bid_ask_for)
-        # Fall back to mark when natural is unavailable (missing bid/ask).
-        current = natural_debit if natural_debit is not None else mark_credit
+    current = natural_close_debit_for_exit(
+        current_net_credit_mid, legs=legs, bid_ask_for=bid_ask_for
+    )
     if current is None:
         return (False, "")
     if entry_net_credit_mid <= 0:
