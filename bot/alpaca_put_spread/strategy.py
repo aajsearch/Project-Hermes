@@ -768,6 +768,13 @@ class AlpacaPutSpreadRunner:
             "retry_backoff_seconds": self.cfg.api_retry_backoff_seconds,
         }
 
+    def _close_fill_timeout_seconds(self, close_reason: str) -> int:
+        """TP closes get a longer wait before timeout-cancel; SL / expiry / other use order_fill_timeout_seconds."""
+        r = (close_reason or "").lower()
+        if "tp" in r:
+            return int(self.cfg.take_profit_order_fill_timeout_seconds)
+        return int(self.cfg.order_fill_timeout_seconds)
+
     def _get_order_status(self, order_id: str) -> str:
         try:
             o = self._retry_api(lambda: self.trading_client.get_order_by_id(order_id))
@@ -1025,7 +1032,7 @@ class AlpacaPutSpreadRunner:
         final = wait_for_order(
             self.trading_client,
             order_id,
-            timeout_seconds=self.cfg.order_fill_timeout_seconds,
+            timeout_seconds=self._close_fill_timeout_seconds(reason or ""),
             **self._exec_retry_kw(),
         )
         status = str(getattr(final, "status", "")).lower()
@@ -1174,7 +1181,7 @@ class AlpacaPutSpreadRunner:
                     return False
 
         # For expiry_cutoff, avoid aggressive timeout-driven cancel loops; let it rest longer.
-        timeout = float(self.cfg.order_fill_timeout_seconds)
+        timeout = float(self._close_fill_timeout_seconds(close_reason))
         if close_reason == "expiry_cutoff":
             timeout = max(timeout, 600.0)
         if submitted_at_ts and (time.time() - submitted_at_ts) >= timeout:

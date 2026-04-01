@@ -9,6 +9,8 @@ alpaca_options:
     # Per-cycle behavior
     max_entry_retries: 1
     order_fill_timeout_seconds: 60
+    # Take-profit multileg closes: wait this long (seconds) before canceling if still unfilled.
+    take_profit_order_fill_timeout_seconds: 300
     order_cancel_timeout_seconds: 5
     # Retry Alpaca REST calls on transient network errors and HTTP 5xx (submit/cancel/order/positions).
     api_retry_attempts: 3
