@@ -17,6 +17,11 @@ from src.client.kalshi_client import KalshiClient
 
 logger = logging.getLogger(__name__)
 
+# Kalshi's order API requires a limit price; there is no true market order. Selling at 1c on the
+# traded side is the most aggressive limit (cross the book). Same value as KalshiClient.place_market_order
+# for sells. Used for all V2 stop_loss / market_sell exits (e.g. continuous_alpha_limit_99, hourly_signals_farthest).
+_EMULATED_MARKET_SELL_LIMIT_CENTS = 1
+
 
 def _exit_price_cents_from_fill_rows(fills: List[dict], side: str) -> Optional[int]:
     """
@@ -458,14 +463,14 @@ class PipelineExecutor:
                     "[EXECUTION AUDIT] count: pos_count=None (get_positions failed or no match) → sell_count=fill_count=%s",
                     sell_count,
                 )
-            # Payload we send: emulated market order as aggressive limit (sell down to 1c).
+            # Payload mirrors KalshiClient.place_market_order (aggressive limit + IoC reduce-only sell).
             payload = {
                 "ticker": ticker_sell,
                 "action": "sell",
                 "side": side,
                 "count": int(sell_count),
                 "type": "limit",
-                f"{side}_price": 1,
+                f"{side}_price": _EMULATED_MARKET_SELL_LIMIT_CENTS,
                 "reduce_only": True,
                 "time_in_force": "immediate_or_cancel",
             }

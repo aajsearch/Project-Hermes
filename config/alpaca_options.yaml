@@ -21,6 +21,16 @@ alpaca_options:
     # Contract size for the spread (number of option contracts).
     # For bull put spreads with 1:1 leg ratios, this is qty applied to the mleg order.
     order_qty: 10
+    # Multileg close: minimum seconds before cancel/replace (reduces exchange queue chasing).
+    close_order_sticky_seconds: 240
+    close_order_max_replaces: 40
+    close_order_max_wall_seconds: 14400
+    # 0DTE: start expiry evacuation at this local clock on the option expiry calendar date
+    # (default 12:20 America/Los_Angeles ≈ 40 minutes before 1:00 PM PT equity close).
+    # Set eod_evacuation_enabled: false to use per-strategy exit.exit_before_minutes before option expiry instead.
+    eod_evacuation_enabled: true
+    eod_evacuation_hhmm_local: "12:20"
+    eod_evacuation_timezone: "America/Los_Angeles"
 
   # Risk caps (operational safety). Block new entries when daily PnL <= -cap.
   # Set to 0 to disable.

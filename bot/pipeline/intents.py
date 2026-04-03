@@ -48,7 +48,14 @@ EXIT_ACTIONS = (EXIT_ACTION_STOP_LOSS, EXIT_ACTION_TAKE_PROFIT, EXIT_ACTION_MARK
 
 @dataclass(frozen=True)
 class ExitAction:
-    """Request to exit an order; produced by strategy.evaluate_exit(ctx, my_orders)."""
+    """
+    Request to exit an order; produced by strategy.evaluate_exit(ctx, my_orders).
+
+    For ``stop_loss`` / ``market_sell``, the V2 executor does not use ``limit_price_cents``;
+    it calls KalshiClient.place_market_order → limit order at **1¢** on the position side
+    (IOC + reduce_only), i.e. maximum aggression so the close matches like a market sell.
+    Same execution path for strategies such as continuous_alpha_limit_99 and hourly_signals_farthest.
+    """
 
     order_id: str
     action: str  # "stop_loss" | "take_profit" | "market_sell" | "cancel_only"

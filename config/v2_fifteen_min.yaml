@@ -7,7 +7,7 @@ fifteen_min:
 
   strategies:
     continuous_alpha_limit_99:
-      enabled: true
+      enabled: false
       window_seconds: { btc: 150, eth: 150, sol: 150, xrp: 150 }
       
       # --- 1. ENTRY CONSTRAINTS (The 85-95 Sweet Spot) ---

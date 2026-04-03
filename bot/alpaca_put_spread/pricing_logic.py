@@ -131,6 +131,23 @@ def estimate_close_debit_natural_from_open_legs(legs: Sequence[Leg], bid_ask_for
     return float(debit) if debit >= 0 else 0.0
 
 
+def aggressive_stop_loss_debit_limit_from_natural(natural_debit: float) -> float:
+    """
+    Marketable multileg debit limit for stop-loss exits: widen well past natural ask sum
+    so the close crosses the spread (Alpaca rejects naked market on some mleg routes).
+    """
+    n = max(0.0, float(natural_debit))
+    return max(n * 1.15, n + 0.05)
+
+
+def ultra_aggressive_eod_evac_debit_limit_from_natural(natural_debit: float) -> float:
+    """
+    Time-cutoff (e.g. pre margin sweep) evacuation: very wide debit cap vs natural close cost.
+    """
+    n = max(0.0, float(natural_debit))
+    return max(n * 1.30, n + 0.10)
+
+
 def net_credit_mid(short_put_mid: float, long_put_mid: float) -> float:
     """PCS helper: net credit from short and long put mids (sell short, buy long)."""
     legs = (

@@ -114,6 +114,26 @@ class TestSpreadQtyFromBroker(unittest.TestCase):
         pos = {"A": {"qty": -3.0}, "B": {"qty": 10.0}}
         self.assertEqual(_spread_qty_from_broker(["A", "B"], pos, 10), ("broken", 0))
 
+    def test_balanced_smaller_than_configured(self):
+        """After partial desk exit, equal leg sizes (e.g. 3 vs 3) close min(10,3)=3."""
+        from bot.alpaca_put_spread.strategy import _spread_qty_from_broker
+
+        pos = {"A": {"qty": -3.0}, "B": {"qty": 3.0}}
+        self.assertEqual(_spread_qty_from_broker(["A", "B"], pos, 10), ("ok", 3))
+
+
+class TestAggressiveCloseLimits(unittest.TestCase):
+    def test_sl_uses_max_of_pct_and_dollar_buffer(self):
+        from bot.alpaca_put_spread.pricing_logic import aggressive_stop_loss_debit_limit_from_natural
+
+        self.assertAlmostEqual(aggressive_stop_loss_debit_limit_from_natural(1.0), max(1.15, 1.05))
+        self.assertAlmostEqual(aggressive_stop_loss_debit_limit_from_natural(0.20), max(0.23, 0.25))
+
+    def test_eod_evac_wider_than_sl(self):
+        from bot.alpaca_put_spread.pricing_logic import ultra_aggressive_eod_evac_debit_limit_from_natural
+
+        self.assertAlmostEqual(ultra_aggressive_eod_evac_debit_limit_from_natural(1.0), max(1.30, 1.10))
+
 
 class TestCloseDebitSlippageFloor(unittest.TestCase):
     def test_zero_net_uses_min_cent_buffer(self):

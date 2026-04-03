@@ -17,7 +17,7 @@ intervals:
     mode: TRADE
   hourly:
     enabled: true
-    assets: [btc]
+    assets: [btc,eth]
     mode: TRADE
 
 caps:
@@ -37,6 +37,6 @@ no_trade_windows:
 feature_flags:
   v2_hourly:
     # Enable V2 hourly per asset (canary list). Empty = off.
-    enabled_assets: [btc]
+    enabled_assets: [btc,eth]
     # When true, V2 hourly evaluates and logs but does not place orders (hourly-only dry-run).
     shadow_mode: false

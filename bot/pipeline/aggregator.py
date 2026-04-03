@@ -5,11 +5,34 @@ Takes (OrderIntent, strategy_id) pairs, sorts by config strategy_priority, enfor
 from __future__ import annotations
 
 import logging
-from typing import List, Tuple
+from typing import Any, List, Optional, Tuple
 
 from bot.pipeline.intents import OrderIntent, OrderRecord
 
 logger = logging.getLogger(__name__)
+
+
+def _asset_cfg_value(value: Any, asset: Optional[str], default: Any) -> Any:
+    """Scalar config or per-asset dict (keys lower or upper), same as hourly V2 strategies."""
+    if value is None:
+        return default
+    if isinstance(value, dict):
+        if not asset:
+            return default
+        a = str(asset).strip().lower()
+        return value.get(a, value.get(a.upper(), default))
+    return value
+
+
+def _resolve_strategy_max_cost_cents(strat_cfg: dict, asset: Optional[str]) -> int:
+    """Prefer max_cost_cents_by_asset, then max_cost_cents (scalar or per-asset map). Default 600."""
+    max_cost = _asset_cfg_value(strat_cfg.get("max_cost_cents_by_asset"), asset, None)
+    if max_cost is None:
+        max_cost = _asset_cfg_value(strat_cfg.get("max_cost_cents"), asset, 600)
+    try:
+        return int(max_cost)
+    except (TypeError, ValueError):
+        return 600
 
 
 class OrderAggregator:
@@ -24,6 +47,7 @@ class OrderAggregator:
         config: dict,
         active_orders: List[OrderRecord],
         current_cost_by_strategy: dict | None = None,
+        asset: str | None = None,
     ) -> List[Tuple[OrderIntent, str]]:
         """
         Sort intents by strategy priority, enforce per-strategy cost cap.
@@ -51,7 +75,7 @@ class OrderAggregator:
         intent, strategy_id = sorted_intents[0]
         strategies_cfg = config.get("strategies") or {}
         strat_cfg = strategies_cfg.get(strategy_id) or {}
-        max_cost_cents = int(strat_cfg.get("max_cost_cents", 600))
+        max_cost_cents = _resolve_strategy_max_cost_cents(strat_cfg, asset)
         current_cost = (current_cost_by_strategy or {}).get(strategy_id, 0)
         new_cost = intent.count * (intent.price_cents or 99)
         if current_cost + new_cost > max_cost_cents:

@@ -6,7 +6,9 @@ Key parity goals (see docs/KALSHI_HOURLY_V1_V2_PARITY.md):
 - Read full hourly event market list from ctx.event_markets (populated by run_unified for hourly).
 - Emit at most one OrderIntent per tick; when pick_all_in_range=true, we iterate farthest-first across ticks
   by skipping tickers already traded by this strategy in the current window (my_orders).
-- Basic stop-loss exit using current bid vs placement_bid_cents with optional persistence via sqlite.
+- Stop-loss: per filled order, if current bid vs entry bid is down >= stop_loss_pct (default 20%), emit
+  ExitAction(stop_loss). Execution (same as continuous_alpha_limit_99): executor runs Kalshi
+  place_market_order → limit sell at 1¢ on that side, IOC + reduce_only (see bot/pipeline/executor.py).
 """
 
 from __future__ import annotations
@@ -272,7 +274,8 @@ def _get_current_bid_for_side(market: Dict[str, Any], side: str) -> Optional[int
         if v is None:
             return None
         i = int(v)
-        return i if i > 0 else None
+        # 0¢ bid is valid for SL (max drawdown vs entry); only None means missing quote.
+        return i
     except Exception:
         return None
 
@@ -454,14 +457,18 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
             side = str(s.side).lower()
             if side not in ("yes", "no"):
                 continue
-            # Selection uses legacy thresholds (ask/bid qualification), but execution places a fixed
-            # limit at 99c (same as fifteen_min limit-99 style).
-            price = 99
+            # Selection uses legacy thresholds (ask/bid qualification); limit price matches fifteen_min (configurable).
+            price = _parse_int(cfg.get("limit_price_cents"), 99)
+            if price < 1 or price > 99:
+                price = 99
 
             order_count = int(_get_asset_cfg(cfg.get("order_count"), ctx.asset, 1) or 1)
             if order_count < 1:
                 order_count = 1
-            max_cost = int(_get_asset_cfg(cfg.get("max_cost_cents"), ctx.asset, 50000) or 50000)
+            max_cost_raw = _get_asset_cfg(cfg.get("max_cost_cents_by_asset"), ctx.asset, None)
+            if max_cost_raw is None:
+                max_cost_raw = _get_asset_cfg(cfg.get("max_cost_cents"), ctx.asset, 50000)
+            max_cost = int(max_cost_raw or 50000)
             if max_cost > 0 and (order_count * int(price)) > max_cost:
                 _log_telemetry(
                     window_id=f"{ctx.interval}_{logical_window_slot(ctx.market_id)}",
@@ -659,8 +666,11 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
             return []
 
         exit_cfg = cfg.get("exit") or {}
-        stop_loss_frac = _parse_float(exit_cfg.get("stop_loss_pct"), 0.30)
-        panic_frac = _parse_float(exit_cfg.get("panic_stop_loss_pct"), stop_loss_frac)
+        # Accept fraction (0.20) or percent points (20) like fifteen_min YAML — avoids SL never arming if
+        # someone sets stop_loss_pct: 15 meaning 15%.
+        stop_loss_frac = _parse_float(exit_cfg.get("stop_loss_pct"), 0.20)
+        if stop_loss_frac > 1.0:
+            stop_loss_frac = stop_loss_frac / 100.0
         persistence = _parse_int(exit_cfg.get("stop_loss_persistence_polls"), 1)
         if persistence < 1:
             persistence = 1
@@ -675,7 +685,10 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
         window_id = f"{ctx.interval}_{logical_window_slot(ctx.market_id)}"
 
         for o in my_orders:
-            if (o.status or "") not in ("filled", "executed"):
+            # Match continuous_alpha_limit_99 (last_90s): treat partial fills as eligible for SL monitoring.
+            st = (o.status or "").lower()
+            fc = int(getattr(o, "filled_count", 0) or 0)
+            if st not in ("filled", "executed", "complete") and fc < 1:
                 continue
             t = str(o.ticker or "")
             if not t:
@@ -699,46 +712,20 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
                 continue
 
             loss_frac = max(0.0, float(entry_bid - cur_bid) / float(entry_bid))
-            triggered = loss_frac >= stop_loss_frac
-            panic = loss_frac >= panic_frac
-
-            if not triggered:
-                # Reset persistence counter if previously armed.
+            if loss_frac < stop_loss_frac:
                 if persistence > 1:
                     _sl_state_set(o.order_id, 0)
-                continue
-
-            if panic:
-                exits.append(ExitAction(order_id=str(o.order_id), action="stop_loss", reason="panic_stop_loss"))
-                logger.info(
-                    "[hourly_signals_v2_sl] [%s] order_id=%s ticker=%s side=%s reason=panic_stop_loss entry_bid=%s cur_bid=%s loss_frac=%.4f",
-                    (ctx.asset or "").upper(),
-                    str(o.order_id),
-                    t,
-                    side,
-                    entry_bid,
-                    cur_bid,
-                    loss_frac,
-                )
-                _log_telemetry(
-                    window_id=window_id,
-                    asset=ctx.asset,
-                    action="exit",
-                    ticker=t,
-                    side=side,
-                    reason="panic_stop_loss",
-                    details={"entry_bid": entry_bid, "cur_bid": cur_bid, "loss_frac": loss_frac},
-                )
                 continue
 
             if persistence <= 1:
                 exits.append(ExitAction(order_id=str(o.order_id), action="stop_loss", reason="stop_loss"))
                 logger.info(
-                    "[hourly_signals_v2_sl] [%s] order_id=%s ticker=%s side=%s reason=stop_loss entry_bid=%s cur_bid=%s loss_frac=%.4f",
+                    "[hourly_signals_v2_sl] [%s] order_id=%s ticker=%s side=%s reason=stop_loss bid_down>=%.0f%% entry_bid=%s cur_bid=%s loss_frac=%.4f",
                     (ctx.asset or "").upper(),
                     str(o.order_id),
                     t,
                     side,
+                    stop_loss_frac * 100.0,
                     entry_bid,
                     cur_bid,
                     loss_frac,

@@ -1,5 +1,5 @@
 ---
-description: Commit and push changes to Project Hermes (aajsearch) main branch
+description: Commit and push to Project Hermes only when the user asks
 alwaysApply: true
 ---
 
@@ -7,6 +7,6 @@ alwaysApply: true
 
 - **Target repo**: **hermes** — https://github.com/aajsearch/Project-Hermes.git  
 - **Target branch**: **main**. Work on `main` and push to `hermes main`.
-- **After completing a task** that modifies code or config: stage changes, commit with a clear message, then push to **main**: `git push hermes main` (or from branch `main`: `git push` if it tracks `hermes/main`).
+- **Do not** run `git commit` or `git push` unless the user **explicitly** asks (e.g. "commit and push", "save and push", "push to GitHub"). Implementing a task or changing files does **not** imply permission to commit or push.
+- When the user **does** ask to commit and push: ensure changes are on `main` (merge or checkout main as appropriate), then `git add` (only intended paths), `git commit -m "..."`, then push to **main**: `git push hermes main` (or `git push origin main` if that remote tracks Hermes).
 - **Do not** commit secrets, `.env`, or binary assets. Respect `.gitignore`.
-- If the user asks to "commit and push" or "save and push": ensure changes are on `main` (merge or checkout main as appropriate), then `git add`, `git commit -m "..."`, `git push hermes main`.

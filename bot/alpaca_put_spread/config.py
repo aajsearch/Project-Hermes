@@ -171,6 +171,17 @@ class AlpacaPutSpreadConfig:
     # Skip new entries when OCC expiry is within this many minutes (Alpaca rejects "expires soon").
     min_minutes_to_expiry_for_new_entry: int
 
+    # Multileg close: min seconds a resting close order must stay open before cancel/replace (queue stickiness).
+    close_order_sticky_seconds: int
+    # Safety: stop trying to replace after this many attempts or this many seconds since first close submit.
+    close_order_max_replaces: int
+    close_order_max_wall_seconds: int
+    # When True, expiry evacuation uses Pacific wall clock on expiry date (see hhmm/timezone below).
+    # When False, use per-strategy exit_before_minutes before option expiry timestamp (legacy).
+    eod_evacuation_enabled: bool
+    eod_evacuation_hhmm_local: str
+    eod_evacuation_timezone: str
+
     trade_window_timezone: Optional[str]
     trade_window_start_time_local: Optional[str]
     trade_window_end_time_local: Optional[str]
@@ -519,6 +530,18 @@ def load_alpaca_options_config(config_dir: str | Path = "config") -> AlpacaPutSp
         raise ValueError("alpaca_options.runtime.api_retry_backoff_seconds must be >= 0")
     if min_minutes_to_expiry_for_new_entry < 0:
         raise ValueError("alpaca_options.runtime.min_minutes_to_expiry_for_new_entry must be >= 0")
+    close_order_sticky_seconds = int(runtime.get("close_order_sticky_seconds", 240))
+    close_order_max_replaces = int(runtime.get("close_order_max_replaces", 40))
+    close_order_max_wall_seconds = int(runtime.get("close_order_max_wall_seconds", 14400))
+    if close_order_sticky_seconds < 0:
+        raise ValueError("alpaca_options.runtime.close_order_sticky_seconds must be >= 0")
+    if close_order_max_replaces < 1:
+        raise ValueError("alpaca_options.runtime.close_order_max_replaces must be >= 1")
+    if close_order_max_wall_seconds < 60:
+        raise ValueError("alpaca_options.runtime.close_order_max_wall_seconds must be >= 60")
+    eod_evacuation_enabled = bool(runtime.get("eod_evacuation_enabled", True))
+    eod_evacuation_hhmm_local = str(runtime.get("eod_evacuation_hhmm_local", "12:20")).strip()
+    eod_evacuation_timezone = str(runtime.get("eod_evacuation_timezone", "America/Los_Angeles")).strip()
     order_qty = int(runtime.get("order_qty", 1))
     if order_qty <= 0:
         raise ValueError("alpaca_options.runtime.order_qty must be >= 1")
@@ -579,6 +602,12 @@ def load_alpaca_options_config(config_dir: str | Path = "config") -> AlpacaPutSp
         api_retry_attempts=api_retry_attempts,
         api_retry_backoff_seconds=api_retry_backoff_seconds,
         min_minutes_to_expiry_for_new_entry=min_minutes_to_expiry_for_new_entry,
+        close_order_sticky_seconds=close_order_sticky_seconds,
+        close_order_max_replaces=close_order_max_replaces,
+        close_order_max_wall_seconds=close_order_max_wall_seconds,
+        eod_evacuation_enabled=eod_evacuation_enabled,
+        eod_evacuation_hhmm_local=eod_evacuation_hhmm_local,
+        eod_evacuation_timezone=eod_evacuation_timezone,
         trade_window_timezone=trade_window_timezone,
         trade_window_start_time_local=trade_window_start_time_local,
         trade_window_end_time_local=trade_window_end_time_local,

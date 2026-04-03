@@ -521,6 +521,37 @@ def run_pipeline_cycle(
         except Exception:
             open_order_ids = set()
 
+        # Hourly: market_id changes every hour. Exit monitoring must still see filled rows from the prior
+        # event_id, and evaluate_exit needs a top-of-book for each registry ticker (not only current hour's
+        # event_markets). Enrich ctx.event_markets before strategies run.
+        if interval == "hourly" and kalshi_client:
+            try:
+                existing_tickers = {
+                    str(m.get("ticker") or "")
+                    for m in (ctx.event_markets or [])
+                    if isinstance(m, dict) and m.get("ticker")
+                }
+                need: set[str] = set()
+                for strat in strategies:
+                    for o in registry.get_orders_by_strategy(
+                        strat.strategy_id, interval, market_id=None, asset=asset, active_only=False
+                    ):
+                        st = (o.status or "").lower()
+                        fc = int(getattr(o, "filled_count", 0) or 0)
+                        if st in ("filled", "executed", "complete") or fc >= 1:
+                            t = str(o.ticker or "")
+                            if t and t not in existing_tickers:
+                                need.add(t)
+                for t in need:
+                    top = kalshi_client.get_top_of_book(t)
+                    if top and isinstance(top, dict):
+                        row = dict(top)
+                        row["ticker"] = t
+                        ctx.event_markets.append(row)
+                        existing_tickers.add(t)
+            except Exception as e:
+                logger.debug("[%s] [%s] Hourly event_markets exit enrichment skipped: %s", interval, asset.upper(), e)
+
         asset_intents: List[tuple] = []
         asset_exits: List[Any] = []
         for strat in strategies:
@@ -799,12 +830,23 @@ def run_pipeline_cycle(
                         pass
 
             # For exits, include filled orders too (not just resting).
-            my_orders = registry.get_orders_by_strategy(
-                strat.strategy_id, interval, market_id=market_id, asset=asset, active_only=False
-            )
-            exits = strat.evaluate_exit(ctx, my_orders)
+            # Hourly: do not scope registry rows to the current hour's market_id — filled positions keep the
+            # placement event_id, so a strict market_id filter drops them after the hour rolls and SL never runs.
+            if interval == "hourly":
+                my_orders_for_exit = registry.get_orders_by_strategy(
+                    strat.strategy_id, interval, market_id=None, asset=asset, active_only=False
+                )
+                my_orders_for_entry = registry.get_orders_by_strategy(
+                    strat.strategy_id, interval, market_id=market_id, asset=asset, active_only=False
+                )
+            else:
+                my_orders_for_exit = registry.get_orders_by_strategy(
+                    strat.strategy_id, interval, market_id=market_id, asset=asset, active_only=False
+                )
+                my_orders_for_entry = my_orders_for_exit
+            exits = strat.evaluate_exit(ctx, my_orders_for_exit)
             asset_exits.extend(exits)
-            intent = strat.evaluate_entry(ctx, my_orders=my_orders)
+            intent = strat.evaluate_entry(ctx, my_orders=my_orders_for_entry)
             if intent is not None:
                 asset_intents.append((intent, strat.strategy_id))
 
@@ -820,7 +862,11 @@ def run_pipeline_cycle(
                     o.count * (o.limit_price_cents or 99) for o in orders
                 )
         final_intents = aggregator.resolve_intents(
-            asset_intents, interval_slice, active_orders, current_cost_by_strategy
+            asset_intents,
+            interval_slice,
+            active_orders,
+            current_cost_by_strategy,
+            asset=asset,
         )
         # Exits run first inside execute_cycle; global cooldown (e.g. after stop-loss) is updated there,
         # so the next asset's evaluate_entry in a subsequent tick or the next market cycle will see it.

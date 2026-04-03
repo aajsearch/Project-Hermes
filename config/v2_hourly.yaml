@@ -15,7 +15,7 @@ hourly:
     # NOTE: doge often only has a range event; primary_only will effectively evaluate nothing for doge.
     event_mode_by_asset:
       btc: primary_only
-      eth: both
+      eth: primary_only
       sol: both
       xrp: both
       doge: range_only
@@ -28,11 +28,13 @@ hourly:
     # risk guards, and hourly exit criteria.
     hourly_signals_farthest:
       enabled: true
+      # Aligned with fifteen_min continuous_alpha_limit_99: limit buy at 99¢ once bid passes floor.
+      limit_price_cents: 99
       # Position sizing + spend cap (same idea as v2_fifteen_min.yaml)
-      order_count: { btc: 1, eth: 1, sol: 1, xrp: 1, doge: 1 }
-      max_cost_cents: 500
+      order_count: { btc: 50, eth: 25, sol: 1, xrp: 1, doge: 1 }
+      max_cost_cents: { btc: 50000, eth: 10000, sol: 500, xrp: 500, doge: 500 }
       # Max entry orders this strategy may place per (asset, hourly window).
-      max_orders_per_window: 10
+      max_orders_per_window: 20
       entry_window:
         late_window_minutes: 10
         late_interval_seconds: 10
@@ -47,8 +49,9 @@ hourly:
           sol: 50
           xrp: 1
           doge: 0.005
-        thresholds_yes: { min: 92, max: 98 }
-        thresholds_no: { min: 92, max: 98 }
+        # Min bid on chosen side before entry (YES >= 94, NO >= 95); max 99 matches limit-99 style band.
+        thresholds_yes: { min: 95, max: 98 }
+        thresholds_no: { min: 95, max: 98 }
 
       guards:
         enabled: true
@@ -67,8 +70,8 @@ hourly:
         distance_buffer:
           enabled: true
           assets:
-            btc: { pct: 0.025, floor_usd: 100 }
-            eth: { pct: 0.005, floor_usd: 50 }
+            btc: { pct: 0.0015, floor_usd: 90 }
+            eth: { pct: 0.0005, floor_usd: 9 }
         anchor_one_per_side:
           enabled: true
           lock_per_window: true
@@ -81,8 +84,9 @@ hourly:
           order_size_multiplier: 5
 
       exit:
-        stop_loss_pct: 0.30
-        panic_stop_loss_pct: 0.30
+        # Per filled position: if current bid for that side is down >= this vs entry bid, exit (after persistence if >1).
+        # Use either a fraction (0.20 = 20%) or percent points (20 = 20%) — same convention as fifteen_min-friendly configs.
+        stop_loss_pct: 0.20
         stop_loss_persistence_polls: 1
         evaluation_interval_seconds: 1
         hard_flip_exit:
