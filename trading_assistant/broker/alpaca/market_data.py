@@ -1,5 +1,6 @@
 import pandas as pd
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
@@ -7,12 +8,60 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 DEFAULT_FEED = "iex"
 
 
+class DataError(RuntimeError):
+    """Stock quote missing or unusable (e.g. zero bid/ask); do not trade on fabricated prices."""
+
+
+def _equity_root_symbol_or_raise(symbol: str) -> str:
+    """
+    Stock latest-quote API must receive root tickers only (e.g. AMZN, SPY), never OCC option symbols.
+    """
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        raise ValueError("underlying symbol must be non-empty")
+    if len(sym) > 5:
+        raise ValueError(f"invalid equity root symbol (len>5): {symbol!r}")
+    if any(ch.isdigit() for ch in sym):
+        raise ValueError(f"invalid equity root symbol (digits/OCC not allowed): {symbol!r}")
+    return sym
+
+
+def _quote_price_to_float(v) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    if x != x:  # NaN
+        return None
+    return x
+
+
 def get_latest_mid(stock_data, symbol: str, feed: str = DEFAULT_FEED) -> float:
-    req = StockLatestQuoteRequest(symbol_or_symbols=[symbol], feed=feed)
-    q = stock_data.get_stock_latest_quote(req)[symbol]
-    if q.bid_price and q.ask_price:
-        return (q.bid_price + q.ask_price) / 2.0
-    return float(q.ask_price or q.bid_price or 0.0)
+    sym = _equity_root_symbol_or_raise(symbol)
+    req = StockLatestQuoteRequest(symbol_or_symbols=[sym], feed=feed)
+    try:
+        quotes = stock_data.get_stock_latest_quote(req)
+    except Exception as e:
+        raise DataError(f"get_stock_latest_quote failed for {sym!r}: {e}") from e
+    if not isinstance(quotes, dict) or sym not in quotes:
+        raise DataError(f"empty or missing quote response for {sym!r}")
+    q = quotes[sym]
+    if q is None:
+        raise DataError(f"null quote object for {sym!r}")
+
+    bid = _quote_price_to_float(getattr(q, "bid_price", None))
+    ask = _quote_price_to_float(getattr(q, "ask_price", None))
+
+    if bid is not None and bid > 0 and ask is not None and ask > 0:
+        return (bid + ask) / 2.0
+    if bid is not None and bid > 0 and (ask is None or ask <= 0):
+        return float(bid)
+    if ask is not None and ask > 0 and (bid is None or bid <= 0):
+        return float(ask)
+
+    raise DataError(f"no usable bid/ask for {sym!r}: bid={bid!r} ask={ask!r}")
 
 
 def _parse_timeframe(timeframe: str) -> TimeFrame:

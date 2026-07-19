@@ -13,11 +13,14 @@ try:
 except ImportError:
     yaml = None  # type: ignore
 
-# Load .env so COINBASE_* are available
-from dotenv import load_dotenv
+# Load repo-root .env so COINBASE_* are available
 _script_dir = os.path.dirname(os.path.abspath(__file__))
-load_dotenv()  # cwd (e.g. when run from repo root)
-load_dotenv(os.path.join(_script_dir, "..", ".env"))  # repo root when run from coinbase_grid_bot/
+try:
+    from .env_utils import load_repo_env, resolve_repo_path  # type: ignore
+except ImportError:  # when executed as a script
+    from env_utils import load_repo_env, resolve_repo_path  # type: ignore  # noqa: E402
+
+load_repo_env()
 
 # Configure basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -69,7 +72,8 @@ def load_grid_config(config_path: Optional[str] = None) -> Tuple[Dict[str, Any],
     """
     if yaml is None:
         raise ImportError("PyYAML is required for config. Install with: pip install PyYAML")
-    path = config_path or os.environ.get("COINBASE_GRID_CONFIG") or os.path.join(_script_dir, "config.yaml")
+    env_path = resolve_repo_path(os.environ.get("COINBASE_GRID_CONFIG") or None)
+    path = config_path or env_path or os.path.join(_script_dir, "config.yaml")
     with open(path, "r") as f:
         data = yaml.safe_load(f) or {}
     common = data.get("common") or {}
@@ -315,7 +319,7 @@ class LiveCoinbaseGridClient:
         if RESTClient is None:
             raise ImportError("coinbase-advanced-py is required. Install with: pip install coinbase-advanced-py")
 
-        key_file = key_file or os.environ.get("COINBASE_KEY_FILE") or None
+        key_file = key_file or resolve_repo_path(os.environ.get("COINBASE_KEY_FILE") or None) or None
         key_file = key_file.strip() if isinstance(key_file, str) and key_file.strip() else None
         api_key = api_key or os.environ.get("COINBASE_API_KEY") or None
         api_secret = api_secret or os.environ.get("COINBASE_API_SECRET") or None
@@ -351,6 +355,46 @@ class LiveCoinbaseGridClient:
         resp = self._rest_client.get_public_product(product_id)
         return _get_price_from_product_response(resp)
 
+    def get_active_balance(self, account_uuid: Optional[str] = None) -> float:
+        """
+        Fast-path balance fetch via single-account endpoint.
+        Uses USD_ACCOUNT_UUID from .env when account_uuid is not provided.
+
+        Returns available balance as float (account.available_balance.value).
+        """
+        if not self._live_orders:
+            return float("inf")
+        account_uuid = (account_uuid or os.environ.get("USD_ACCOUNT_UUID") or "").strip() or None
+        if not account_uuid:
+            raise CoinbaseAPIError("USD_ACCOUNT_UUID is not set (needed for fast balance fetch).")
+        try:
+            resp = self._rest_client.get_account(account_uuid)
+            acc = (
+                getattr(resp, "account", None)
+                or (resp.get("account") if isinstance(resp, dict) else None)
+                or resp
+            )
+            # Optional safety: ensure account is in the configured trading portfolio (if provided).
+            trading_portfolio_id = (os.environ.get("TRADING_PORTFOLIO_ID") or "").strip() or None
+            if trading_portfolio_id:
+                acc_pid = getattr(acc, "retail_portfolio_id", None) or (
+                    acc.get("retail_portfolio_id") if isinstance(acc, dict) else None
+                )
+                if acc_pid and str(acc_pid) != trading_portfolio_id:
+                    raise CoinbaseAPIError(
+                        f"USD_ACCOUNT_UUID is in portfolio {acc_pid}, not TRADING_PORTFOLIO_ID={trading_portfolio_id}."
+                    )
+            ab = getattr(acc, "available_balance", None) or (acc.get("available_balance") if isinstance(acc, dict) else None)
+            val = getattr(ab, "value", None) if ab is not None and not isinstance(ab, dict) else (ab.get("value") if isinstance(ab, dict) else None)
+            try:
+                return float(val or 0)
+            except (TypeError, ValueError):
+                return 0.0
+        except HTTPError as e:
+            if e.response is not None and getattr(e.response, "status_code", None) == 429:
+                raise RateLimitError("API rate limit exceeded when fetching single account balance.") from e
+            raise CoinbaseAPIError(f"Failed to fetch account balance for {account_uuid}: {e}") from e
+
     def check_balances(self, product_id: str) -> Tuple[float, float]:
         """
         Fetch available balances for base and quote currency of product_id (e.g. SOL-USD).
@@ -362,10 +406,27 @@ class LiveCoinbaseGridClient:
         if len(parts) != 2:
             return (0.0, 0.0)
         base_currency, quote_currency = parts[0].strip(), parts[1].strip()
+        # Fast-path: if you already know the exact USD account UUID to trade from,
+        # avoid scanning /accounts. This is much faster and reduces rate-limit risk.
+        if quote_currency.upper() == "USD" and (os.environ.get("USD_ACCOUNT_UUID") or "").strip():
+            quote_available = self.get_active_balance()
+            # We intentionally do not scan for base balances here; if you need SELLs immediately,
+            # extend this with a BASE_ACCOUNT_UUID fast-path as well.
+            return (0.0, quote_available)
+
         base_available, quote_available = 0.0, 0.0
         try:
-            resp = self._rest_client.get_accounts(limit=250)
-            accounts = getattr(resp, "accounts", None) or []
+            accounts = []
+            cursor = None
+            while True:
+                resp = self._rest_client.get_accounts(limit=250, cursor=cursor)
+                page = getattr(resp, "accounts", None) or []
+                accounts.extend(page)
+                if not getattr(resp, "has_next", False):
+                    break
+                cursor = getattr(resp, "cursor", None)
+                if not cursor:
+                    break
             for acc in accounts:
                 currency = (getattr(acc, "currency", None) or "").upper()
                 if not currency:

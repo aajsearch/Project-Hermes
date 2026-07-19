@@ -1,0 +1,4 @@
+# MCP auth for headless monitor (never commit)
+
+Bearer JWT from Robinhood MCP OAuth.
+Obtain after `cursor agent mcp login robinhood-trading` — see MCP_AUTH.md.

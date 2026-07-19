@@ -33,6 +33,11 @@ logger = logging.getLogger(__name__)
 TELEMETRY_TABLE = "v2_telemetry_hourly_signals"
 SL_STATE_TABLE = "v2_hourly_sl_state"
 
+# Throttled stop-loss visibility: without per-ticker books persisted, we need periodic probes so
+# we can later prove whether SL threshold was never reached vs we were missing books/quotes.
+_SL_PROBE_LAST_TS: Dict[str, float] = {}  # order_id -> unix seconds
+_SL_PROBE_LAST_MISSING_TS: Dict[str, float] = {}  # order_id -> unix seconds (missing book/bid)
+
 
 def _v2_db_path() -> Path:
     return Path(__file__).resolve().parents[2].parent / "data" / "v2_state.db"
@@ -266,18 +271,27 @@ def _already_traded_tickers(my_orders: Optional[List[OrderRecord]]) -> set:
 
 
 def _get_current_bid_for_side(market: Dict[str, Any], side: str) -> Optional[int]:
-    try:
-        if side == "yes":
-            v = market.get("yes_bid")
-        else:
-            v = market.get("no_bid")
+    """Best bid for SL; mirrors entry path key fallbacks (event list vs orderbook REST)."""
+    keys = (
+        ["yes_bid", "yes_bid_price", "yes_bid_dollars"]
+        if str(side).lower() == "yes"
+        else ["no_bid", "no_bid_price", "no_bid_dollars"]
+    )
+    for k in keys:
+        v = market.get(k)
         if v is None:
-            return None
-        i = int(v)
-        # 0¢ bid is valid for SL (max drawdown vs entry); only None means missing quote.
+            continue
+        try:
+            f = float(v)
+        except Exception:
+            continue
+        if 0.0 <= f <= 1.0:
+            i = int(round(f * 100.0))
+        else:
+            i = int(round(f))
+        # 0¢ bid is valid for SL; only None means missing quote.
         return i
-    except Exception:
-        return None
+    return None
 
 
 def _sl_state_get(order_id: str) -> Tuple[int, float]:
@@ -319,6 +333,23 @@ def _sl_state_set(order_id: str, consecutive_polls: int) -> None:
     finally:
         conn.close()
 
+def _should_probe(order_id: str, every_seconds: float) -> bool:
+    now = float(time.time())
+    last = float(_SL_PROBE_LAST_TS.get(str(order_id), 0.0) or 0.0)
+    if now - last < float(every_seconds):
+        return False
+    _SL_PROBE_LAST_TS[str(order_id)] = now
+    return True
+
+
+def _should_probe_missing(order_id: str, every_seconds: float) -> bool:
+    now = float(time.time())
+    last = float(_SL_PROBE_LAST_MISSING_TS.get(str(order_id), 0.0) or 0.0)
+    if now - last < float(every_seconds):
+        return False
+    _SL_PROBE_LAST_MISSING_TS[str(order_id)] = now
+    return True
+
 
 class HourlySignalsFarthestStrategy(BaseV2Strategy):
     def __init__(self, config: dict) -> None:
@@ -329,7 +360,8 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
         if not cfg.get("enabled", False):
             return None
         sec_to_close = float(ctx.seconds_to_close or 0.0)
-        logger.info(
+        # Noise control: per-tick telemetry should be DEBUG; INFO reserved for placements and exits.
+        logger.debug(
             "[hourly_signals_v2_tick] [%s] sec_to_close=%.0f enabled=true",
             (ctx.asset or "").upper(),
             sec_to_close,
@@ -339,7 +371,7 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
             max_orders_per_window = 1
         # Cap entry rate per (window, asset) for this strategy.
         if my_orders and len(my_orders) >= max_orders_per_window:
-            logger.info(
+            logger.debug(
                 "[hourly_signals_v2_tick] [%s] skip=max_orders_per_window open_orders=%s cap=%s",
                 (ctx.asset or "").upper(),
                 len(my_orders or []),
@@ -349,7 +381,7 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
         ew = cfg.get("entry_window") or {}
         late_window_minutes = _parse_float(ew.get("late_window_minutes"), 20.0)
         if (sec_to_close / 60.0) > late_window_minutes:
-            logger.info(
+            logger.debug(
                 "[hourly_signals_v2_tick] [%s] skip=outside_late_window sec_to_close=%.0f late_window_minutes=%.1f",
                 (ctx.asset or "").upper(),
                 sec_to_close,
@@ -357,7 +389,7 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
             )
             return None
         if ctx.spot is None:
-            logger.info(
+            logger.debug(
                 "[hourly_signals_v2_tick] [%s] skip=spot_none",
                 (ctx.asset or "").upper(),
             )
@@ -426,7 +458,7 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
                     bid_yes_in_band += 1
                 if no_lo <= nb <= no_hi:
                     bid_no_in_band += 1
-            logger.info(
+            logger.debug(
                 "[hourly_signals_v2_tick] [%s] skip=no_signals quotes=%s sec_to_close=%.0f "
                 "yes_band=[%s,%s] no_band=[%s,%s] "
                 "ask_in_band(yes=%s,no=%s) bid_in_band(yes=%s,no=%s) "
@@ -499,7 +531,7 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
                     if strike_v > 0:
                         expected_side = "yes" if float(spot) > strike_v else "no" if float(spot) < strike_v else side
                         if side != expected_side:
-                            logger.info(
+                            logger.debug(
                                 "[hourly_signals_v2_tick] [%s] skip=direction_mismatch ticker=%s strike=%.2f spot=%.2f chosen=%s expected=%s",
                                 (ctx.asset or "").upper(),
                                 str(s.ticker),
@@ -528,7 +560,7 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
                 if min_dist_required is not None:
                     distance_dir = (float(spot) - strike_v) if side == "yes" else (strike_v - float(spot))
                     if distance_dir < float(min_dist_required):
-                        logger.info(
+                        logger.debug(
                             "[hourly_signals_v2_tick] [%s] skip=distance_buffer ticker=%s side=%s strike=%.2f spot=%.2f distance=%.2f min_required=%.2f",
                             (ctx.asset or "").upper(),
                             str(s.ticker),
@@ -560,7 +592,7 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
             bid_hi = int(thresholds.get("yes_max")) if side == "yes" else int(thresholds.get("no_max"))
             chosen_bid_for_gate = int(placement_bid or 0)
             if chosen_bid_for_gate <= 0 or chosen_bid_for_gate < bid_lo or chosen_bid_for_gate > bid_hi:
-                logger.info(
+                logger.debug(
                     "[hourly_signals_v2_tick] [%s] skip=chosen_bid_out_of_band ticker=%s side=%s bid=%s band=[%s,%s]",
                     (ctx.asset or "").upper(),
                     str(s.ticker),
@@ -671,6 +703,14 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
         stop_loss_frac = _parse_float(exit_cfg.get("stop_loss_pct"), 0.20)
         if stop_loss_frac > 1.0:
             stop_loss_frac = stop_loss_frac / 100.0
+        sl_limit_offset_cents = _parse_int(exit_cfg.get("stop_loss_limit_offset_cents"), 10)
+        if sl_limit_offset_cents < 0:
+            sl_limit_offset_cents = 0
+        # How often to emit stop-loss probe telemetry for filled orders (seconds).
+        # This does NOT change SL behavior; it only adds visibility.
+        probe_every_s = _parse_float(exit_cfg.get("evaluation_interval_seconds"), 10.0)
+        if probe_every_s <= 0:
+            probe_every_s = 10.0
         persistence = _parse_int(exit_cfg.get("stop_loss_persistence_polls"), 1)
         if persistence < 1:
             persistence = 1
@@ -683,6 +723,8 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
 
         exits: List[ExitAction] = []
         window_id = f"{ctx.interval}_{logical_window_slot(ctx.market_id)}"
+        sec_to_close = float(ctx.seconds_to_close or 0.0)
+        ctx_mid = str(ctx.market_id or "")
 
         for o in my_orders:
             # Match continuous_alpha_limit_99 (last_90s): treat partial fills as eligible for SL monitoring.
@@ -696,12 +738,51 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
             side = str(o.side or "").lower()
             if side not in ("yes", "no"):
                 continue
+            # Only monitor SL for fills in the *current* hourly event (run_unified scopes registry; this is defense-in-depth).
+            if str(getattr(o, "market_id", "") or "") != ctx_mid:
+                continue
 
             mkt = by_ticker.get(t)
             if not mkt:
+                if _should_probe_missing(str(o.order_id), probe_every_s):
+                    logger.info(
+                        "[hourly_signals_v2_sl_probe] [%s] missing_book order_id=%s ticker=%s side=%s sec_to_close=%.0f",
+                        (ctx.asset or "").upper(),
+                        str(o.order_id),
+                        t,
+                        side,
+                        sec_to_close,
+                    )
+                    _log_telemetry(
+                        window_id=window_id,
+                        asset=ctx.asset,
+                        action="exit_check",
+                        ticker=t,
+                        side=side,
+                        reason="sl_missing_book",
+                        details={"order_id": str(o.order_id), "sec_to_close": sec_to_close},
+                    )
                 continue
             cur_bid = _get_current_bid_for_side(mkt, side)
             if cur_bid is None:
+                if _should_probe_missing(str(o.order_id), probe_every_s):
+                    logger.info(
+                        "[hourly_signals_v2_sl_probe] [%s] missing_bid order_id=%s ticker=%s side=%s sec_to_close=%.0f",
+                        (ctx.asset or "").upper(),
+                        str(o.order_id),
+                        t,
+                        side,
+                        sec_to_close,
+                    )
+                    _log_telemetry(
+                        window_id=window_id,
+                        asset=ctx.asset,
+                        action="exit_check",
+                        ticker=t,
+                        side=side,
+                        reason="sl_missing_bid",
+                        details={"order_id": str(o.order_id), "sec_to_close": sec_to_close},
+                    )
                 continue
             entry_bid = (
                 o.entry_fill_price_cents
@@ -712,13 +793,51 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
                 continue
 
             loss_frac = max(0.0, float(entry_bid - cur_bid) / float(entry_bid))
+            if _should_probe(str(o.order_id), probe_every_s):
+                logger.info(
+                    "[hourly_signals_v2_sl_probe] [%s] order_id=%s ticker=%s side=%s sec_to_close=%.0f "
+                    "entry_bid=%s cur_bid=%s loss_frac=%.4f sl_threshold=%.4f",
+                    (ctx.asset or "").upper(),
+                    str(o.order_id),
+                    t,
+                    side,
+                    sec_to_close,
+                    entry_bid,
+                    cur_bid,
+                    loss_frac,
+                    stop_loss_frac,
+                )
+                _log_telemetry(
+                    window_id=window_id,
+                    asset=ctx.asset,
+                    action="exit_check",
+                    ticker=t,
+                    side=side,
+                    reason="sl_probe",
+                    details={
+                        "order_id": str(o.order_id),
+                        "sec_to_close": sec_to_close,
+                        "entry_bid": int(entry_bid),
+                        "cur_bid": int(cur_bid),
+                        "loss_frac": float(loss_frac),
+                        "sl_threshold": float(stop_loss_frac),
+                    },
+                )
             if loss_frac < stop_loss_frac:
                 if persistence > 1:
                     _sl_state_set(o.order_id, 0)
                 continue
 
+            sl_limit_cents = max(1, int(cur_bid) - int(sl_limit_offset_cents))
             if persistence <= 1:
-                exits.append(ExitAction(order_id=str(o.order_id), action="stop_loss", reason="stop_loss"))
+                exits.append(
+                    ExitAction(
+                        order_id=str(o.order_id),
+                        action="stop_loss",
+                        reason="stop_loss",
+                        limit_price_cents=int(sl_limit_cents),
+                    )
+                )
                 logger.info(
                     "[hourly_signals_v2_sl] [%s] order_id=%s ticker=%s side=%s reason=stop_loss bid_down>=%.0f%% entry_bid=%s cur_bid=%s loss_frac=%.4f",
                     (ctx.asset or "").upper(),
@@ -750,6 +869,7 @@ class HourlySignalsFarthestStrategy(BaseV2Strategy):
                         order_id=str(o.order_id),
                         action="stop_loss",
                         reason=f"stop_loss_persist_{nxt}",
+                        limit_price_cents=int(sl_limit_cents),
                     )
                 )
                 logger.info(

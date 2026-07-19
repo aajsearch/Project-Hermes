@@ -118,7 +118,16 @@ def main() -> None:
     strat_hourly_regular = HourlySignalsFarthestStrategy(config)
 
     fifteen_min_strats = [strat_last90s, strat_knife_catcher, strat_atm]
-    hourly_strats: list = [strat_hourly_last90s, strat_hourly_regular]
+    hourly_strats: list = []
+    _hourly_blocks = (config.get("hourly") or {}).get("strategies") or {}
+    for _hs in (strat_hourly_last90s, strat_hourly_regular):
+        _blk = _hourly_blocks.get(_hs.strategy_id) if isinstance(_hourly_blocks, dict) else None
+        if isinstance(_blk, dict) and _blk.get("enabled", False):
+            hourly_strats.append(_hs)
+    if not hourly_strats:
+        logger.warning(
+            "No hourly strategies have enabled: true in hourly.strategies; hourly pipeline will not evaluate strategies"
+        )
 
     def run_interval_loop(
         interval: str,

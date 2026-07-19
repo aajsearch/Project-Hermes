@@ -67,7 +67,7 @@ from bot.alpaca_put_spread.state import (
 )
 from bot.alpaca_put_spread.strategy_types import StrategyType
 
-from trading_assistant.broker.alpaca.market_data import get_latest_mid
+from trading_assistant.broker.alpaca.market_data import DataError, get_latest_mid
 from trading_assistant.broker.alpaca.positions import list_open_positions
 
 
@@ -966,7 +966,11 @@ class AlpacaPutSpreadRunner:
         if pending_close:
             return self._poll_pending_close(underlying, open_spread, strategy_type, pending_close, ec)
 
-        underlying_mid = get_latest_mid(self.stock_data_client, underlying)
+        try:
+            underlying_mid = get_latest_mid(self.stock_data_client, underlying)
+        except (ValueError, DataError) as e:
+            logger.warning("[%s][%s] skip close cycle: invalid or unavailable spot (%s)", underlying, strategy_type, e)
+            return False
         if underlying_mid <= 0:
             return False
 
@@ -1424,8 +1428,36 @@ class AlpacaPutSpreadRunner:
             logger.info("[%s][%s] cooldown active", underlying, strategy_type)
             return
 
-        underlying_mid = get_latest_mid(self.stock_data_client, underlying)
+        try:
+            underlying_mid = get_latest_mid(self.stock_data_client, underlying)
+        except (ValueError, DataError) as e:
+            logger.warning(
+                "[%s][%s] skip entry: underlying spot unavailable (%s)",
+                underlying,
+                strategy_type,
+                e,
+            )
+            log_event(
+                "skip_entry_no_spot",
+                str(e),
+                underlying=underlying,
+                extra={"strategy_type": strategy_type},
+            )
+            return
         spot = underlying_mid if underlying_mid and underlying_mid > 0 else None
+        if spot is None:
+            logger.warning(
+                "[%s][%s] skip entry: missing underlying spot (mid quote unavailable)",
+                underlying,
+                strategy_type,
+            )
+            log_event(
+                "skip_entry_no_spot",
+                "missing underlying spot",
+                underlying=underlying,
+                extra={"strategy_type": strategy_type},
+            )
+            return
 
         candidate: Any = None
         entry_legs: List[Dict[str, Any]] = []
@@ -1551,7 +1583,38 @@ class AlpacaPutSpreadRunner:
         snap["order_id"] = order_id
         set_nested(self.state, PENDING_ENTRY, underlying, strategy_type, snap)
         save_state(self.state)
-        logger.info("[%s][%s] Submitted entry order_id=%s", underlying, strategy_type, order_id)
+        spot_for_log = spot
+        if strategy_type == _STRATEGY_PCS:
+            try:
+                min_otm = float(self.cfg.put_credit_spread.min_short_otm_percent)
+            except Exception:
+                min_otm = 0.0
+            max_short = (
+                float(spot_for_log) * (1.0 - float(min_otm))
+                if spot_for_log is not None and float(spot_for_log) > 0 and float(min_otm) > 0
+                else None
+            )
+            logger.info(
+                "[%s][%s] Submitted entry order_id=%s spot=%.4f short=%s(K=%.2f) long=%s(K=%.2f) min_short_otm_percent=%.4f max_short=%.2f",
+                underlying,
+                strategy_type,
+                order_id,
+                float(spot_for_log) if spot_for_log is not None else float("nan"),
+                getattr(candidate, "short_put_symbol", None),
+                float(getattr(candidate, "short_strike", 0.0) or 0.0),
+                getattr(candidate, "long_put_symbol", None),
+                float(getattr(candidate, "long_strike", 0.0) or 0.0),
+                float(min_otm),
+                float(max_short) if max_short is not None else float("nan"),
+            )
+        else:
+            logger.info(
+                "[%s][%s] Submitted entry order_id=%s spot=%.4f",
+                underlying,
+                strategy_type,
+                order_id,
+                float(spot_for_log) if spot_for_log is not None else float("nan"),
+            )
 
     def _complete_entry_fill(
         self,
@@ -1579,7 +1642,16 @@ class AlpacaPutSpreadRunner:
         if recalc is not None:
             entry_credit_mid = float(recalc)
 
-        underlying_mid = get_latest_mid(self.stock_data_client, underlying)
+        try:
+            underlying_mid = get_latest_mid(self.stock_data_client, underlying)
+        except (ValueError, DataError) as e:
+            logger.warning(
+                "[%s][%s] entry fill: spot unavailable; spread will omit entry_underlying_mid (%s)",
+                underlying,
+                strategy_type,
+                e,
+            )
+            underlying_mid = None
         try:
             um = float(underlying_mid) if underlying_mid else 0.0
         except (TypeError, ValueError):

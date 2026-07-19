@@ -61,7 +61,7 @@ from core.state_store import (
 from core.ledger import append_trade, SKIP_COOLDOWN, SKIP_PENDING_ORDER, SKIP_ALREADY_HOLDING, SKIP_NEAR_OPEN, SKIP_KILL_SWITCH, SKIP_PORTFOLIO_LOCK, SKIP_MAX_POSITION, SKIP_MAX_BUYS_CYCLE, SKIP_MAX_BUYS_HOUR
 
 from core.risk import compute_qty_from_notional, should_exit_position, is_in_cooldown, skip_near_open
-from broker.alpaca.market_data import get_bars_df, get_latest_mid
+from broker.alpaca.market_data import DataError, get_bars_df, get_latest_mid
 from broker.alpaca.positions import get_open_position_qty
 from broker.alpaca.orders import submit_market_order, wait_for_order
 
@@ -221,7 +221,10 @@ def _compute_portfolio_invested_and_pnl(
                 if broker_qty <= 0:
                     continue
                 invested += entry * broker_qty
-                mid = _safe_float(get_latest_mid(stock_data_client, sym), 0.0)
+                try:
+                    mid = _safe_float(get_latest_mid(stock_data_client, sym), 0.0)
+                except (ValueError, DataError):
+                    mid = 0.0
                 if mid > 0:
                     unrealized += (mid - entry) * broker_qty
             elif pos.asset_type == "OPTION" or key.startswith("OPT:"):
@@ -361,7 +364,10 @@ def reconcile_equity_positions_from_broker(state, trading_client, stock_data_cli
                 continue
 
             if st_pos is None or _safe_float(st_pos.qty) != broker_qty:
-                px = _safe_float(get_latest_mid(stock_data_client, sym) or 0.0, 0.0)
+                try:
+                    px = _safe_float(get_latest_mid(stock_data_client, sym) or 0.0, 0.0)
+                except (ValueError, DataError):
+                    px = 0.0
                 set_position(state, sym, Position(
                     asset_type="EQUITY",
                     key=sym,
@@ -515,7 +521,10 @@ def run_cycle(stock_data_client, trading_client, option_data_client, watchlist_c
                 log(f"{sym}: SKIP {SKIP_COOLDOWN} until {cd.get('until')}")
                 continue
 
-            price = _safe_float(get_latest_mid(stock_data_client, sym), 0.0)
+            try:
+                price = _safe_float(get_latest_mid(stock_data_client, sym), 0.0)
+            except (ValueError, DataError):
+                price = 0.0
             pos = get_position(state, sym)
             broker_qty = _safe_float(get_open_position_qty(trading_client, sym), 0.0)
 
@@ -806,7 +815,10 @@ def run_cycle(stock_data_client, trading_client, option_data_client, watchlist_c
                                     contract_type=ctype,
                                 ))
                                 init_mfe_mae_tracker(state, _opt_key(und), filled_avg)
-                                underlying_price = _safe_float(get_latest_mid(stock_data_client, und), 0.0)
+                                try:
+                                    underlying_price = _safe_float(get_latest_mid(stock_data_client, und), 0.0)
+                                except (ValueError, DataError):
+                                    underlying_price = 0.0
                                 opt_snapshot = _option_entry_snapshot(best, profile_name, und, underlying_price, contract_type=ctype)
                                 append_trade(now_iso(), best.symbol, "BUY", filled_qty, filled_avg, STRATEGY_VERSION, profile_name, sig.reason, "", asset_type="OPTION", entry_snapshot_json=opt_snapshot, contract_type=ctype)
                                 append_buy_time(state)

@@ -15,9 +15,20 @@ cdp_api_key-*.json
 *.db
 logs/
 .venv/
+venv/
 data/
 reports/
 console.log
+__pycache__/
+*.pyc
+.DS_Store
+.pycache/
+robinhood_agentic/monitor/monitor.log
+robinhood_agentic/monitor/session_state.json
+robinhood_agentic/monitor/.mcp_access_token
+robinhood_agentic/monitor/LIVE_STATUS.md
+robinhood_agentic/monitor/latest_status.json
+robinhood_agentic/monitor/dashboard.html
 
 # --- Optional: uncomment to ignore local exports ---
 # *.csv

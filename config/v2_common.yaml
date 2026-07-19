@@ -12,8 +12,8 @@ dry_run: false
 
 intervals:
   fifteen_min:
-    enabled: true
-    assets: [btc, eth, sol, xrp]
+    enabled: false
+    assets: [btc]
     mode: TRADE
   hourly:
     enabled: true

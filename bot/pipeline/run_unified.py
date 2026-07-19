@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -229,18 +231,26 @@ def run_pipeline_cycle(
             window_key = f"{interval}_{_logical_window_slot(current_window_id)}"
             logger.info("[TICK_LOG] Start of window: window_id=%s (market_id=%s)", window_key, current_window_id)
 
-    for asset in assets:
-        asset = str(asset).strip().lower()
+    interval_pipeline = (config.get(interval) or {}).get("pipeline") or {}
+    try:
+        parallel_workers = max(1, int(interval_pipeline.get("parallel_asset_workers", 1) or 1))
+    except (TypeError, ValueError):
+        parallel_workers = 1
+    use_parallel_hourly = interval == "hourly" and parallel_workers > 1
+    tick_parallel_lock = threading.Lock() if use_parallel_hourly else None
+
+    assets_to_run: List[str] = []
+    for _raw in assets:
+        _a = str(_raw).strip().lower()
         if interval == "hourly":
             ff = config.get("feature_flags") or {}
             v2h = ff.get("v2_hourly") if isinstance(ff, dict) else None
             enabled_assets = (v2h or {}).get("enabled_assets", []) if isinstance(v2h, dict) else []
             if isinstance(enabled_assets, list) and enabled_assets:
-                allow = {str(a).strip().lower() for a in enabled_assets if str(a).strip()}
-                if asset not in allow:
+                allow = {str(x).strip().lower() for x in enabled_assets if str(x).strip()}
+                if _a not in allow:
                     continue
             else:
-                # Default safe: hourly does nothing unless enabled_assets is non-empty.
                 global _hourly_feature_flag_logged
                 if not _hourly_feature_flag_logged:
                     logger.info(
@@ -249,8 +259,11 @@ def run_pipeline_cycle(
                     _hourly_feature_flag_logged = True
                 continue
         if not kalshi_client:
-            logger.warning("[%s] [%s] No Kalshi client, skipping asset", interval, asset.upper())
+            logger.warning("[%s] [%s] No Kalshi client, skipping asset", interval, _a.upper())
             continue
+        assets_to_run.append(_a)
+
+    def _run_pipeline_asset(asset: str) -> None:
         try:
             market_source = "REST"
             markets: Optional[List[Dict[str, Any]]] = None
@@ -368,11 +381,11 @@ def run_pipeline_cycle(
                                 pass
             if not market or not isinstance(market, dict):
                 logger.warning("[%s] [%s] No active market, skipping asset", interval, asset.upper())
-                continue
+                return
             ticker = market.get("ticker")
             if not ticker:
                 logger.warning("[%s] [%s] Market missing ticker, skipping asset", interval, asset.upper())
-                continue
+                return
             close_ts = _close_ts_from_market(market)
             if close_ts is not None:
                 now_ts = int(datetime.now(timezone.utc).timestamp())
@@ -385,7 +398,7 @@ def run_pipeline_cycle(
                 seconds_to_close = max(0.0, mins * 60.0) if mins is not None else None
             if seconds_to_close is None or seconds_to_close < 0:
                 logger.warning("[%s] [%s] Invalid seconds_to_close=%s, skipping asset", interval, asset.upper(), seconds_to_close)
-                continue
+                return
             quote_source = "REST"
             if use_kalshi_ws:
                 try:
@@ -415,7 +428,7 @@ def run_pipeline_cycle(
                 top = kalshi_client.get_top_of_book(ticker)
             if not top or not isinstance(top, dict):
                 logger.warning("[%s] [%s] Orderbook fetch failed, skipping asset", interval, asset.upper())
-                continue
+                return
             quote: Dict[str, int] = {
                 "yes_bid": int(top.get("yes_bid") or 0),
                 "yes_ask": int(top.get("yes_ask") or 0),
@@ -446,7 +459,7 @@ def run_pipeline_cycle(
             market_data = market
         except Exception as e:
             logger.warning("[%s] [%s] Fetch error, skipping asset: %s", interval, asset.upper(), e)
-            continue
+            return
 
         ctx = data_layer.build_context(
             interval=interval,
@@ -466,23 +479,36 @@ def run_pipeline_cycle(
                 "[%s] [%s] Distance is None (no strike or spot), skipping asset — strike=%s spot=%s",
                 interval, asset.upper(), ctx.strike, ctx.spot,
             )
-            continue
+            return
         if interval != "fifteen_min" and ctx.spot is None:
             logger.warning("[%s] [%s] Spot is None, skipping asset (hourly requires spot)", interval, asset.upper())
-            continue
+            return
 
         # Tick logger: one row per asset per window (tick history as JSON). Use logical slot so all assets share same window key.
         if tick_logger is not None:
             window_id = f"{interval}_{_logical_window_slot(market_id)}"
-            tick_logger.record_tick(
-                window_id=window_id,
-                asset=asset,
-                sec=float(ctx.seconds_to_close),
-                yes_bid=int(ctx.quote.get("yes_bid") or 0),
-                no_bid=int(ctx.quote.get("no_bid") or 0),
-                strike=float(ctx.strike) if ctx.strike is not None else None,
-                spot=float(ctx.spot) if ctx.spot is not None else None,
-            )
+            _tl = tick_parallel_lock
+            if _tl is not None:
+                with _tl:
+                    tick_logger.record_tick(
+                        window_id=window_id,
+                        asset=asset,
+                        sec=float(ctx.seconds_to_close),
+                        yes_bid=int(ctx.quote.get("yes_bid") or 0),
+                        no_bid=int(ctx.quote.get("no_bid") or 0),
+                        strike=float(ctx.strike) if ctx.strike is not None else None,
+                        spot=float(ctx.spot) if ctx.spot is not None else None,
+                    )
+            else:
+                tick_logger.record_tick(
+                    window_id=window_id,
+                    asset=asset,
+                    sec=float(ctx.seconds_to_close),
+                    yes_bid=int(ctx.quote.get("yes_bid") or 0),
+                    no_bid=int(ctx.quote.get("no_bid") or 0),
+                    strike=float(ctx.strike) if ctx.strike is not None else None,
+                    spot=float(ctx.spot) if ctx.spot is not None else None,
+                )
         # Dynamic float precision by asset: BTC/ETH 2, SOL 3, XRP 5
         _ndp = 2 if asset in ("btc", "eth") else 3 if asset == "sol" else 5 if asset == "xrp" else 2
         def _fmt(v: Any) -> str:
@@ -499,7 +525,8 @@ def run_pipeline_cycle(
         spot_str = ctx.spot_source
         if ctx.spot_source == "WS" and ctx.spot_age_s is not None:
             spot_str = "WS (%.1fs)" % ctx.spot_age_s
-        logger.info(
+        # Noise control: this is a per-tick snapshot; keep at DEBUG.
+        logger.debug(
             "[V2 DATA] %s | market=%s quote=%s spot_src=%s | Strike: %s (%s) | Spot: %s | Dist: %s",
             asset.upper(),
             market_source,
@@ -521,34 +548,42 @@ def run_pipeline_cycle(
         except Exception:
             open_order_ids = set()
 
-        # Hourly: market_id changes every hour. Exit monitoring must still see filled rows from the prior
-        # event_id, and evaluate_exit needs a top-of-book for each registry ticker (not only current hour's
-        # event_markets). Enrich ctx.event_markets before strategies run.
+        # Hourly: merge REST orderbook top-of-book into ctx.event_markets for every filled order ticker
+        # in the *current* window only. Event list responses often omit yes_bid/no_bid; we used to only
+        # fetch top for tickers *missing* from the list, so strikes already listed kept null bids and
+        # evaluate_exit saw sl_missing_bid forever.
         if interval == "hourly" and kalshi_client:
             try:
-                existing_tickers = {
-                    str(m.get("ticker") or "")
-                    for m in (ctx.event_markets or [])
-                    if isinstance(m, dict) and m.get("ticker")
-                }
-                need: set[str] = set()
+                tickers_with_fills: set[str] = set()
                 for strat in strategies:
                     for o in registry.get_orders_by_strategy(
-                        strat.strategy_id, interval, market_id=None, asset=asset, active_only=False
+                        strat.strategy_id, interval, market_id=market_id, asset=asset, active_only=False
                     ):
                         st = (o.status or "").lower()
                         fc = int(getattr(o, "filled_count", 0) or 0)
                         if st in ("filled", "executed", "complete") or fc >= 1:
                             t = str(o.ticker or "")
-                            if t and t not in existing_tickers:
-                                need.add(t)
-                for t in need:
+                            if t:
+                                tickers_with_fills.add(t)
+                for t in tickers_with_fills:
                     top = kalshi_client.get_top_of_book(t)
-                    if top and isinstance(top, dict):
+                    if not top or not isinstance(top, dict):
+                        continue
+                    merged = False
+                    for m in ctx.event_markets or []:
+                        if not isinstance(m, dict):
+                            continue
+                        if str(m.get("ticker") or "") != t:
+                            continue
+                        for k in ("yes_bid", "no_bid", "yes_ask", "no_ask"):
+                            v = top.get(k)
+                            if v is not None:
+                                m[k] = v
+                        merged = True
+                    if not merged:
                         row = dict(top)
                         row["ticker"] = t
                         ctx.event_markets.append(row)
-                        existing_tickers.add(t)
             except Exception as e:
                 logger.debug("[%s] [%s] Hourly event_markets exit enrichment skipped: %s", interval, asset.upper(), e)
 
@@ -830,11 +865,11 @@ def run_pipeline_cycle(
                         pass
 
             # For exits, include filled orders too (not just resting).
-            # Hourly: do not scope registry rows to the current hour's market_id — filled positions keep the
-            # placement event_id, so a strict market_id filter drops them after the hour rolls and SL never runs.
+            # Hourly: only evaluate exits for orders in the *active* event window (current market_id).
+            # When the clock rolls to the next hour, prior-window fills are not monitored here.
             if interval == "hourly":
                 my_orders_for_exit = registry.get_orders_by_strategy(
-                    strat.strategy_id, interval, market_id=None, asset=asset, active_only=False
+                    strat.strategy_id, interval, market_id=market_id, asset=asset, active_only=False
                 )
                 my_orders_for_entry = registry.get_orders_by_strategy(
                     strat.strategy_id, interval, market_id=market_id, asset=asset, active_only=False
@@ -878,3 +913,12 @@ def run_pipeline_cycle(
             asset,
             ticker=ticker,
         )
+    if use_parallel_hourly and len(assets_to_run) > 1:
+        max_w = min(parallel_workers, len(assets_to_run))
+        with ThreadPoolExecutor(max_workers=max_w) as _pool:
+            futs = [_pool.submit(_run_pipeline_asset, a) for a in assets_to_run]
+            for _f in as_completed(futs):
+                _f.result()
+    else:
+        for asset in assets_to_run:
+            _run_pipeline_asset(asset)

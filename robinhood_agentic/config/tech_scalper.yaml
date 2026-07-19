@@ -1,0 +1,114 @@
+# Tech / semi / MAG7 / AI micro-swing — Robinhood Agentic (MCP-driven)
+# See: prompts/tech_scalper.md and docs/TECH_SCALPER_STRATEGY.md
+
+account:
+  nickname: Agentic
+  budget_usd: 500
+  reserve_usd: 50
+  timezone_reference: America/New_York
+
+portfolio:
+  # HARD RULE: only one playbook (tech / lev ETF / options) live per calendar day on this account.
+  one_playbook_per_day: true
+
+position_sizing:
+  target_notional_usd: 100
+  max_concurrent: 2          # raise to 3–4 after 50+ trades with WR proof
+  cooldown_minutes_after_sl: 30
+  max_stop_losses_per_day: 5
+
+entry:
+  # Whole-share ONLY if mid <= min(target_notional_usd, buying_power - reserve) — never up to full BP.
+  prefer_whole_shares: true
+  whole_share_max_qty: 1
+  limit_entry_offset_bps: 5
+  fractional_fallback: market
+  # Pilot: false = whole-share path only (broker SL + synthetic TP via monitor).
+  allow_fractional_live: false
+
+scalp:
+  profit_target_pct: 0.006
+  stop_loss_pct: 0.0045
+  stop_loss_clear_bps: 15
+  hard_flat_time_et: "15:55"
+  no_new_entry_after_et: "15:30"
+  no_new_entry_before_et: "09:45"
+  poll_seconds: 15
+  require_post_fill_refresh: true
+  cancel_open_sell_before_exit: true
+  # On synthetic TP: cancel resting broker SL before market sell (no OCO on Robinhood).
+  cancel_sibling_order_on_exit_fill: true
+
+settlement:
+  gfv_safe_mode: true
+  # Subtract pending_deposits from usable BP before sizing (agent reads get_portfolio).
+
+selection:
+  market_hours: regular_hours
+  max_spread_pct: 0.0015
+  max_spread_usd: 0.25
+  min_price_usd: 15
+  min_abs_day_change_pct: 0.003
+  max_abs_day_change_pct: 0.008
+  max_active_symbols: 2
+  quote_batch_size: 20
+  # Full 33-name watchlist from day 1; core_symbols rank higher, deprioritize rank lower.
+  pilot_core_only: false
+  core_symbols:
+    - QQQ
+    - XLK
+    - AAPL
+    - MSFT
+  deprioritize_symbols:
+    - ARKK
+    - SMCI
+    - MDB
+    - SNOW
+    - MU
+    - NVDA
+    - TSLA
+  event_blackout:
+    earnings_day: true
+    fomc_cpi_nfp_morning: true
+
+watchlist:
+  mag7:
+    - AAPL
+    - MSFT
+    - GOOGL
+    - AMZN
+    - META
+    - NVDA
+    - TSLA
+  semiconductor:
+    - AMD
+    - AVGO
+    - QCOM
+    - MU
+    - INTC
+    - AMAT
+    - LRCX
+    - TSM
+    - MRVL
+    - KLAC
+  ai_data:
+    - PLTR
+    - ARM
+    - SMCI
+    - SNOW
+    - MDB
+  enterprise_cloud:
+    - CRM
+    - ORCL
+    - NFLX
+  cybersecurity:
+    - PANW
+    - CRWD
+  platform:
+    - DASH
+  etfs:
+    - QQQ
+    - XLK
+    - SOXX
+    - SMH
+    - ARKK

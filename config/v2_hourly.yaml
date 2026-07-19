@@ -1,7 +1,10 @@
 # V2 hourly: pipeline + strategies (strict schema)
 hourly:
   pipeline:
-    run_interval_seconds: 10
+    # Sleep after each full multi-asset cycle (not per asset). Use 0 to avoid an extra fixed delay.
+    run_interval_seconds: 0
+    # When >1, hourly runs BTC/ETH (etc.) in parallel threads so cycle wall time is closer to one asset’s fetch cost.
+    parallel_asset_workers: 2
     # For hourly events, Kalshi often has multiple event tickers per asset:
     # - primary (above/below)
     # - range (bucketed band)
@@ -19,9 +22,9 @@ hourly:
       sol: both
       xrp: both
       doge: range_only
-    # Priority order when multiple hourly strategies emit intents on the same tick.
-    # Put last-window strategy first so it wins during the closing seconds.
-    strategy_priority: [hourly_last_90s_limit_99, hourly_signals_farthest]
+    # Priority when multiple strategies emit on the same tick (first wins). If you enable hourly_last_90s_limit_99,
+    # list it first so it wins in the final seconds: [hourly_last_90s_limit_99, hourly_signals_farthest]
+    strategy_priority: [hourly_signals_farthest]
 
   strategies:
     # Regular legacy hourly loop: eligible tickers near spot, farthest (or all-in-range) selection,
@@ -31,13 +34,13 @@ hourly:
       # Aligned with fifteen_min continuous_alpha_limit_99: limit buy at 99¢ once bid passes floor.
       limit_price_cents: 99
       # Position sizing + spend cap (same idea as v2_fifteen_min.yaml)
-      order_count: { btc: 50, eth: 25, sol: 1, xrp: 1, doge: 1 }
-      max_cost_cents: { btc: 50000, eth: 10000, sol: 500, xrp: 500, doge: 500 }
+      order_count: { btc: 15, eth: 5, sol: 1, xrp: 1, doge: 1 }
+      max_cost_cents: { btc: 500000, eth: 20000, sol: 500, xrp: 500, doge: 500 }
       # Max entry orders this strategy may place per (asset, hourly window).
-      max_orders_per_window: 20
+      max_orders_per_window: 2
+      # Only late_window_minutes is read by V2 (hourly_signals_farthest). Loop cadence is hourly.pipeline.run_interval_seconds.
       entry_window:
-        late_window_minutes: 10
-        late_interval_seconds: 10
+        late_window_minutes: 7
 
       selection:
         # Mirror legacy config/hourly.yaml + common.yaml
@@ -50,8 +53,8 @@ hourly:
           xrp: 1
           doge: 0.005
         # Min bid on chosen side before entry (YES >= 94, NO >= 95); max 99 matches limit-99 style band.
-        thresholds_yes: { min: 95, max: 98 }
-        thresholds_no: { min: 95, max: 98 }
+        thresholds_yes: { min: 97, max: 99 }
+        thresholds_no: { min: 97, max: 99 }
 
       guards:
         enabled: true
@@ -70,8 +73,8 @@ hourly:
         distance_buffer:
           enabled: true
           assets:
-            btc: { pct: 0.0015, floor_usd: 90 }
-            eth: { pct: 0.0005, floor_usd: 9 }
+            btc: { pct: 0.0011, floor_usd: 120}
+            eth: { pct: 0.0032, floor_usd: 8 }
         anchor_one_per_side:
           enabled: true
           lock_per_window: true
@@ -86,9 +89,13 @@ hourly:
       exit:
         # Per filled position: if current bid for that side is down >= this vs entry bid, exit (after persistence if >1).
         # Use either a fraction (0.20 = 20%) or percent points (20 = 20%) — same convention as fifteen_min-friendly configs.
-        stop_loss_pct: 0.20
-        stop_loss_persistence_polls: 1
-        evaluation_interval_seconds: 1
+        stop_loss_pct: 0.70
+        stop_loss_persistence_polls: 2
+        # When SL triggers at cur_bid, place IOC reduce-only sell with limit = max(1, cur_bid - offset).
+        stop_loss_limit_offset_cents: 10
+        # SL probe telemetry (forensics): throttled visibility into entry_bid/cur_bid/loss_frac per filled order.
+        # Exit evaluation is scoped to the active hourly event (current market_id); prior windows are not tracked.
+        evaluation_interval_seconds: 0
         hard_flip_exit:
           enabled: false
           enable_only_if_seconds_to_close_lte: 120

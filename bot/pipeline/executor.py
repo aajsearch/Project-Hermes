@@ -463,14 +463,27 @@ class PipelineExecutor:
                     "[EXECUTION AUDIT] count: pos_count=None (get_positions failed or no match) → sell_count=fill_count=%s",
                     sell_count,
                 )
-            # Payload mirrors KalshiClient.place_market_order (aggressive limit + IoC reduce-only sell).
+            # Stop-loss / market_sell: emulate market sell with an aggressive limit.
+            # If strategy provided a limit_price_cents (e.g. cur_bid - 10c), use it; else default to 1c.
+            px = _EMULATED_MARKET_SELL_LIMIT_CENTS
+            try:
+                if exit_action.action in (EXIT_ACTION_STOP_LOSS, EXIT_ACTION_MARKET_SELL) and exit_action.limit_price_cents is not None:
+                    px = int(exit_action.limit_price_cents)
+            except Exception:
+                px = _EMULATED_MARKET_SELL_LIMIT_CENTS
+            if px < 1:
+                px = 1
+            if px > 99:
+                px = 99
+
+            # Payload mirrors the order we send (IOC + reduce_only sell).
             payload = {
                 "ticker": ticker_sell,
                 "action": "sell",
                 "side": side,
                 "count": int(sell_count),
                 "type": "limit",
-                f"{side}_price": _EMULATED_MARKET_SELL_LIMIT_CENTS,
+                f"{side}_price": px,
                 "reduce_only": True,
                 "time_in_force": "immediate_or_cancel",
             }
@@ -489,13 +502,21 @@ class PipelineExecutor:
             stop_loss_success = False
             for attempt in range(1, max_stop_loss_retries + 1):
                 try:
-                    resp = self._kalshi_client.place_market_order(
+                    resp = self._kalshi_client.place_limit_order(
                         ticker=ticker_sell,
                         action="sell",
                         side=side,
+                        price_cents=px,
                         count=sell_count,
+                        time_in_force="immediate_or_cancel",
+                        reduce_only=True,
                     )
-                    sell_order_id = (resp or {}).get("order", {}).get("order_id") or (resp or {}).get("order_id")
+                    resp.raise_for_status()
+                    try:
+                        resp_body = resp.json()
+                    except Exception:
+                        resp_body = None
+                    sell_order_id = (resp_body or {}).get("order", {}).get("order_id") or (resp_body or {}).get("order_id")
                     so_d: Optional[dict] = None  # sell order dict for exit price / fill
                     reason = "take_profit" if exit_action.action == EXIT_ACTION_TAKE_PROFIT else "stop_loss/market_sell"
                     logger.info(
@@ -513,7 +534,7 @@ class PipelineExecutor:
                         sell_count=sell_count,
                         attempt=attempt,
                         success=True,
-                        http_status=getattr(getattr(resp, "status_code", None), "__int__", lambda: None)(),
+                        http_status=int(getattr(resp, "status_code", 0) or 0) or None,
                         error_message=None,
                         response_body=getattr(resp, "text", None),
                         payload=payload,

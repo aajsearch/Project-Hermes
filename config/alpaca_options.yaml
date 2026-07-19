@@ -85,7 +85,7 @@ alpaca_options:
         entry_operator: ">="
         put_spread_width_points_min: 4.0
         put_spread_width_points_max: 10.0  # Cap max risk tightly
-        min_short_otm_percent: 0.004      # FIXED: Require short strike to be at least 0.4% OTM
+        min_short_otm_percent: 0.02      # FIXED: Require short strike to be at least 0.4% OTM
 
       exit:
         tp_pct: 0.60           # Let theta decay burn off 60% of the premium
@@ -117,9 +117,9 @@ alpaca_options:
       entry:
         target_credit: 0.15
         entry_operator: ">="
-        call_spread_width_points_min: 1.0
-        call_spread_width_points_max: 5.0
-        min_short_otm_percent: 0.004      # FIXED: Aligned with 0DTE call pricing
+        call_spread_width_points_min: 4.0
+        call_spread_width_points_max: 10.0
+        min_short_otm_percent: 0.02      # FIXED: Aligned with 0DTE call pricing
 
       exit:
         tp_pct: 0.60

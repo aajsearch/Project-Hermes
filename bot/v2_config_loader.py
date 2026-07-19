@@ -124,6 +124,14 @@ def _validate_hourly(config: Dict[str, Any]) -> None:
         )
     if "run_interval_seconds" not in pipeline:
         raise ValueError("Invalid V2 Config Schema: missing 'hourly.pipeline.run_interval_seconds' in v2_hourly.yaml")
+    paw = pipeline.get("parallel_asset_workers")
+    if paw is not None:
+        try:
+            pi = int(paw)
+        except (TypeError, ValueError):
+            raise ValueError("Invalid V2 Config Schema: hourly.pipeline.parallel_asset_workers must be an int") from None
+        if pi < 1:
+            raise ValueError("Invalid V2 Config Schema: hourly.pipeline.parallel_asset_workers must be >= 1")
     # Optional: event_mode_by_asset controls primary vs range event selection.
     event_mode = pipeline.get("event_mode_by_asset")
     if event_mode is not None:

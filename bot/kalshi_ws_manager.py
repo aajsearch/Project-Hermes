@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import logging
 import os
+import socket
 import ssl
 import threading
 import time
@@ -43,6 +45,26 @@ _logged_orderbook_miss: set = set()  # tickers we've already logged miss for (re
 
 WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
 WS_PATH = "/trade-api/ws/v2"
+
+
+def _websockets_connect_header_kwargs(headers: List[Any]) -> Dict[str, Any]:
+    """
+    websockets.connect header kwarg differs by version:
+    - Legacy / older: extra_headers
+    - Newer asyncio client: additional_headers
+    Passing the wrong name can yield: create_connection() got an unexpected keyword argument 'additional_headers'.
+    """
+    try:
+        import websockets
+
+        params = inspect.signature(websockets.connect).parameters
+    except Exception:
+        return {"extra_headers": headers}
+    if "extra_headers" in params:
+        return {"extra_headers": headers}
+    if "additional_headers" in params:
+        return {"additional_headers": headers}
+    return {"extra_headers": headers}
 
 
 def _kalshi_ws_ssl_context() -> ssl.SSLContext:
@@ -439,14 +461,14 @@ async def _kalshi_ws_loop() -> None:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 1.5, 60.0)
                 continue
-            async with websockets.connect(
-                WS_URL,
-                additional_headers=headers,
-                ping_interval=20,
-                ping_timeout=10,
-                close_timeout=5,
-                ssl=True,
-            ) as ws:
+            connect_kw: Dict[str, Any] = {
+                "ping_interval": 20,
+                "ping_timeout": 10,
+                "close_timeout": 5,
+                "ssl": True,
+            }
+            connect_kw.update(_websockets_connect_header_kwargs(headers))
+            async with websockets.connect(WS_URL, **connect_kw) as ws:
                 backoff = 1.0
                 with _ws_control_lock:
                     _current_ws = ws
@@ -519,6 +541,10 @@ async def _kalshi_ws_loop() -> None:
                 status = getattr(status, "status_code", None) if status is not None else getattr(e, "status_code", None)
                 headers = getattr(getattr(e, "response", None), "headers", None) or getattr(e, "headers", None)
                 logger.error("[kalshi_ws] Handshake failed: status=%s headers=%s", status, headers)
+            elif isinstance(e, socket.gaierror):
+                # Transient DNS resolution failures are common on unstable networks.
+                # Treat as reconnectable warning (avoid full traceback noise).
+                logger.warning("[kalshi_ws] DNS resolve/connect failed (%s); reconnecting in %.1fs", e, backoff)
             else:
                 logger.exception("[kalshi_ws] Connect/handshake error: %s", e)
         await asyncio.sleep(backoff)

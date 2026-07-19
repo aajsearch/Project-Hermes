@@ -1,0 +1,89 @@
+env:
+  load_dotenv: true
+
+exchange:
+  # Switched to live production API
+  mode: coinbase
+
+  trading_portfolio_id: "84e1d28f-2999-4600-a300-f8c31dd12928"
+  usd_account_uuid: "4593b276-986f-5709-b70c-c7b88caf155e"
+
+  rest_timeout_seconds: 10
+  rest_max_retries: 5
+  rest_backoff_base_seconds: 0.25
+  circuit_breaker:
+    failure_threshold: 5
+    cooldown_seconds: 30
+
+market_data:
+  websocket_url: "wss://advanced-trade-ws.coinbase.com"
+  channels:
+    - ticker
+    - level2
+  heartbeat_seconds: 1.0
+  volatility:
+    window_seconds: 60
+    sampling_hz: 2
+
+strategy:
+  # Multi-product config: each product has its own scalper params.
+  products:
+    - product_id: "SOL-USD"
+      # REDUCED FOR LIVE TEST: ~ $7-8 per order instead of $150
+      base_order_size: 0.05
+      half_spread_bps: 10
+      profit_target_pct: 0.03
+      stop_loss_pct: 0.015
+
+    # Example second product (tune as needed before enabling live):
+    - product_id: "BTC-USD"
+      base_order_size: 0.0002
+      half_spread_bps: 10
+      profit_target_pct: 0.03
+      stop_loss_pct: 0.015
+
+  vol_widening:
+    enabled: true
+    vol_threshold: 0.0025
+    max_multiplier: 5.0
+
+  throttling:
+    # Reduce cancel/replace churn in live trading.
+    min_interval_ms: 5000
+    price_move_bps: 15.0
+
+execution:
+  # CRITICAL: Ensures you don't pay Taker fees
+  post_only: true
+  idempotency:
+    enabled: true
+    namespace: "mm_bot_simple_v1"
+  requote_threshold_bps: 15
+  min_requote_interval_seconds: 5.0
+
+risk:
+  # REDUCED FOR LIVE TEST: Hard cap on total exposure
+  max_notional_usd: 100.0
+  stop_loss_pct: 0.10
+  # If enabled, bot will ONLY place asks (SELL) to reduce inventory.
+  unwind_only: true
+  # Auto-exit unwind-only once |inventory| <= this threshold (dust-safe).
+  # If omitted, defaults are used (BTC: 1e-6, others: 1e-4).
+  unwind_exit_inventory_base: 0.0001
+  # REDUCED FOR LIVE TEST: Instantly kills bot if you lose $5
+  daily_loss_limit_usd: 5.0
+  kill_switch:
+    enabled: true
+
+storage:
+  sqlite_path: "mm_bot/data/mm_bot.sqlite3"
+  schema_path: "mm_bot/sql/schema.sql"
+
+reporting:
+  csv_output_path: "mm_bot/reports/summary.csv"
+  console_summary_interval_seconds: 30
+
+runtime:
+  queue_maxsize: 10000
+  shutdown_timeout_seconds: 15
+

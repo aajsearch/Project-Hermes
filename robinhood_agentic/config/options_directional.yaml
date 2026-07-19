@@ -1,0 +1,91 @@
+# Single-leg options (directional) — Robinhood Agentic MCP
+# MCP: single leg only. Delta/OI filtered on get_option_quotes (NOT get_option_instruments).
+# See: prompts/options_mcp.md and docs/OPTIONS_MCP_STRATEGY.md
+
+account:
+  nickname: Agentic
+  budget_usd: 500
+  reserve_usd: 100
+  timezone_reference: America/New_York
+
+portfolio:
+  one_playbook_per_day: true
+
+prerequisites:
+  min_option_level: option_level_2
+  upgrade_url_template: "https://applink.robinhood.com/upgrade_options?account_number={account_number}"
+  mcp_limitations:
+    - single_leg_only
+    - no_multi_leg_spreads
+    - no_stock_option_combos
+    - delta_and_oi_on_get_option_quotes_only
+
+position_sizing:
+  max_contracts_per_trade: 1
+  max_premium_usd: 75
+  max_concurrent_positions: 1
+  max_trades_per_day: 2
+  cooldown_minutes_after_loss: 60
+
+trade:
+  profit_target_pct: 0.40         # +40% on premium
+  stop_loss_pct: 0.30             # -30% on premium (tighter; max loss still 100% of premium)
+  hard_flat_time_et: "15:45"
+  no_new_entry_after_et: "15:00"
+  no_new_entry_before_et: "10:00"
+  poll_seconds: 15
+  require_post_fill_refresh: true
+
+underlyings:
+  # Pilot: QQQ/SPY only — NVDA needs ~$200+ for real delta.
+  pilot_core_only: true
+  core:
+    - SPY
+    - QQQ
+  extended:
+    - NVDA
+    - AAPL
+    - TSLA
+    - AMD
+    - META
+    - AMZN
+
+contract_selection:
+  default_style: short_dated_directional
+  styles:
+    short_dated_directional:
+      dte_min: 1                  # no 0DTE in agentic chat flow (gamma + chat-stop risk)
+      dte_max: 5
+      # $75 budget → lottery sizing; honest 0.35 delta needs ~$200+ on QQQ weeklies.
+      delta_target: 0.15
+      delta_tolerance: 0.10
+      option_type: call
+      prefer_weekly: true
+      # Filter on get_option_quotes response (not instrument query):
+      min_open_interest: 500
+      max_bid_ask_spread_pct: 0.10
+    cash_secured_put:
+      enabled: false
+      dte_min: 7
+      dte_max: 21
+      delta_target: 0.20
+      min_cash_collateral_buffer_usd: 150
+
+direction:
+  regime_symbol: QQQ
+  bull_min_day_change_pct: 0.005
+  bear_max_day_change_pct: -0.005
+  bull_contract_type: call
+  bear_contract_type: put
+
+risk:
+  max_concurrent_premium_usd: 75
+  max_daily_realized_loss_usd: 75
+  circuit_breaker_losses_per_day: 2
+  never_sell_naked_calls: true
+  never_hold_through_close: true
+  defined_risk_note: "Max loss on long option = 100% of premium paid; SL is best-effort only."
+
+event_blackout:
+  earnings_day: true
+  fomc_cpi_nfp_morning: true

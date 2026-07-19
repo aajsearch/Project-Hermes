@@ -449,6 +449,7 @@ class KalshiClient:
         count,
         client_order_id=None,
         time_in_force=None,
+        reduce_only: Optional[bool] = None,
     ):
         """
         Place a limit order. time_in_force: None (default/resting), 'immediate_or_cancel', 'fill_or_kill', 'good_till_canceled'.
@@ -476,6 +477,8 @@ class KalshiClient:
         }
         if time_in_force is not None:
             order["time_in_force"] = str(time_in_force).strip().lower()
+        if reduce_only is not None:
+            order["reduce_only"] = bool(reduce_only)
         headers = self._headers("POST", path)
         return requests.post(self.base_url + path, headers=headers, json=order)
 

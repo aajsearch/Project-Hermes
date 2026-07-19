@@ -1,0 +1,86 @@
+# Leveraged 2x/3x ETF micro-swing — Robinhood Agentic (MCP-driven)
+# See: prompts/leveraged_etf.md and docs/LEVERAGED_ETF_STRATEGY.md
+
+account:
+  nickname: Agentic
+  budget_usd: 500
+  reserve_usd: 50
+  timezone_reference: America/New_York
+
+portfolio:
+  one_playbook_per_day: true
+
+position_sizing:
+  target_notional_usd: 75
+  max_concurrent: 1
+  max_active_symbols: 1
+  cooldown_minutes_after_sl: 45
+  max_stop_losses_per_day: 3
+
+entry:
+  prefer_whole_shares: true
+  whole_share_max_qty: 1
+  limit_entry_offset_bps: 8
+  fractional_fallback: market
+  allow_fractional_live: false
+  # Whole-share only if mid <= min(target_notional_usd, buying_power - reserve).
+
+trade:
+  profit_target_pct: 0.020    # +2.00% (wider for 3x noise)
+  stop_loss_pct: 0.012        # -1.20%
+  stop_loss_clear_bps: 20
+  hard_flat_time_et: "15:55"
+  no_new_entry_after_et: "15:30"
+  no_new_entry_before_et: "09:45"
+  poll_seconds: 15
+  require_post_fill_refresh: true
+  cancel_open_sell_before_exit: true
+  cancel_sibling_order_on_exit_fill: true
+
+settlement:
+  gfv_safe_mode: true
+
+direction:
+  regime_symbol: QQQ
+  bull_min_day_change_pct: 0.005    # +0.50%
+  bear_max_day_change_pct: -0.005   # -0.50%
+
+selection:
+  market_hours: regular_hours
+  max_spread_pct: 0.0020
+  max_spread_usd: 0.35
+  min_price_usd: 8
+  min_abs_day_change_pct: 0.004
+  max_abs_day_change_pct: 0.025
+  # Pilot: index 3x only — no single-stock levered, no TBT.
+  pilot_symbols_only:
+    - TQQQ
+    - SQQQ
+
+# Flat tradable list (agent quotes all in one get_equity_quotes call).
+tradable_symbols:
+  - TQQQ
+  - SQQQ
+  - UPRO
+  - SPXU
+  - SOXL
+  - SOXS
+  - TECL
+  - TECS
+  - NVDL
+
+# Not in auto-select during pilot (discretionary / higher risk).
+optional_discretionary:
+  - TSLL
+  - FNGU
+  # TBT removed — rates product, not equity inverse; breaks QQQ bear regime logic.
+
+risk:
+  mutually_exclusive_pairs:
+    - [TQQQ, SQQQ]
+    - [UPRO, SPXU]
+    - [SOXL, SOXS]
+    - [TECL, TECS]
+  single_stock_levered_max_notional_usd: 50
+  event_blackout:
+    fomc_cpi_nfp_morning: true
