@@ -52,7 +52,7 @@ Follow options_directional.yaml. Check option_level; chain scan SPY/QQQ, delta o
 
 ## Cross-strategy rule
 
-**Run only ONE playbook per day** on the Agentic $500 account.
+**Equity + options same day OK** on the Agentic $500 account. Avoid leveraged ETF the same day.
 
 ## Trading (require confirmation)
 

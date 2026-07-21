@@ -9,7 +9,7 @@ Prompts: [`prompts/options_mcp.md`](../prompts/options_mcp.md)
 
 1. `get_accounts` → `agentic_allowed=true` and `option_level_2` or `option_level_3`
 2. If empty → upgrade URL from config template with **your** `account_number` from `get_accounts`
-3. **One playbook per day** — do not combine with equity playbooks
+3. **Equity + options same day OK** — may run with tech scalper; avoid leveraged ETF same day
 
 ## MCP workflow (correct)
 
@@ -28,7 +28,7 @@ get_option_chains(underlying)
 | Delta target | **0.15** | 0.35Δ costs $200+ on QQQ — not compatible with $75 |
 | DTE | **1–5** | No 0DTE in agentic flow |
 | Max premium | $75 | Defined risk = 100% of premium |
-| TP / SL | +40% / −30% on premium | Best-effort; can gap through |
+| TP / SL | +15% / −10% on premium (intraday) | Best-effort; can gap through |
 | Underlyings | **SPY, QQQ** only (pilot) | |
 
 ## Regime

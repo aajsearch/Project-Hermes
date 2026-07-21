@@ -7,7 +7,7 @@ Prompts: [`prompts/leveraged_etf.md`](../prompts/leveraged_etf.md)
 
 ## Pilot rules (post-review)
 
-- **One playbook per day** — do not run with tech scalper or options same session.
+- **Do not stack with other playbooks** — if tech scalper or options ran today, skip leveraged ETF (equity+options may share a day with each other).
 - **One position only** (`max_concurrent: 1`).
 - **Pilot symbols:** TQQQ and SQQQ only until proven.
 - **Whole-share path only** (`allow_fractional_live: false`).

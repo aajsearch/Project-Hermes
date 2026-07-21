@@ -8,8 +8,11 @@ account:
   timezone_reference: America/New_York
 
 portfolio:
-  # HARD RULE: only one playbook (tech / lev ETF / options) live per calendar day on this account.
-  one_playbook_per_day: true
+  # Equity tech scalper + single-leg options may run the same day.
+  # Still avoid stacking leveraged ETF with either on the same calendar day.
+  one_playbook_per_day: false
+  allow_equity_and_options_same_day: true
+  exclude_leveraged_etf_with_other_playbooks: true
 
 position_sizing:
   target_notional_usd: 100

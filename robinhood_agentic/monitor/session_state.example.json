@@ -10,9 +10,28 @@
       "entry": 317.8,
       "tp": 319.71,
       "sl": 316.57,
-      "tp_order_id": "ORDER_UUID_FROM_get_equity_orders",
-      "synthetic_sl": true,
+      "sl_order_id": "ORDER_UUID",
+      "synthetic_sl": false,
+      "synthetic_tp": true,
       "opened_at": "2026-07-13T15:22:02Z"
+    }
+  ],
+  "option_positions": [
+    {
+      "option_id": "OPTION_INSTRUMENT_UUID",
+      "symbol": "QQQ",
+      "label": "QQQ 725C 2026-07-24",
+      "option_type": "call",
+      "strike": 725.0,
+      "expiration": "2026-07-24",
+      "qty": 1,
+      "entry": 0.6,
+      "tp": 0.69,
+      "sl": 0.54,
+      "multiplier": 100,
+      "synthetic_tp": true,
+      "synthetic_sl": true,
+      "opened_at": "2026-07-20T15:27:09Z"
     }
   ]
 }

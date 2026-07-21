@@ -29,6 +29,11 @@ robinhood_agentic/monitor/.mcp_access_token
 robinhood_agentic/monitor/LIVE_STATUS.md
 robinhood_agentic/monitor/latest_status.json
 robinhood_agentic/monitor/dashboard.html
+robinhood_agentic/.venv/
+robinhood_agentic/data/*.db
+robinhood_agentic/data/*.db-*
+robinhood_agentic/app/ui/node_modules/
+robinhood_agentic/app/ui/dist/
 
 # --- Optional: uncomment to ignore local exports ---
 # *.csv

@@ -8,7 +8,10 @@ account:
   timezone_reference: America/New_York
 
 portfolio:
+  # Do not stack leveraged ETF with tech scalper or options on the same calendar day.
   one_playbook_per_day: true
+  allow_equity_and_options_same_day: true
+  exclude_leveraged_etf_with_other_playbooks: true
 
 position_sizing:
   target_notional_usd: 75

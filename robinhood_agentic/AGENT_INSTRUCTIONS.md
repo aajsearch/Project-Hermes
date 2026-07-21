@@ -13,7 +13,7 @@ Do **not** mix with Kalshi/Alpaca/Coinbase unless the user explicitly asks.
 
 ## Portfolio rule (hard)
 
-**One playbook per calendar day** on the $500 Agentic account. If tech scalper ran today, do not start leveraged ETF or options live the same day. Each playbook sets `portfolio.one_playbook_per_day: true`.
+**Equity + options same day OK** on the $500 Agentic account (`allow_equity_and_options_same_day`). Tech scalper and single-leg options may run together. **Do not** also run leveraged ETF the same day (`exclude_leveraged_etf_with_other_playbooks`).
 
 Before every entry:
 - `get_portfolio` — subtract `pending_deposits` from usable buying power
@@ -47,7 +47,7 @@ Never buy 1 share above the notional cap (e.g. no $300 share when target is $100
 - Max **2** concurrent; TP +0.60%, SL −0.45%
 - `allow_fractional_live: false` default — skip symbols above notional cap
 - Flat **3:55 PM ET**
-- **Only equity playbook** on days you run this (no lev ETF / options same day)
+- Equity + options same day OK; still avoid leveraged ETF the same day
 
 ## Leveraged ETF (pilot)
 
@@ -61,7 +61,7 @@ Never buy 1 share above the notional cap (e.g. no $300 share when target is $100
 - Stop if `option_level` empty; use `upgrade_url_template` with account from `get_accounts`
 - Delta/OI on **`get_option_quotes`**, not `get_option_instruments`
 - Pilot: SPY/QQQ; **0.15Δ**; premium ≤ **$75**; DTE ≥ **1**
-- TP +40% / SL −30% on premium; max loss = 100% of premium
+- TP +15% / SL −10% on premium (intraday); max loss = 100% of premium
 - Flat **3:45 PM ET**
 
 ## Logging

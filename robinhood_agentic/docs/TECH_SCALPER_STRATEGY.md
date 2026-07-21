@@ -9,7 +9,7 @@ Prompts: [`prompts/tech_scalper.md`](../prompts/tech_scalper.md)
 
 | Setting | Value |
 |---------|-------|
-| Playbook | **Tech scalper only** — do not run lev ETF or options same day |
+| Playbook | Tech scalper + options same day OK; avoid leveraged ETF same day |
 | Watchlist | **Full 33 symbols** (quotes batch 20 + 13) |
 | `allow_fractional_live` | **false** default — whole-share broker SL + synthetic TP |
 | `max_concurrent` | **2** |

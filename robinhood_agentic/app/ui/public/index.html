@@ -1,0 +1,1408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Command Center — Hermes Desk</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #070a0f;
+      --bg-elev: #0c1118;
+      --panel: #10161f;
+      --panel-2: #141b26;
+      --line: #1e2836;
+      --line-strong: #2c3a4f;
+      --text: #e7edf6;
+      --muted: #8090a8;
+      --faint: #5a6a82;
+      --green: #3ecf8e;
+      --green-dim: #1a3d2e;
+      --red: #ef6b73;
+      --red-dim: #3d1a1e;
+      --amber: #d4a84b;
+      --amber-dim: #3a2e14;
+      --accent: #6aa3d8;
+      --accent-dim: #1a2d42;
+      --halt: #c23b3b;
+      --mono: "IBM Plex Mono", ui-monospace, monospace;
+      --sans: "IBM Plex Sans", "Segoe UI", sans-serif;
+      --radius: 4px;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; }
+    body {
+      font-family: var(--sans);
+      background:
+        radial-gradient(1200px 500px at 10% -10%, #121a28 0%, transparent 55%),
+        radial-gradient(900px 400px at 100% 0%, #0e1620 0%, transparent 45%),
+        var(--bg);
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      padding: 0.65rem 1.1rem;
+      border-bottom: 1px solid var(--line);
+      background: rgba(7, 10, 15, 0.92);
+      backdrop-filter: blur(8px);
+      position: sticky;
+      top: 0;
+      z-index: 20;
+    }
+    .brand {
+      display: flex;
+      flex-direction: column;
+      gap: 0.05rem;
+    }
+    .brand h1 {
+      margin: 0;
+      font-size: 0.95rem;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+    .brand .sub {
+      font-family: var(--mono);
+      font-size: 0.65rem;
+      color: var(--faint);
+      letter-spacing: 0.04em;
+    }
+    .health {
+      display: flex;
+      gap: 0.85rem;
+      align-items: center;
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      color: var(--muted);
+    }
+    .dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      display: inline-block;
+      background: var(--faint);
+      margin-right: 0.35rem;
+      vertical-align: middle;
+    }
+    .dot.ok { background: var(--green); }
+    .dot.warn { background: var(--amber); }
+    .dot.bad { background: var(--red); }
+    .tabs { display: flex; gap: 0.15rem; margin-left: auto; }
+    .tabs button {
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--muted);
+      padding: 0.38rem 0.7rem;
+      border-radius: var(--radius);
+      cursor: pointer;
+      font-size: 0.78rem;
+      font-family: var(--sans);
+    }
+    .tabs button:hover { color: var(--text); }
+    .tabs button.active {
+      color: var(--text);
+      border-color: var(--line-strong);
+      background: var(--panel);
+    }
+    main {
+      padding: 0.9rem 1.1rem 2rem;
+      max-width: 1280px;
+      margin: 0 auto;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 0.85rem 0.95rem;
+      margin-bottom: 0.75rem;
+    }
+    .panel-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 0.75rem;
+      margin-bottom: 0.55rem;
+    }
+    .panel-head h2 {
+      margin: 0;
+      font-size: 0.72rem;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .row { display: flex; flex-wrap: wrap; gap: 0.65rem; align-items: center; }
+    .desk {
+      border-color: var(--line-strong);
+      background: linear-gradient(180deg, #121925 0%, var(--panel) 100%);
+      padding: 1rem 1.05rem;
+    }
+    .desk.tone-danger { border-left: 3px solid var(--red); }
+    .desk.tone-warn { border-left: 3px solid var(--amber); }
+    .desk.tone-accent { border-left: 3px solid var(--accent); }
+    .desk.tone-muted { border-left: 3px solid var(--line-strong); }
+    .desk-top {
+      display: grid;
+      grid-template-columns: 1.4fr 1fr;
+      gap: 1rem;
+      align-items: start;
+    }
+    @media (max-width: 900px) {
+      .desk-top { grid-template-columns: 1fr; }
+      .cc-grid { grid-template-columns: 1fr !important; }
+    }
+    .desk-label {
+      font-family: var(--mono);
+      font-size: 1.15rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      margin: 0 0 0.25rem;
+    }
+    .desk-label.tone-danger { color: var(--red); }
+    .desk-label.tone-warn { color: var(--amber); }
+    .desk-label.tone-accent { color: var(--accent); }
+    .desk-label.tone-muted { color: var(--muted); }
+    .desk-detail { color: var(--muted); font-size: 0.86rem; max-width: 42rem; }
+    .flag-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 0.45rem;
+      margin-top: 0.85rem;
+    }
+    @media (max-width: 800px) {
+      .flag-grid { grid-template-columns: 1fr 1fr; }
+    }
+    .flag-cell {
+      background: var(--bg-elev);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 0.5rem 0.55rem;
+      min-height: 3.4rem;
+    }
+    .flag-cell .k {
+      font-size: 0.65rem;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      color: var(--faint);
+      margin-bottom: 0.2rem;
+    }
+    .flag-cell .v {
+      font-family: var(--mono);
+      font-size: 0.82rem;
+      font-weight: 500;
+    }
+    .flag-cell .v.on { color: var(--green); }
+    .flag-cell .v.off { color: var(--amber); }
+    .flag-cell .v.live { color: var(--red); }
+    .flag-cell .v.open { color: var(--green); }
+    .flag-cell .v.closed { color: var(--muted); }
+    .ops-controls {
+      display: flex;
+      flex-direction: column;
+      gap: 0.55rem;
+      align-items: stretch;
+    }
+    .seg {
+      display: inline-flex;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius);
+      overflow: hidden;
+      background: var(--bg-elev);
+    }
+    .seg button {
+      flex: 1;
+      border: none;
+      background: transparent;
+      color: var(--muted);
+      padding: 0.42rem 0.55rem;
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      cursor: pointer;
+      border-right: 1px solid var(--line);
+    }
+    .seg button:last-child { border-right: none; }
+    .seg button.active-on {
+      background: var(--green-dim);
+      color: var(--green);
+    }
+    .seg button.active-off {
+      background: var(--amber-dim);
+      color: var(--amber);
+    }
+    .seg button.active-live {
+      background: var(--red-dim);
+      color: var(--red);
+    }
+    .seg button:hover { color: var(--text); }
+    .ctrl-label {
+      font-size: 0.65rem;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      color: var(--faint);
+      margin-bottom: 0.2rem;
+    }
+    .mode-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      justify-content: flex-end;
+    }
+    .cc-grid {
+      display: grid;
+      grid-template-columns: 1.65fr 1fr;
+      gap: 0.75rem;
+      align-items: start;
+    }
+    .stack { display: flex; flex-direction: column; gap: 0.75rem; }
+    .decision {
+      background: var(--bg-elev);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 0.85rem;
+    }
+    .decision-title {
+      font-family: var(--mono);
+      font-size: 0.95rem;
+      font-weight: 600;
+      margin: 0 0 0.35rem;
+    }
+    .decision-msg { color: var(--text); font-size: 0.9rem; }
+    .meta-line {
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      color: var(--faint);
+      margin-top: 0.55rem;
+    }
+    .stat-num {
+      font-family: var(--mono);
+      font-size: 1.35rem;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+    .countdown {
+      font-family: var(--mono);
+      font-size: 1.55rem;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0.04em;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+    th, td {
+      text-align: left;
+      padding: 0.42rem 0.45rem;
+      border-bottom: 1px solid var(--line);
+    }
+    th {
+      color: var(--faint);
+      font-weight: 500;
+      font-size: 0.68rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+    tr:hover td { background: rgba(255,255,255,0.015); }
+    .pos { color: var(--green); }
+    .neg { color: var(--red); }
+    .btn {
+      border: 1px solid transparent;
+      border-radius: var(--radius);
+      padding: 0.4rem 0.7rem;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.75rem;
+      font-family: var(--sans);
+    }
+    .btn-halt {
+      background: var(--halt);
+      color: #fff;
+      font-size: 0.82rem;
+      padding: 0.5rem 0.95rem;
+      letter-spacing: 0.05em;
+    }
+    .btn-secondary {
+      background: var(--panel-2);
+      color: var(--text);
+      border-color: var(--line-strong);
+    }
+    .btn-danger { background: #6e2428; color: #fff; }
+    .btn-ok { background: #1d5c3c; color: #fff; }
+    .btn-ghost {
+      background: transparent;
+      color: var(--muted);
+      border-color: var(--line);
+    }
+    .muted { color: var(--muted); }
+    .faint { color: var(--faint); font-size: 0.75rem; }
+    .bar {
+      height: 6px;
+      background: #1a222e;
+      border-radius: 2px;
+      overflow: hidden;
+      width: 100%;
+      max-width: 160px;
+    }
+    .bar > span { display: block; height: 100%; background: var(--accent); }
+    .bar.warn > span { background: var(--amber); }
+    .bar.danger > span { background: var(--red); }
+    .risk-row {
+      display: grid;
+      grid-template-columns: 5.5rem 2.5rem 1fr;
+      gap: 0.45rem;
+      align-items: center;
+      margin-bottom: 0.45rem;
+      font-family: var(--mono);
+      font-size: 0.75rem;
+    }
+    .feed {
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      max-height: 360px;
+      overflow: auto;
+      background: var(--bg-elev);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 0.65rem;
+    }
+    .feed div { padding: 0.18rem 0; border-bottom: 1px solid #161e28; }
+    input, select, textarea {
+      background: var(--bg-elev);
+      border: 1px solid var(--line);
+      color: var(--text);
+      border-radius: var(--radius);
+      padding: 0.4rem 0.55rem;
+      font-size: 0.82rem;
+      font-family: var(--sans);
+    }
+    label { font-size: 0.75rem; color: var(--muted); display: block; margin-bottom: 0.2rem; }
+    .field { margin-bottom: 0.65rem; }
+    .chip {
+      display: inline-block;
+      padding: 0.1rem 0.4rem;
+      border-radius: 2px;
+      font-family: var(--mono);
+      font-size: 0.68rem;
+      background: #1a2330;
+      color: var(--muted);
+    }
+    .chip.on { background: var(--green-dim); color: var(--green); }
+    .chip.off { background: var(--red-dim); color: var(--red); }
+    .chip.warn { background: var(--amber-dim); color: var(--amber); }
+    .empty {
+      padding: 0.85rem 0.2rem;
+      color: var(--faint);
+      font-family: var(--mono);
+      font-size: 0.78rem;
+    }
+    .toast {
+      position: fixed;
+      bottom: 1.1rem;
+      right: 1.1rem;
+      background: var(--panel-2);
+      border: 1px solid var(--line-strong);
+      padding: 0.65rem 0.85rem;
+      border-radius: var(--radius);
+      font-size: 0.8rem;
+      z-index: 60;
+      display: none;
+      max-width: 320px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+    }
+    .toast.show { display: block; }
+    .modal-bg {
+      display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7);
+      align-items: center; justify-content: center; z-index: 50;
+    }
+    .modal-bg.show { display: flex; }
+    .modal {
+      background: var(--panel);
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      padding: 1.15rem;
+      width: min(440px, 92vw);
+    }
+    .modal h3 { margin: 0 0 0.5rem; font-size: 1rem; }
+    .live-answer {
+      margin-top: 0.65rem;
+      padding: 0.45rem 0.55rem;
+      border-radius: var(--radius);
+      font-family: var(--mono);
+      font-size: 0.75rem;
+      border: 1px solid var(--line);
+      background: var(--bg-elev);
+    }
+    .live-answer.yes { border-color: #5a2a2e; color: var(--red); background: var(--red-dim); }
+    .live-answer.no { border-color: var(--line); color: var(--muted); }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+    @media (max-width: 800px) { .grid-2 { grid-template-columns: 1fr; } }
+    ul#alerts { margin: 0.35rem 0 0; padding-left: 1.1rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <h1>Command Center</h1>
+      <span class="sub">Hermes · Agentic Desk</span>
+    </div>
+    <div class="health">
+      <span><span class="dot" id="hbDot"></span>Engine</span>
+      <span><span class="dot" id="mcpDot"></span>MCP</span>
+    </div>
+    <nav class="tabs">
+      <button class="active" data-tab="cc">Desk</button>
+      <button data-tab="tel">Telemetry</button>
+      <button data-tab="cfg">Strategy</button>
+      <button data-tab="an">Analytics</button>
+    </nav>
+  </header>
+
+  <main>
+    <section id="tab-cc">
+      <!-- Operating status -->
+      <div class="panel desk tone-muted" id="deskPanel">
+        <div class="desk-top">
+          <div>
+            <div class="faint" style="letter-spacing:0.08em;text-transform:uppercase;margin-bottom:0.15rem">Desk state</div>
+            <h2 class="desk-label tone-muted" id="deskLabel">—</h2>
+            <div class="desk-detail" id="deskDetail">Loading operational state…</div>
+            <div class="live-answer no" id="liveAnswer">Can place live orders? —</div>
+            <div class="flag-grid">
+              <div class="flag-cell">
+                <div class="k">Trading window</div>
+                <div class="v" id="winValue">—</div>
+                <div class="faint" id="winRange"></div>
+              </div>
+              <div class="flag-cell">
+                <div class="k">Execution</div>
+                <div class="v" id="execValue">—</div>
+                <div class="faint" id="execHint"></div>
+              </div>
+              <div class="flag-cell">
+                <div class="k">Scanner</div>
+                <div class="v" id="scanValue">—</div>
+                <div class="faint" id="scanHint"></div>
+              </div>
+              <div class="flag-cell">
+                <div class="k">Auto-entry</div>
+                <div class="v" id="autoValue">—</div>
+                <div class="faint" id="modeTiny"></div>
+              </div>
+            </div>
+          </div>
+          <div class="ops-controls">
+            <div>
+              <div class="ctrl-label">Scanner</div>
+              <div class="seg" id="segScanner">
+                <button type="button" data-val="1">ON</button>
+                <button type="button" data-val="0">OFF</button>
+              </div>
+            </div>
+            <div>
+              <div class="ctrl-label">Execution</div>
+              <div class="seg" id="segDry">
+                <button type="button" data-val="1">DRY RUN</button>
+                <button type="button" data-val="0">LIVE</button>
+              </div>
+            </div>
+            <div>
+              <div class="ctrl-label">Auto-entry</div>
+              <div class="seg" id="segAuto">
+                <button type="button" data-val="1">ON</button>
+                <button type="button" data-val="0">OFF</button>
+              </div>
+            </div>
+            <div>
+              <div class="ctrl-label">Mode</div>
+              <div class="mode-row">
+                <button class="btn btn-secondary" id="btnAutonomous">Autonomous</button>
+                <button class="btn btn-secondary" id="btnCopilot">Co-Pilot</button>
+                <button class="btn btn-ok" id="btnResume">Resume</button>
+                <button class="btn btn-halt" id="btnHalt">HALT</button>
+              </div>
+              <div class="faint" id="haltReason" style="margin-top:0.3rem;text-align:right"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="cc-grid">
+        <div class="stack">
+          <div class="panel">
+            <div class="panel-head">
+              <h2>Entry decision</h2>
+              <span class="faint" id="decisionTs"></span>
+            </div>
+            <div class="decision" id="entryDecisionBox">
+              <div class="decision-title" id="decisionTitle">Waiting for scan…</div>
+              <div class="decision-msg" id="entryDecisionMsg">The next watchlist pass will explain why an entry did or did not fire.</div>
+              <div class="meta-line" id="lastScanResult">No scans yet</div>
+            </div>
+            <div class="row" style="justify-content:space-between;margin-top:0.85rem;align-items:flex-end">
+              <div>
+                <div class="ctrl-label">Next scan</div>
+                <div class="faint" id="scanScheduleMeta">—</div>
+              </div>
+              <div style="text-align:right">
+                <div class="countdown" id="scanCountdown">--:--</div>
+                <div class="faint" id="scanCountdownLabel">until next scan</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <h2>Live positions</h2>
+              <span class="faint" id="updatedAt"></span>
+            </div>
+            <table>
+              <thead>
+                <tr>
+                  <th>Symbol</th><th>Mark</th><th>Entry</th><th>PnL</th>
+                  <th>→ TP</th><th>→ SL</th><th>Levels</th><th></th>
+                </tr>
+              </thead>
+              <tbody id="posBody"><tr><td colspan="8" class="empty">No open positions</td></tr></tbody>
+            </table>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><h2>Pending approvals</h2></div>
+            <div id="approvals" class="empty">None</div>
+          </div>
+        </div>
+
+        <div class="stack">
+          <div class="panel">
+            <div class="panel-head"><h2>Session</h2></div>
+            <div class="muted" style="margin-bottom:0.15rem">Daily realized PnL</div>
+            <div id="pnl" class="stat-num">$0.00</div>
+            <div class="faint" id="tradeCount">0 trades today</div>
+            <div style="margin-top:0.85rem">
+              <div class="risk-row">
+                <span class="muted">Equity SLs</span>
+                <span id="slLabel">0/5</span>
+                <div class="bar" id="slBar"><span style="width:0%"></span></div>
+              </div>
+              <div class="risk-row">
+                <span class="muted">Opt losses</span>
+                <span id="optLabel">0/2</span>
+                <div class="bar" id="optBar"><span style="width:0%"></span></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><h2>Window clock</h2></div>
+            <div class="faint" id="windowMessage">—</div>
+            <div class="row" style="margin-top:0.65rem;justify-content:space-between">
+              <div>
+                <div class="ctrl-label">Until open</div>
+                <div class="stat-num" style="font-size:1.05rem" id="untilOpen">—</div>
+              </div>
+              <div style="text-align:right">
+                <div class="ctrl-label">Until close</div>
+                <div class="stat-num" style="font-size:1.05rem" id="untilClose">—</div>
+              </div>
+            </div>
+            <div class="faint" style="margin-top:0.55rem" id="windowNow"></div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><h2>Alerts</h2></div>
+            <ul id="alerts" class="muted"></ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-tel" hidden>
+      <div class="panel row">
+        <button class="btn btn-secondary" id="btnRescan">Force Rescan</button>
+        <div style="margin-left:auto;text-align:right">
+          <div class="countdown" style="font-size:1.2rem" id="telCountdown">--:--</div>
+          <div class="faint" id="telCountdownMeta">next scan</div>
+        </div>
+        <input id="injectText" placeholder="evaluate_equity:TSLA or Force scan NVDA options" style="flex:1;min-width:200px" />
+        <button class="btn btn-ok" id="btnInject">Inject</button>
+      </div>
+      <div class="grid-2">
+        <div class="panel">
+          <div class="panel-head"><h2>Scan history</h2></div>
+          <div class="faint" style="margin-bottom:0.5rem">Click a row to load full results</div>
+          <div style="max-height:360px;overflow:auto">
+            <table>
+              <thead><tr><th>When</th><th>Trigger</th><th>Qualified</th><th>Top</th></tr></thead>
+              <tbody id="scanHistoryBody"></tbody>
+            </table>
+          </div>
+          <div class="panel-head" style="margin-top:1rem"><h2>Brain feed</h2></div>
+          <div class="feed" id="auditFeed"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>Scan detail</h2></div>
+          <div class="faint" id="scanMeta"></div>
+          <div id="scanRejectSummary" class="faint" style="margin:0.4rem 0"></div>
+          <div style="max-height:420px;overflow:auto;margin-top:0.5rem">
+            <table>
+              <thead><tr><th>Sym</th><th>Status</th><th>Day%</th><th>Spread</th><th>Mid</th></tr></thead>
+              <tbody id="scanBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-cfg" hidden>
+      <div class="grid-2">
+        <div class="panel">
+          <div class="row" style="justify-content:space-between;margin-bottom:0.5rem">
+            <strong>Tech Equity Scalper</strong>
+            <span class="chip" id="techVer">v—</span>
+          </div>
+          <div class="field"><label>TP % (e.g. 0.006 = 0.60%)</label><input id="techTp" type="number" step="0.0001" /></div>
+          <div class="field"><label>SL %</label><input id="techSl" type="number" step="0.0001" /></div>
+          <div class="field"><label>Max spread %</label><input id="techSpread" type="number" step="0.0001" /></div>
+          <div class="field"><label>Day move min / max</label>
+            <div class="row">
+              <input id="techDayMin" type="number" step="0.0001" style="width:45%" />
+              <input id="techDayMax" type="number" step="0.0001" style="width:45%" />
+            </div>
+          </div>
+          <div class="field"><label>Entry window (ET)</label>
+            <div class="row">
+              <input id="techBefore" style="width:45%" />
+              <input id="techAfter" style="width:45%" />
+            </div>
+          </div>
+          <div class="field"><label>Hard flat ET</label><input id="techFlat" /></div>
+          <div class="field"><label>Universe (comma-separated)</label><textarea id="techUniverse" rows="4" style="width:100%"></textarea></div>
+          <div class="row">
+            <button class="btn btn-ok" id="btnSaveTech">Apply Tech Config</button>
+            <button class="btn btn-secondary" id="btnResetTech">Reset YAML</button>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="row" style="justify-content:space-between;margin-bottom:0.5rem">
+            <strong>Options Directional</strong>
+            <span class="chip" id="optVer">v—</span>
+          </div>
+          <div class="field"><label>TP % on premium</label><input id="optTp" type="number" step="0.01" /></div>
+          <div class="field"><label>SL % on premium</label><input id="optSl" type="number" step="0.01" /></div>
+          <div class="field"><label>Hard flat ET</label><input id="optFlat" /></div>
+          <div class="field"><label>Max premium USD</label><input id="optPremium" type="number" /></div>
+          <div class="field"><label>Delta target</label><input id="optDelta" type="number" step="0.01" /></div>
+          <div class="field"><label>Same-day symbol block</label>
+            <select id="sameDayBlock"><option value="1">On</option><option value="0">Off</option></select>
+          </div>
+          <div class="field"><label>Dry run (no live orders)</label>
+            <select id="dryRun"><option value="0">Off</option><option value="1">On</option></select>
+          </div>
+          <div class="field"><label>Auto-entry</label>
+            <select id="autoEntry"><option value="0">Off</option><option value="1">On</option></select>
+          </div>
+          <div class="field"><label>Scanner</label>
+            <select id="scannerFlag"><option value="1">On</option><option value="0">Off</option></select>
+          </div>
+          <div class="row">
+            <button class="btn btn-ok" id="btnSaveOpt">Apply Options Config</button>
+            <button class="btn btn-secondary" id="btnResetOpt">Reset YAML</button>
+            <button class="btn btn-secondary" id="btnFlags">Save Flags</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-an" hidden>
+      <div class="panel row" style="justify-content:space-between">
+        <div>
+          <strong>Edge verification</strong>
+          <div class="faint" id="anSummary"></div>
+        </div>
+        <a class="btn btn-secondary" href="/api/analytics/export.csv">Export Ledger CSV</a>
+      </div>
+      <div class="grid-2">
+        <div class="panel">
+          <div class="panel-head"><h2>Slippage</h2></div>
+          <canvas id="slipCanvas" width="520" height="260" style="width:100%;max-width:520px;background:#0a0e14;border-radius:4px"></canvas>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>Exit reasons</h2></div>
+          <div id="exitReasons" class="feed"></div>
+          <div class="panel-head" style="margin-top:1rem"><h2>Time-of-day heatmap</h2></div>
+          <div id="heatmap" class="feed"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast"></div>
+
+  <div class="modal-bg" id="haltModal">
+    <div class="modal">
+      <h3>GLOBAL HALT</h3>
+      <p class="muted">Choose how aggressive the halt should be.</p>
+      <div class="field">
+        <label><input type="radio" name="haltVar" value="flatten" checked /> Flatten all — cancel pending + market exit everything</label>
+      </div>
+      <div class="field">
+        <label><input type="radio" name="haltVar" value="soft" /> Soft — cancel pending + stop scanner, keep positions</label>
+      </div>
+      <div class="field">
+        <label><input type="radio" name="haltVar" value="entries_only" /> Entries only — block new entries, keep monitoring exits</label>
+      </div>
+      <div class="row" style="justify-content:flex-end;margin-top:1rem">
+        <button class="btn btn-secondary" id="haltCancel">Cancel</button>
+        <button class="btn btn-halt" id="haltConfirm">Confirm Halt</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-bg" id="confirmModal">
+    <div class="modal">
+      <h3 id="confirmTitle">Confirm</h3>
+      <p class="muted" id="confirmBody"></p>
+      <div class="row" style="justify-content:flex-end;margin-top:1rem">
+        <button class="btn btn-secondary" id="confirmCancel">Cancel</button>
+        <button class="btn btn-danger" id="confirmOk">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let techConfig = null;
+    let optConfig = null;
+    let scanSchedule = null;
+    let tradingWindow = null;
+    let selectedScanId = null;
+    let lastSeenScanId = null;
+    let confirmResolver = null;
+    let lastFlags = {};
+
+    function showToast(msg) {
+      const t = $("toast");
+      t.textContent = msg;
+      t.classList.add("show");
+      clearTimeout(showToast._timer);
+      showToast._timer = setTimeout(() => t.classList.remove("show"), 3200);
+    }
+
+    function askConfirm(title, body) {
+      $("confirmTitle").textContent = title;
+      $("confirmBody").textContent = body;
+      $("confirmModal").classList.add("show");
+      return new Promise((resolve) => { confirmResolver = resolve; });
+    }
+    $("confirmCancel").onclick = () => {
+      $("confirmModal").classList.remove("show");
+      if (confirmResolver) confirmResolver(false);
+      confirmResolver = null;
+    };
+    $("confirmOk").onclick = () => {
+      $("confirmModal").classList.remove("show");
+      if (confirmResolver) confirmResolver(true);
+      confirmResolver = null;
+    };
+
+    function fmtCountdown(sec) {
+      if (sec == null || sec < 0) return "--:--";
+      const m = Math.floor(sec / 60);
+      const s = Math.floor(sec % 60);
+      return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+    }
+
+    function fmtDateTime(iso) {
+      if (!iso) return "—";
+      try {
+        const d = new Date(iso);
+        return d.toLocaleString("en-US", {
+          timeZone: "America/Los_Angeles",
+          month: "short",
+          day: "numeric",
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        }) + " PT";
+      } catch { return iso; }
+    }
+
+    function setSeg(id, on, onClass, offClass) {
+      const root = $(id);
+      [...root.querySelectorAll("button")].forEach((b) => {
+        b.classList.remove("active-on", "active-off", "active-live");
+        const val = b.dataset.val === "1";
+        if (val === on) b.classList.add(onClass);
+        else if (!on && b.dataset.val === "0") b.classList.add(offClass);
+      });
+    }
+
+    function wireSeg(id, handler) {
+      $(id).querySelectorAll("button").forEach((b) => {
+        b.onclick = () => handler(b.dataset.val === "1");
+      });
+    }
+
+    async function setFlags(partial) {
+      await api("/api/flags", { method: "POST", body: JSON.stringify(partial) });
+      showToast("Flags updated");
+      refresh();
+    }
+
+    function renderDesk(s) {
+      const desk = s.desk || {};
+      const win = s.trading_window || {};
+      const flags = s.flags || {};
+      const ss = s.system || {};
+      tradingWindow = win;
+      lastFlags = flags;
+
+      const tone = desk.tone || "muted";
+      $("deskPanel").className = `panel desk tone-${tone}`;
+      $("deskLabel").className = `desk-label tone-${tone}`;
+      $("deskLabel").textContent = desk.label || "—";
+      $("deskDetail").textContent = desk.detail || "";
+      $("haltReason").textContent = ss.halt_reason ? `Halt: ${ss.halt_reason}` : `Mode: ${(ss.mode || "—").toUpperCase()}`;
+
+      const canLive = !!desk.can_place_live_orders;
+      const liveEl = $("liveAnswer");
+      liveEl.className = "live-answer " + (canLive ? "yes" : "no");
+      liveEl.textContent = canLive
+        ? "Can place live orders? YES — autonomous auto-entry is armed"
+        : "Can place live orders? NO — broker stays flat on new entries";
+
+      // Window cell
+      const winEl = $("winValue");
+      if (win.in_window) {
+        winEl.textContent = "OPEN";
+        winEl.className = "v open";
+      } else {
+        winEl.textContent = (win.phase || "closed").toUpperCase().replace("_", " ");
+        winEl.className = "v closed";
+      }
+      $("winRange").textContent = win.start_et && win.end_et
+        ? `${win.start_et}–${win.end_et} ET`
+        : "";
+      $("windowMessage").textContent = win.message || "—";
+      $("untilOpen").textContent = win.in_window ? "—" : fmtCountdown(win.seconds_until_open);
+      $("untilClose").textContent = win.in_window ? fmtCountdown(win.seconds_until_close) : "—";
+      $("windowNow").textContent = win.now_et ? `Now ${win.now_et} ET` : "";
+
+      // Execution
+      const exec = $("execValue");
+      if (flags.dry_run) {
+        exec.textContent = "DRY RUN";
+        exec.className = "v off";
+        $("execHint").textContent = "No broker orders";
+      } else {
+        exec.textContent = "LIVE";
+        exec.className = "v live";
+        $("execHint").textContent = "Real orders possible";
+      }
+
+      // Scanner
+      const sc = $("scanValue");
+      if (flags.scanner_enabled) {
+        sc.textContent = "ON";
+        sc.className = "v on";
+        $("scanHint").textContent = "Evaluating watchlist";
+      } else {
+        sc.textContent = "OFF";
+        sc.className = "v off";
+        $("scanHint").textContent = "Paused — no candidates";
+      }
+
+      const au = $("autoValue");
+      if (flags.auto_entry_enabled) {
+        au.textContent = "ON";
+        au.className = "v on";
+      } else {
+        au.textContent = "OFF";
+        au.className = "v off";
+      }
+      $("modeTiny").textContent = (ss.mode || "—").toUpperCase();
+
+      setSeg("segScanner", !!flags.scanner_enabled, "active-on", "active-off");
+      setSeg("segDry", !!flags.dry_run, "active-off", "active-live");
+      // dry run ON uses amber (active-off), LIVE uses active-live on the LIVE button
+      const dryRoot = $("segDry");
+      [...dryRoot.querySelectorAll("button")].forEach((b) => {
+        b.classList.remove("active-on", "active-off", "active-live");
+        if (flags.dry_run && b.dataset.val === "1") b.classList.add("active-off");
+        if (!flags.dry_run && b.dataset.val === "0") b.classList.add("active-live");
+      });
+      setSeg("segAuto", !!flags.auto_entry_enabled, "active-on", "active-off");
+    }
+
+    function renderScanSchedule(sched, summary, decision) {
+      scanSchedule = sched;
+      if (!sched) {
+        $("scanCountdown").textContent = "--:--";
+        $("scanScheduleMeta").textContent = "Waiting for engine…";
+        $("telCountdown").textContent = "--:--";
+        return;
+      }
+      const enabled = sched.scanner_enabled;
+      let label = `every ${sched.rescan_minutes}m`;
+      if (!enabled) label = "scanner paused";
+      else if (sched.scan_in_progress) label = "scan in progress…";
+      else if (sched.force_pending) label = "forced scan queued";
+      $("scanScheduleMeta").textContent =
+        `${label} · last ${fmtDateTime(sched.last_rescan_at)} · next ${fmtDateTime(sched.next_rescan_at)}`;
+      const sec = sched.scan_in_progress || sched.force_pending ? 0 : sched.seconds_until_next;
+      $("scanCountdown").textContent = enabled ? fmtCountdown(sec) : "OFF";
+      $("scanCountdownLabel").textContent = !enabled
+        ? "scanning paused"
+        : sched.scan_in_progress
+          ? "scanning now"
+          : "until next scan";
+      $("telCountdown").textContent = enabled ? fmtCountdown(sec) : "OFF";
+      $("telCountdownMeta").textContent = !enabled ? "scanner off" : (sched.scan_in_progress ? "scanning…" : "until next scan");
+
+      if (summary) {
+        const top = (summary.top || []).map((t) => t.symbol || t).join(", ") || "—";
+        const rejects = Object.entries(summary.reject_counts || {})
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 4)
+          .map(([k, v]) => `${k}:${v}`)
+          .join(" · ");
+        $("lastScanResult").innerHTML =
+          `Scan #${summary.id} · ${summary.trigger} · ${fmtDateTime(summary.ts)} · ` +
+          `${summary.qualified_count} qualified / ${summary.evaluated}` +
+          ` · Top: ${top}` +
+          (rejects ? ` · Rejects ${rejects}` : "");
+        if (summary.id && summary.id !== lastSeenScanId) lastSeenScanId = summary.id;
+      }
+
+      const title = $("decisionTitle");
+      const msg = $("entryDecisionMsg");
+      const ts = $("decisionTs");
+      if (decision && decision.message) {
+        ts.textContent = decision.ts ? fmtDateTime(decision.ts) : "";
+        if (decision.code === "dry_run") title.textContent = "SIMULATED ENTRY";
+        else if (decision.action === "blocked") title.textContent = "NO ENTRY";
+        else if (decision.action === "propose") title.textContent = "AWAITING APPROVAL";
+        else if (decision.code === "live_entry") title.textContent = "LIVE ENTRY QUEUED";
+        else if (decision.code === "no_qualified") title.textContent = "NO QUALIFIED NAMES";
+        else title.textContent = "ENTRY DECISION";
+        const tone =
+          decision.action === "blocked" || decision.code === "dry_run" || decision.code === "no_qualified"
+            ? "neg"
+            : decision.code === "live_entry" ? "pos" : "";
+        msg.innerHTML = `<span class="${tone}">${decision.message}</span>`;
+      }
+    }
+
+    setInterval(() => {
+      if (scanSchedule && scanSchedule.scanner_enabled &&
+          !scanSchedule.scan_in_progress && !scanSchedule.force_pending &&
+          typeof scanSchedule.seconds_until_next === "number" &&
+          scanSchedule.seconds_until_next > 0) {
+        scanSchedule.seconds_until_next -= 1;
+        $("scanCountdown").textContent = fmtCountdown(scanSchedule.seconds_until_next);
+        $("telCountdown").textContent = fmtCountdown(scanSchedule.seconds_until_next);
+      }
+      if (tradingWindow) {
+        if (tradingWindow.in_window && tradingWindow.seconds_until_close > 0) {
+          tradingWindow.seconds_until_close -= 1;
+          $("untilClose").textContent = fmtCountdown(tradingWindow.seconds_until_close);
+        } else if (!tradingWindow.in_window && tradingWindow.seconds_until_open > 0) {
+          tradingWindow.seconds_until_open -= 1;
+          $("untilOpen").textContent = fmtCountdown(tradingWindow.seconds_until_open);
+        }
+      }
+    }, 1000);
+
+    document.querySelectorAll(".tabs button").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".tabs button").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        ["cc", "tel", "cfg", "an"].forEach((t) => {
+          $(`tab-${t}`).hidden = t !== btn.dataset.tab;
+        });
+        if (btn.dataset.tab === "tel") refreshTelemetry();
+        if (btn.dataset.tab === "cfg") loadConfigs();
+        if (btn.dataset.tab === "an") loadAnalytics();
+      });
+    });
+
+    async function api(path, opts) {
+      const res = await fetch(path, {
+        headers: { "Content-Type": "application/json" },
+        ...opts,
+      });
+      if (!res.ok) throw new Error(await res.text());
+      return res.json();
+    }
+
+    function ageSeconds(iso) {
+      if (!iso) return 9999;
+      return (Date.now() - new Date(iso).getTime()) / 1000;
+    }
+
+    function renderStatus(s) {
+      const ss = s.system || {};
+      const poll = ss.poll_seconds || 15;
+      const age = ageSeconds(s.heartbeat_at || ss.engine_heartbeat_at);
+      $("hbDot").className = "dot " + (age < poll * 2 ? "ok" : age < poll * 6 ? "warn" : "bad");
+      $("mcpDot").className = "dot " + (s.mcp_ok ? "ok" : "bad");
+
+      renderDesk(s);
+
+      const stats = s.daily_stats || {};
+      const pnl = Number(stats.realized_pnl || 0);
+      $("pnl").textContent = `$${pnl.toFixed(2)}`;
+      $("pnl").className = "stat-num " + (pnl >= 0 ? "pos" : "neg");
+      $("tradeCount").textContent = `${stats.trade_count || 0} trades today`;
+      const cb = s.circuit_breakers || {};
+      const slU = cb.equity_sl?.used || 0, slM = cb.equity_sl?.max || 5;
+      const oU = cb.option_losses?.used || 0, oM = cb.option_losses?.max || 2;
+      $("slLabel").textContent = `${slU}/${slM}`;
+      $("optLabel").textContent = `${oU}/${oM}`;
+      const slPct = Math.min(100, (slU / slM) * 100);
+      const oPct = Math.min(100, (oU / oM) * 100);
+      $("slBar").className = "bar " + (slPct >= 80 ? "danger" : slPct >= 50 ? "warn" : "");
+      $("slBar").innerHTML = `<span style="width:${slPct}%"></span>`;
+      $("optBar").className = "bar " + (oPct >= 80 ? "danger" : oPct >= 50 ? "warn" : "");
+      $("optBar").innerHTML = `<span style="width:${oPct}%"></span>`;
+      $("updatedAt").textContent = s.updated_at ? fmtDateTime(s.updated_at) : "";
+      renderScanSchedule(s.scan_schedule, s.last_scan_summary, s.entry_decision);
+
+      const snaps = s.snapshots || [];
+      if (!snaps.length) {
+        $("posBody").innerHTML = `<tr><td colspan="8" class="empty">No open positions</td></tr>`;
+      } else {
+        $("posBody").innerHTML = snaps.map((p) => {
+          const prec = p.asset === "option" ? 4 : 2;
+          const cls = p.pnl >= 0 ? "pos" : "neg";
+          const badge = p.auto_exit === false ? '<span class="chip off">manual</span>' :
+            (p.synthetic_sl ? '<span class="chip warn">synth SL</span>' : '<span class="chip on">broker SL</span>');
+          const idAttr = p.option_id
+            ? `data-option-id="${p.option_id}"`
+            : `data-symbol="${p.symbol}"`;
+          return `<tr>
+            <td><b>${p.symbol}</b> ${badge}</td>
+            <td>$${Number(p.last).toFixed(prec)}</td>
+            <td>$${Number(p.entry).toFixed(prec)}</td>
+            <td class="${cls}">$${Number(p.pnl).toFixed(2)} (${Number(p.pnl_pct).toFixed(2)}%)</td>
+            <td>${Number(p.dist_tp).toFixed(prec)} <span class="faint">(${Number(p.dist_tp_pct||0).toFixed(2)}%)</span></td>
+            <td>${Number(p.dist_sl).toFixed(prec)} <span class="faint">(${Number(p.dist_sl_pct||0).toFixed(2)}%)</span></td>
+            <td>${Number(p.tp).toFixed(prec)} / ${Number(p.sl).toFixed(prec)}</td>
+            <td>
+              <button class="btn btn-danger btn-liq" ${idAttr}>Liquidate</button>
+              <button class="btn btn-ghost btn-ae" ${idAttr} data-ae="${p.auto_exit === false ? 1 : 0}">
+                ${p.auto_exit === false ? "Enable AE" : "Cancel AE"}
+              </button>
+            </td>
+          </tr>`;
+        }).join("");
+        document.querySelectorAll(".btn-liq").forEach((b) => {
+          b.onclick = () => api("/api/liquidate", {
+            method: "POST",
+            body: JSON.stringify({
+              symbol: b.dataset.symbol || null,
+              option_id: b.dataset.optionId || null,
+            }),
+          }).then(() => showToast("Liquidate queued"));
+        });
+        document.querySelectorAll(".btn-ae").forEach((b) => {
+          b.onclick = () => api("/api/auto-exit", {
+            method: "POST",
+            body: JSON.stringify({
+              symbol: b.dataset.symbol || null,
+              option_id: b.dataset.optionId || null,
+              enabled: b.dataset.ae === "1",
+            }),
+          });
+        });
+      }
+
+      const alerts = s.alerts || [];
+      $("alerts").innerHTML = alerts.length
+        ? alerts.map((a) => `<li>${a}</li>`).join("")
+        : "<li>—</li>";
+
+      const appr = s.approvals || [];
+      if (!appr.length) $("approvals").innerHTML = '<div class="empty">None</div>';
+      else {
+        $("approvals").innerHTML = appr.map((a) => `
+          <div class="row" style="margin:0.35rem 0">
+            <span>#${a.id} ${a.action_type} ${a.symbol || a.option_id || ""}</span>
+            <button class="btn btn-ok" onclick="decide(${a.id}, true)">Approve</button>
+            <button class="btn btn-danger" onclick="decide(${a.id}, false)">Reject</button>
+          </div>`).join("");
+      }
+    }
+
+    window.decide = async (id, ok) => {
+      await api(ok ? "/api/approvals/approve" : "/api/approvals/reject", {
+        method: "POST",
+        body: JSON.stringify({ approval_id: id }),
+      });
+    };
+
+    async function refresh() {
+      try {
+        const s = await api("/api/status");
+        renderStatus(s);
+      } catch (e) {
+        $("hbDot").className = "dot bad";
+      }
+    }
+
+    async function refreshTelemetry() {
+      const [audit, scan] = await Promise.all([
+        api("/api/audit?limit=80"),
+        api("/api/scan?limit=25"),
+      ]);
+      $("auditFeed").innerHTML = (audit.events || []).map((e) =>
+        `<div><span class="muted">${e.ts}</span> <b>${e.event_type}</b> ${JSON.stringify(e.payload)}</div>`
+      ).join("") || "<div class='muted'>No events</div>";
+
+      renderScanSchedule(scan.schedule, scan.summary, null);
+
+      const hist = scan.history || [];
+      $("scanHistoryBody").innerHTML = hist.length
+        ? hist.map((h) => {
+            const active = selectedScanId === h.id || (!selectedScanId && h === hist[0]);
+            return `<tr data-scan-id="${h.id}" style="cursor:pointer;${active ? "background:#1c2430" : ""}">
+              <td>${fmtDateTime(h.ts)}</td>
+              <td>${h.trigger}</td>
+              <td><span class="chip on">${h.qualified_count}</span> / ${h.evaluated}</td>
+              <td>${(h.top || []).join(", ") || "—"}</td>
+            </tr>`;
+          }).join("")
+        : `<tr><td colspan="4" class="empty">No scans yet</td></tr>`;
+
+      document.querySelectorAll("#scanHistoryBody tr[data-scan-id]").forEach((tr) => {
+        tr.onclick = () => loadScanDetail(Number(tr.dataset.scanId));
+      });
+
+      const detailId = selectedScanId || (hist[0] && hist[0].id);
+      if (detailId) {
+        if (!selectedScanId || selectedScanId === (scan.scan && scan.scan.id)) {
+          renderScanDetail(scan.scan, scan.summary);
+          selectedScanId = scan.scan && scan.scan.id;
+        } else {
+          loadScanDetail(selectedScanId);
+        }
+      } else {
+        $("scanMeta").textContent = "No scan yet";
+        $("scanBody").innerHTML = "";
+        $("scanRejectSummary").textContent = "";
+      }
+    }
+
+    async function loadScanDetail(id) {
+      selectedScanId = id;
+      const data = await api(`/api/scan?scan_id=${id}`);
+      renderScanDetail(data.scan, data.summary);
+      document.querySelectorAll("#scanHistoryBody tr[data-scan-id]").forEach((tr) => {
+        tr.style.background = Number(tr.dataset.scanId) === id ? "#1c2430" : "";
+      });
+    }
+
+    function renderScanDetail(sc, summary) {
+      if (!sc) {
+        $("scanMeta").textContent = "No scan yet";
+        $("scanBody").innerHTML = "";
+        $("scanRejectSummary").textContent = "";
+        return;
+      }
+      $("scanMeta").textContent =
+        `#${sc.id} · ${sc.trigger} · ${fmtDateTime(sc.ts)} · ${(summary && summary.qualified_count) || 0} qualified / ${(summary && summary.evaluated) || (sc.rows || []).length}`;
+      const rejects = summary && summary.reject_counts
+        ? Object.entries(summary.reject_counts).map(([k, v]) => `${k}: ${v}`).join(" · ")
+        : "";
+      $("scanRejectSummary").textContent = rejects ? `Rejects — ${rejects}` : "";
+      const rows = [...(sc.rows || [])].sort((a, b) => {
+        if (a.qualified && !b.qualified) return -1;
+        if (!a.qualified && b.qualified) return 1;
+        return (a.rank || 999) - (b.rank || 999);
+      });
+      $("scanBody").innerHTML = rows.map((r) => {
+        const status = r.qualified
+          ? `<span class="chip on">#${r.rank || "?"} ok</span>`
+          : `<span class="chip off">${r.reject_reason || "fail"}</span>`;
+        return `<tr>
+          <td>${r.symbol}</td><td>${status}</td>
+          <td>${r.day != null ? (r.day * 100).toFixed(2) + "%" : "—"}</td>
+          <td>${r.spread_pct != null ? (r.spread_pct * 100).toFixed(3) + "%" : "—"}</td>
+          <td>${r.mid != null ? "$" + Number(r.mid).toFixed(2) : "—"}</td>
+        </tr>`;
+      }).join("");
+    }
+
+    async function loadConfigs() {
+      techConfig = await api("/api/config/tech_scalper");
+      optConfig = await api("/api/config/options_directional");
+      const t = techConfig.config;
+      const o = optConfig.config;
+      $("techVer").textContent = `v${techConfig.version}`;
+      $("optVer").textContent = `v${optConfig.version}`;
+      $("techTp").value = t.scalp?.profit_target_pct ?? 0.006;
+      $("techSl").value = t.scalp?.stop_loss_pct ?? 0.0045;
+      $("techSpread").value = t.selection?.max_spread_pct ?? 0.0015;
+      $("techDayMin").value = t.selection?.min_abs_day_change_pct ?? 0.003;
+      $("techDayMax").value = t.selection?.max_abs_day_change_pct ?? 0.008;
+      $("techBefore").value = t.scalp?.no_new_entry_before_et ?? "09:45";
+      $("techAfter").value = t.scalp?.no_new_entry_after_et ?? "15:30";
+      $("techFlat").value = t.scalp?.hard_flat_time_et ?? "15:55";
+      $("techUniverse").value = (t.watchlist?.all || []).join(", ");
+      $("optTp").value = o.trade?.profit_target_pct ?? 0.15;
+      $("optSl").value = o.trade?.stop_loss_pct ?? 0.10;
+      $("optFlat").value = o.trade?.hard_flat_time_et ?? "15:45";
+      $("optPremium").value = o.position_sizing?.max_premium_usd ?? 75;
+      $("optDelta").value = o.contract_selection?.delta_target ?? 0.15;
+      const st = await api("/api/status");
+      $("sameDayBlock").value = st.system.same_day_symbol_block ? "1" : "0";
+      $("dryRun").value = st.system.dry_run ? "1" : "0";
+      $("autoEntry").value = st.system.auto_entry_enabled ? "1" : "0";
+      $("scannerFlag").value = st.system.scanner_enabled ? "1" : "0";
+    }
+
+    $("btnSaveTech").onclick = async () => {
+      const c = structuredClone(techConfig.config);
+      c.scalp.profit_target_pct = Number($("techTp").value);
+      c.scalp.stop_loss_pct = Number($("techSl").value);
+      c.scalp.no_new_entry_before_et = $("techBefore").value;
+      c.scalp.no_new_entry_after_et = $("techAfter").value;
+      c.scalp.hard_flat_time_et = $("techFlat").value;
+      c.selection.max_spread_pct = Number($("techSpread").value);
+      c.selection.min_abs_day_change_pct = Number($("techDayMin").value);
+      c.selection.max_abs_day_change_pct = Number($("techDayMax").value);
+      c.watchlist.all = $("techUniverse").value.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
+      await api("/api/config/tech_scalper", { method: "PUT", body: JSON.stringify({ config: c }) });
+      loadConfigs();
+      showToast("Tech config applied");
+    };
+    $("btnSaveOpt").onclick = async () => {
+      const c = structuredClone(optConfig.config);
+      c.trade.profit_target_pct = Number($("optTp").value);
+      c.trade.stop_loss_pct = Number($("optSl").value);
+      c.trade.hard_flat_time_et = $("optFlat").value;
+      c.position_sizing.max_premium_usd = Number($("optPremium").value);
+      c.contract_selection = c.contract_selection || {};
+      c.contract_selection.delta_target = Number($("optDelta").value);
+      await api("/api/config/options_directional", { method: "PUT", body: JSON.stringify({ config: c }) });
+      loadConfigs();
+      showToast("Options config applied");
+    };
+    $("btnResetTech").onclick = () => api("/api/config/tech_scalper/reset", { method: "POST" }).then(loadConfigs);
+    $("btnResetOpt").onclick = () => api("/api/config/options_directional/reset", { method: "POST" }).then(loadConfigs);
+    $("btnFlags").onclick = () => api("/api/flags", {
+      method: "POST",
+      body: JSON.stringify({
+        same_day_symbol_block: $("sameDayBlock").value === "1",
+        dry_run: $("dryRun").value === "1",
+        auto_entry_enabled: $("autoEntry").value === "1",
+        scanner_enabled: $("scannerFlag").value === "1",
+      }),
+    }).then(() => showToast("Flags saved"));
+
+    function drawSlippage(points) {
+      const canvas = $("slipCanvas");
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.strokeStyle = "#2a3444";
+      ctx.beginPath();
+      ctx.moveTo(40, 20); ctx.lineTo(40, 240); ctx.lineTo(500, 240);
+      ctx.stroke();
+      if (!points.length) {
+        ctx.fillStyle = "#8b9bb4";
+        ctx.fillText("No fill data yet", 200, 130);
+        return;
+      }
+      const xs = points.map((p) => p.expected_mid);
+      const ys = points.map((p) => p.fill_price);
+      const minX = Math.min(...xs), maxX = Math.max(...xs);
+      const minY = Math.min(...ys), maxY = Math.max(...ys);
+      const sx = (v) => 40 + ((v - minX) / (maxX - minX || 1)) * 440;
+      const sy = (v) => 240 - ((v - minY) / (maxY - minY || 1)) * 200;
+      ctx.strokeStyle = "#5b9fd4";
+      ctx.beginPath();
+      ctx.moveTo(40, 240); ctx.lineTo(500, 20);
+      ctx.stroke();
+      points.forEach((p) => {
+        ctx.fillStyle = p.slippage_bps >= 0 ? "#3dd68c" : "#f07178";
+        ctx.beginPath();
+        ctx.arc(sx(p.expected_mid), sy(p.fill_price), 4, 0, Math.PI * 2);
+        ctx.fill();
+      });
+    }
+
+    async function loadAnalytics() {
+      const a = await api("/api/analytics/summary");
+      $("anSummary").textContent =
+        `${a.trade_count} trades · median slippage ${a.median_slippage_bps != null ? a.median_slippage_bps.toFixed(1) + " bps" : "n/a"}`;
+      drawSlippage(a.slippage_points || []);
+      $("exitReasons").innerHTML = Object.entries(a.exit_reasons || {})
+        .map(([k, v]) => `<div>${k}: <b>${v}</b></div>`).join("") || "<div class='muted'>—</div>";
+      $("heatmap").innerHTML = Object.entries(a.heatmap || {})
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([k, v]) => {
+          const wr = v.n ? ((v.wins / v.n) * 100).toFixed(0) : 0;
+          return `<div>${k} · n=${v.n} WR=${wr}% PnL=$${Number(v.pnl).toFixed(2)}</div>`;
+        }).join("") || "<div class='muted'>—</div>";
+    }
+
+    wireSeg("segScanner", async (on) => {
+      if (on === !!lastFlags.scanner_enabled) return;
+      if (on && tradingWindow && !tradingWindow.in_window) {
+        const ok = await askConfirm(
+          "Enable scanner outside trading window?",
+          "You are outside the entry window. Scans can still run for review, but new entries will be blocked until the window opens. Continue?"
+        );
+        if (!ok) return;
+      }
+      await setFlags({ scanner_enabled: on });
+    });
+
+    wireSeg("segDry", async (dry) => {
+      if (dry === !!lastFlags.dry_run) return;
+      if (!dry) {
+        const ok = await askConfirm(
+          "Switch to LIVE execution?",
+          "Dry run will turn OFF. Eligible signals may send real Robinhood orders (if auto-entry is also ON and you are inside the trading window)."
+        );
+        if (!ok) return;
+      }
+      await setFlags({ dry_run: dry });
+    });
+
+    wireSeg("segAuto", async (on) => {
+      if (on === !!lastFlags.auto_entry_enabled) return;
+      if (on && !lastFlags.dry_run) {
+        const ok = await askConfirm(
+          "Enable auto-entry with LIVE execution?",
+          "The engine may place real orders on the next qualifying scan."
+        );
+        if (!ok) return;
+      }
+      await setFlags({ auto_entry_enabled: on });
+    });
+
+    $("btnHalt").onclick = () => $("haltModal").classList.add("show");
+    $("haltCancel").onclick = () => $("haltModal").classList.remove("show");
+    $("haltConfirm").onclick = async () => {
+      const variant = document.querySelector('input[name="haltVar"]:checked').value;
+      await api("/api/halt", { method: "POST", body: JSON.stringify({ variant }) });
+      $("haltModal").classList.remove("show");
+      showToast("Halt engaged");
+      refresh();
+    };
+    $("btnResume").onclick = () => api("/api/resume", { method: "POST" }).then(() => { showToast("Resumed"); refresh(); });
+    $("btnAutonomous").onclick = () => api("/api/mode", { method: "POST", body: JSON.stringify({ mode: "autonomous" }) }).then(refresh);
+    $("btnCopilot").onclick = () => api("/api/mode", { method: "POST", body: JSON.stringify({ mode: "copilot" }) }).then(refresh);
+    $("btnRescan").onclick = () => api("/api/force-rescan", { method: "POST" }).then(() => setTimeout(refreshTelemetry, 1500));
+    $("btnInject").onclick = () => api("/api/inject", {
+      method: "POST",
+      body: JSON.stringify({ text: $("injectText").value }),
+    }).then(() => setTimeout(refreshTelemetry, 1500));
+
+    refresh();
+    setInterval(refresh, 3000);
+  </script>
+</body>
+</html>

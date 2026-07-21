@@ -9,7 +9,10 @@ account:
   timezone_reference: America/New_York
 
 portfolio:
-  one_playbook_per_day: true
+  # May run alongside tech scalper equity the same day; avoid leveraged ETF same day.
+  one_playbook_per_day: false
+  allow_equity_and_options_same_day: true
+  exclude_leveraged_etf_with_other_playbooks: true
 
 prerequisites:
   min_option_level: option_level_2
@@ -28,8 +31,8 @@ position_sizing:
   cooldown_minutes_after_loss: 60
 
 trade:
-  profit_target_pct: 0.40         # +40% on premium
-  stop_loss_pct: 0.30             # -30% on premium (tighter; max loss still 100% of premium)
+  profit_target_pct: 0.15         # +15% on premium (intraday)
+  stop_loss_pct: 0.10             # -10% on premium (max loss still 100% of premium)
   hard_flat_time_et: "15:45"
   no_new_entry_after_et: "15:00"
   no_new_entry_before_et: "10:00"
@@ -37,8 +40,8 @@ trade:
   require_post_fill_refresh: true
 
 underlyings:
-  # Pilot: QQQ/SPY only — NVDA needs ~$200+ for real delta.
-  pilot_core_only: true
+  # Full list: core + extended (cheap ~0.15Δ weeklies; skip names that won't fit $75 premium).
+  pilot_core_only: false
   core:
     - SPY
     - QQQ

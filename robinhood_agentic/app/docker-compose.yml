@@ -1,0 +1,16 @@
+# Cloud / supervised run (Phase 5)
+services:
+  command-center:
+    build:
+      context: ../..
+      dockerfile: robinhood_agentic/app/Dockerfile
+    ports:
+      - "8787:8787"
+    environment:
+      # Required when exposed beyond localhost
+      COMMAND_CENTER_PIN: ${COMMAND_CENTER_PIN:-}
+      ROBINHOOD_MCP_ACCESS_TOKEN: ${ROBINHOOD_MCP_ACCESS_TOKEN:-}
+    volumes:
+      - ../../data:/app/robinhood_agentic/data
+      - ../../monitor/.mcp_access_token:/app/robinhood_agentic/monitor/.mcp_access_token:ro
+    restart: unless-stopped

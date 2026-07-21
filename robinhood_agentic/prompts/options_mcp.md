@@ -11,10 +11,10 @@ Strategy: [`docs/OPTIONS_MCP_STRATEGY.md`](../docs/OPTIONS_MCP_STRATEGY.md)
 Robinhood MCP:
 1. get_accounts → Agentic option_level, agentic_allowed.
 2. If option_level empty: STOP. Show upgrade URL: upgrade_url_template with account_number from get_accounts.
-3. one_playbook_per_day check.
+3. Equity+options same day OK; skip if leveraged ETF already ran today.
 4. get_portfolio; reserve $100.
 
-Report: READY | NEED_OPTIONS_ENROLLMENT | INSUFFICIENT_CASH | OTHER_PLAYBOOK_TODAY
+Report: READY | NEED_OPTIONS_ENROLLMENT | INSUFFICIENT_CASH | LEV_ETF_CONFLICT
 ```
 
 ---
@@ -43,9 +43,9 @@ Recommend 1 candidate. Defined risk = 100% of premium.
 ```
 Follow options_directional.yaml.
 
-PHASE A — Verify level + one_playbook_per_day + BP.
+PHASE A — Verify level + BP; equity playbook may already be live.
 PHASE B — Chain scan (#2); ONE contract, premium ≤$75.
-PHASE C — review_option_order buy open 1 limit; show TP +40%, SL -30%, max loss=premium. "go" → place.
+PHASE C — review_option_order buy open 1 limit; show TP +15%, SL -10%, max loss=premium. "go" → place.
 PHASE D — Post-fill get_option_orders + get_option_positions.
 PHASE E — Poll 15s: TP/SL on premium; 3:45 PM ET flatten. Max 2 trades/day.
 

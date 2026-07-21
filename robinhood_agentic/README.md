@@ -53,7 +53,8 @@ Project-level MCP config lives at:
    - Lev ETF pilot: `LEVERAGED_ETF_STRATEGY.md` + `leveraged_etf.md`
    - Options (after enroll): `OPTIONS_MCP_STRATEGY.md` + `options_mcp.md`
 6. Only after read-only scans work, try small test orders in the Agentic account.
-7. **Live session monitor** (optional): `python3 robinhood_agentic/monitor/session_monitor.py --notify` — polls AAPL TP/SL every 15s; see `monitor/README.md`.
+7. **Command Center** (recommended): `pip install -r robinhood_agentic/requirements-app.txt && python -m robinhood_agentic.app` → http://127.0.0.1:8787 — see [`app/README.md`](app/README.md). Do **not** run alongside the legacy CLI monitor.
+8. **Legacy session monitor** (optional): `python3 robinhood_agentic/monitor/session_monitor.py --notify` — see `monitor/README.md`.
 
 ## Important
 

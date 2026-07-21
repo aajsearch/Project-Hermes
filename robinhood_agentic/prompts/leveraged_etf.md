@@ -10,7 +10,7 @@ Strategy: [`docs/LEVERAGED_ETF_STRATEGY.md`](../docs/LEVERAGED_ETF_STRATEGY.md)
 ```
 Follow leveraged_etf.yaml. Robinhood MCP only.
 
-1. one_playbook_per_day check (no tech scalper same day).
+1. Do not start if tech scalper or options already ran today.
 2. get_portfolio (minus pending_deposits).
 3. get_equity_quotes: QQQ + tradable_symbols (TQQQ,SQQQ,UPRO,SPXU,SOXL,SOXS,TECL,TECS,NVDL).
 4. QQQ regime: bull ≥+0.50% / bear ≤−0.50% / else chop.

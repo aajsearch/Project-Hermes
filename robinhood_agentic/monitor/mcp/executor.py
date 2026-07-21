@@ -174,6 +174,116 @@ class TradeActions:
         ]
         state_path.write_text(json.dumps(state, indent=2) + "\n")
 
+    def remove_option_from_state(self, state_path: Path, option_id: str) -> None:
+        state = json.loads(state_path.read_text())
+        state["option_positions"] = [
+            p
+            for p in state.get("option_positions", [])
+            if p.get("option_id") != option_id
+        ]
+        state_path.write_text(json.dumps(state, indent=2) + "\n")
+
+    def get_option_positions(
+        self, account_number: str, *, nonzero: bool = True
+    ) -> list[dict[str, Any]]:
+        args: dict[str, Any] = {"account_number": account_number}
+        if nonzero:
+            args["nonzero"] = True
+        data = self.mcp.call("get_option_positions", args)
+        return list((data.get("data") or {}).get("positions") or [])
+
+    def get_option_quotes(self, option_ids: list[str]) -> dict[str, dict[str, Any]]:
+        if not option_ids:
+            return {}
+        data = self.mcp.call("get_option_quotes", {"instrument_ids": option_ids})
+        out: dict[str, dict[str, Any]] = {}
+        for row in (data.get("data") or {}).get("results") or []:
+            q = row.get("quote") or {}
+            oid = q.get("instrument_id")
+            if oid:
+                out[oid] = q
+        return out
+
+    def market_sell_option(
+        self,
+        account_number: str,
+        option_id: str,
+        quantity: str,
+    ) -> dict[str, Any]:
+        placed = self.place_option_order(
+            account_number=account_number,
+            legs=[
+                {
+                    "option_id": option_id,
+                    "side": "sell",
+                    "position_effect": "close",
+                }
+            ],
+            type="market",
+            quantity=quantity,
+            market_hours="regular_hours",
+            time_in_force="gfd",
+        )
+        return (placed.get("data") or {}).get("order") or {}
+
+    def place_option_order(self, **kwargs: Any) -> dict[str, Any]:
+        if "ref_id" not in kwargs:
+            kwargs["ref_id"] = str(uuid.uuid4()).upper()
+        return self.mcp.call("place_option_order", kwargs)
+
+    def execute_option_exit(
+        self,
+        alert: str,
+        state: dict[str, Any],
+        state_path: Path,
+    ) -> bool:
+        """Handle OPT_TP_HIT / OPT_SL_HIT — market sell-to-close, remove from state."""
+        parts = alert.split(":")
+        if len(parts) < 2:
+            return False
+        kind, option_id = parts[0], parts[1]
+        if kind not in {"OPT_TP_HIT", "OPT_SL_HIT", "OPT_FLAT"}:
+            return False
+        acct = state.get("account_number", "")
+        pos = next(
+            (
+                p
+                for p in state.get("option_positions", [])
+                if p.get("option_id") == option_id
+            ),
+            None,
+        )
+        if not pos:
+            return True
+        qty = str(int(float(pos.get("qty") or 1)))
+        order = self.market_sell_option(acct, option_id, qty)
+        oid = order.get("id")
+        state_name = (order.get("state") or "").lower()
+        if state_name == "filled":
+            self.remove_option_from_state(state_path, option_id)
+            return True
+        # Confirm flat via positions if fill state ambiguous.
+        time.sleep(1.0)
+        live = self.get_option_positions(acct, nonzero=True)
+        still = any(
+            p.get("option_id") == option_id and float(p.get("quantity") or 0) > 0
+            for p in live
+            if (p.get("type") or "").lower() == "long"
+        )
+        if still and oid:
+            # Give the fill a moment; if still open, fail for retry.
+            time.sleep(2.0)
+            live = self.get_option_positions(acct, nonzero=True)
+            still = any(
+                p.get("option_id") == option_id and float(p.get("quantity") or 0) > 0
+                for p in live
+                if (p.get("type") or "").lower() == "long"
+            )
+            if still:
+                return False
+        self.remove_option_from_state(state_path, option_id)
+        return True
+
     def _append_position(self, state_path: Path, pos: dict[str, Any]) -> None:
         state = json.loads(state_path.read_text())
         state.setdefault("positions", []).append(pos)
@@ -339,8 +449,68 @@ class TradeActions:
             msgs.append(f"RECONCILE: deduped {sym} (kept single entry)")
         deduped_list = list(deduped.values())
 
-        if msgs or len(deduped_list) != len(state.get("positions", [])):
+        # --- Options reconcile ---
+        opt_tp = float(cfg.get("options", {}).get("profit_target_pct", 0.15))
+        opt_sl = float(cfg.get("options", {}).get("stop_loss_pct", 0.10))
+        live_opts = [
+            p
+            for p in self.get_option_positions(acct, nonzero=True)
+            if (p.get("type") or "").lower() == "long" and float(p.get("quantity") or 0) > 0
+        ]
+        live_opt_ids = {p.get("option_id") for p in live_opts}
+        kept_opts: list[dict[str, Any]] = []
+        for pos in state.get("option_positions", []):
+            oid = pos.get("option_id")
+            if oid in live_opt_ids:
+                kept_opts.append(pos)
+            else:
+                msgs.append(
+                    f"RECONCILE: option {pos.get('label') or oid} not at broker — removed"
+                )
+        tracked_opts = {p.get("option_id") for p in kept_opts}
+        for row in live_opts:
+            oid = row.get("option_id")
+            if not oid or oid in tracked_opts:
+                continue
+            mult = float(row.get("trade_value_multiplier") or 100)
+            avg = float(row.get("average_price") or 0)
+            # Broker average_price is dollars paid per contract; convert to premium/share.
+            entry = avg / mult if avg >= 1.0 and mult > 1 else avg
+            if entry <= 0:
+                continue
+            qty = float(row.get("quantity") or 0)
+            sym = row.get("chain_symbol") or "?"
+            exp = row.get("expiration_date") or ""
+            label = f"{sym} {exp}"
+            kept_opts.append(
+                {
+                    "option_id": oid,
+                    "symbol": sym,
+                    "label": label,
+                    "expiration": exp,
+                    "qty": qty,
+                    "entry": round(entry, 4),
+                    "tp": round(entry * (1 + opt_tp), 4),
+                    "sl": round(entry * (1 - opt_sl), 4),
+                    "multiplier": mult,
+                    "synthetic_tp": True,
+                    "synthetic_sl": True,
+                    "adopted": True,
+                    "opened_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                }
+            )
+            msgs.append(
+                f"RECONCILE: adopted option {label} qty={qty:g} entry=${entry:.4f}"
+            )
+
+        changed = (
+            msgs
+            or len(deduped_list) != len(state.get("positions", []))
+            or len(kept_opts) != len(state.get("option_positions", []))
+        )
+        if changed:
             state["positions"] = deduped_list
+            state["option_positions"] = kept_opts
             state_path.write_text(json.dumps(state, indent=2) + "\n")
         return msgs
 

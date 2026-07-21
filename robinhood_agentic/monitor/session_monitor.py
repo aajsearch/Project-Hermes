@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = ROOT / "config" / "tech_scalper.yaml"
+DEFAULT_OPTIONS_CONFIG = ROOT / "config" / "options_directional.yaml"
 DEFAULT_STATE = Path(__file__).resolve().parent / "session_state.json"
 MONITOR_DIR = Path(__file__).resolve().parent
 if str(MONITOR_DIR) not in sys.path:
@@ -35,6 +36,8 @@ LATEST_JSON_PATH = MONITOR_DIR / "latest_status.json"
 DASHBOARD_PATH = MONITOR_DIR / "dashboard.html"
 QUOTES_URL = "https://api.robinhood.com/quotes/"
 ET = ZoneInfo("America/New_York")
+# Option quotes need MCP (public marketdata is 403). Poll at least this often.
+OPTION_QUOTE_MIN_SECONDS = 30
 
 
 def load_yaml(path: Path) -> dict:
@@ -50,12 +53,15 @@ def load_yaml(path: Path) -> dict:
     }
 
     def num(key: str, section: dict, default: float) -> None:
-        m = re.search(rf"^{re.escape(key)}:\s*([\d.]+)", text, re.M)
+        # Keys are indented under YAML sections — allow leading whitespace.
+        m = re.search(rf"^\s*{re.escape(key)}:\s*([\d.]+)", text, re.M)
         if m:
             section[key] = float(m.group(1)) if "." in m.group(1) else int(m.group(1))
+        else:
+            section[key] = default
 
     def str_val(key: str, section: dict) -> None:
-        m = re.search(rf'^{re.escape(key)}:\s*(true|false)', text, re.M)
+        m = re.search(rf"^\s*{re.escape(key)}:\s*(true|false)", text, re.M)
         if m:
             section[key] = m.group(1) == "true"
 
@@ -105,6 +111,28 @@ def load_yaml(path: Path) -> dict:
         )
 
     return cfg
+
+
+def load_options_cfg(path: Path = DEFAULT_OPTIONS_CONFIG) -> dict:
+    """Load option TP/SL / flat time from options_directional.yaml (minimal parser)."""
+    opts = {
+        "profit_target_pct": 0.15,
+        "stop_loss_pct": 0.10,
+        "hard_flat_time_et": "15:45",
+    }
+    if not path.is_file():
+        return opts
+    text = path.read_text()
+    m = re.search(r"^\s*profit_target_pct:\s*([\d.]+)", text, re.M)
+    if m:
+        opts["profit_target_pct"] = float(m.group(1))
+    m = re.search(r"^\s*stop_loss_pct:\s*([\d.]+)", text, re.M)
+    if m:
+        opts["stop_loss_pct"] = float(m.group(1))
+    m = re.search(r'^\s*hard_flat_time_et:\s*"([^"]+)"', text, re.M)
+    if m:
+        opts["hard_flat_time_et"] = m.group(1)
+    return opts
 
 
 def load_state(path: Path) -> dict:
@@ -244,6 +272,88 @@ def check_positions(
     return alerts, snapshots
 
 
+def check_option_positions(
+    state: dict,
+    option_quotes: dict[str, dict],
+    options_cfg: dict,
+) -> tuple[list[str], list[dict]]:
+    """Premium TP/SL checks for option_positions (mark vs entry)."""
+    alerts: list[str] = []
+    snapshots: list[dict] = []
+    now_t = datetime.now(ET).time()
+    flat_t = datetime.strptime(
+        options_cfg.get("hard_flat_time_et", "15:45"), "%H:%M"
+    ).time()
+
+    for pos in state.get("option_positions", []):
+        oid = pos.get("option_id")
+        if not oid:
+            continue
+        label = pos.get("label") or f"{pos.get('symbol', '?')} opt"
+        q = option_quotes.get(oid)
+        if not q:
+            alerts.append(f"{label}: no option quote")
+            continue
+        bid = float(q.get("bid_price") or 0)
+        ask = float(q.get("ask_price") or 0)
+        mark = float(q.get("mark_price") or 0)
+        last = mark if mark > 0 else ((bid + ask) / 2 if bid > 0 and ask > 0 else bid)
+        entry = float(pos["entry"])
+        tp = float(pos["tp"])
+        sl = float(pos["sl"])
+        qty = float(pos.get("qty", 1))
+        mult = float(pos.get("multiplier") or 100)
+        pnl = (last - entry) * qty * mult
+        pnl_pct = (last / entry - 1) * 100 if entry else 0
+        snap = {
+            "symbol": label,
+            "option_id": oid,
+            "last": last,
+            "entry": entry,
+            "qty": qty,
+            "tp": tp,
+            "sl": sl,
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
+            "fractional": False,
+            "dist_sl": last - sl,
+            "dist_tp": tp - last,
+            "asset": "option",
+        }
+        snapshots.append(snap)
+        log(
+            f"OPT {label} mark=${last:.4f} entry=${entry:.4f} qty={qty:g} "
+            f"PnL=${pnl:+.2f} ({pnl_pct:+.1f}%) TP=${tp:.4f} SL=${sl:.4f}"
+        )
+
+        if now_t >= flat_t:
+            alerts.append(f"OPT_FLAT:{oid}:label={label}:mark={last:.4f}")
+        elif last >= tp and pos.get("synthetic_tp", True):
+            alerts.append(
+                f"OPT_TP_HIT:{oid}:label={label}:mark={last:.4f}:tp={tp:.4f}"
+            )
+        elif last <= sl and pos.get("synthetic_sl", True):
+            alerts.append(
+                f"OPT_SL_HIT:{oid}:label={label}:mark={last:.4f}:sl={sl:.4f}"
+            )
+        elif last <= sl * 1.05:
+            alerts.append(f"{label} NEAR SL (${sl:.4f}, mark ${last:.4f})")
+
+    return alerts, snapshots
+
+
+def fetch_option_quotes_mcp(option_ids: list[str]) -> dict[str, dict]:
+    """Option marks via MCP (required — public marketdata returns 403)."""
+    if not option_ids:
+        return {}
+    from mcp.auth import load_access_token, mcp_cli_authenticated
+    from mcp.executor import TradeActions
+
+    if not (load_access_token() or mcp_cli_authenticated()):
+        return {}
+    return TradeActions().get_option_quotes(option_ids)
+
+
 def write_live_outputs(
     state: dict,
     snapshots: list[dict],
@@ -265,17 +375,28 @@ def write_live_outputs(
     tick_parts = []
     for s in snapshots:
         note = ""
-        if s["dist_sl"] <= 0.25:
+        is_opt = s.get("asset") == "option"
+        if is_opt and s["dist_sl"] <= s["sl"] * 0.05:
             note = "⚠️ near SL"
-        elif any(a.startswith("SL_HIT:") and s["symbol"] in a for a in alerts):
+        elif not is_opt and s["dist_sl"] <= 0.25:
+            note = "⚠️ near SL"
+        elif any(
+            (a.startswith("SL_HIT:") or a.startswith("OPT_SL_HIT:"))
+            and s["symbol"] in a
+            for a in alerts
+        ):
             note = "🛑 SL"
+        elif any(a.startswith("OPT_TP_HIT:") and s.get("option_id", "") in a for a in alerts):
+            note = "✅ TP"
         frac = " frac" if s["fractional"] else ""
+        asset = " opt" if is_opt else ""
+        prec = 4 if is_opt else 2
         lines.append(
-            f"| **{s['symbol']}** | ${s['last']:.2f} | ${s['entry']:.2f} | "
-            f"${s['pnl']:+.2f} ({s['pnl_pct']:+.2f}%) | ${s['tp']:.2f} | "
-            f"${s['sl']:.2f} | {note}{frac} |"
+            f"| **{s['symbol']}** | ${s['last']:.{prec}f} | ${s['entry']:.{prec}f} | "
+            f"${s['pnl']:+.2f} ({s['pnl_pct']:+.2f}%) | ${s['tp']:.{prec}f} | "
+            f"${s['sl']:.{prec}f} | {note}{frac}{asset} |"
         )
-        tick_parts.append(f"{s['symbol']} ${s['last']:.2f} ({s['pnl_pct']:+.2f}%)")
+        tick_parts.append(f"{s['symbol']} ${s['last']:.{prec}f} ({s['pnl_pct']:+.2f}%)")
 
     if alerts:
         lines.extend(["", "## Alerts", ""])
@@ -470,7 +591,41 @@ def run_auto_exit(state: dict, alert: str, repo_root: Path, state_path: Path) ->
     parts = alert.split(":")
     if len(parts) < 2:
         return False
-    kind, sym = parts[0], parts[1]
+    kind = parts[0]
+
+    if kind in {"OPT_TP_HIT", "OPT_SL_HIT", "OPT_FLAT"}:
+        option_id = parts[1]
+        label = option_id[:8]
+        for p in parts:
+            if p.startswith("label="):
+                label = p.replace("label=", "")
+        if load_access_token() or mcp_cli_authenticated():
+            try:
+                log(f"AUTO-EXIT (MCP {kind}): {label}...")
+                ok = TradeActions().execute_option_exit(alert, state, state_path)
+                log(f"AUTO-EXIT (MCP) {label}: {'OK' if ok else 'FAILED'}")
+                return ok
+            except McpHttpError as e:
+                log(f"AUTO-EXIT MCP FAILED {label}: {e}")
+        acct = state.get("account_number", "")
+        prompt = (
+            f"Robinhood MCP option EXIT on Agentic {acct}. "
+            f"Sell-to-close option_id={option_id} ({label}) quantity 1 market. "
+            f"Remove from option_positions in robinhood_agentic/monitor/session_state.json. "
+            f"Execute now — no questions."
+        )
+        log(f"AUTO-EXIT (agent {kind}): launching cursor agent for {label}...")
+        cmd = [
+            "cursor", "agent", "-p", "--trust", "--approve-mcps", "--yolo",
+            "--output-format", "text",
+            prompt,
+        ]
+        result = subprocess.run(
+            cmd, cwd=repo_root, check=False, capture_output=True, text=True
+        )
+        return result.returncode == 0
+
+    sym = parts[1]
 
     if load_access_token() or mcp_cli_authenticated():
         try:
@@ -551,13 +706,16 @@ def main() -> int:
 
     repo_root = ROOT.parent
     cfg = load_yaml(args.config)
+    options_cfg = load_options_cfg()
+    cfg["options"] = options_cfg
     state = load_state(args.state)
     poll = args.poll_seconds or int(cfg.get("scalp", {}).get("poll_seconds", 15))
     watchlist = flatten_watchlist(cfg)
 
     log(
         f"Monitor start | poll={poll}s rescan={args.rescan_minutes}m "
-        f"watchlist={len(watchlist)} symbols"
+        f"watchlist={len(watchlist)} symbols | options TP={options_cfg['profit_target_pct']*100:.0f}% "
+        f"SL={options_cfg['stop_loss_pct']*100:.0f}%"
     )
     if args.auto_exit:
         from mcp.auth import auth_status_message, load_access_token, mcp_cli_authenticated
@@ -579,6 +737,8 @@ def main() -> int:
 
     last_rescan = 0.0
     last_reconcile = time.time()
+    last_option_quote = 0.0
+    option_quotes_cache: dict[str, dict] = {}
     pending_reconcile_seconds = 60
     exit_attempt_at: dict[str, float] = {}
     exit_retry_seconds = 90
@@ -587,6 +747,7 @@ def main() -> int:
     while True:
         state = load_state(args.state)
         positions = state.get("positions", [])
+        option_positions = state.get("option_positions", [])
         has_pending = any(p.get("pending") for p in positions)
         if (
             reconcile_enabled
@@ -597,6 +758,7 @@ def main() -> int:
             last_reconcile = time.time()
             state = load_state(args.state)
             positions = state.get("positions", [])
+            option_positions = state.get("option_positions", [])
         pos_symbols = [p["symbol"] for p in positions]
         tick_symbols = list(dict.fromkeys(pos_symbols + watchlist))
         try:
@@ -609,10 +771,33 @@ def main() -> int:
             continue
 
         alerts, snapshots = check_positions(state, quotes, cfg)
+
+        # Options: MCP quotes (slower). Refresh at least every OPTION_QUOTE_MIN_SECONDS.
+        opt_ids = [p["option_id"] for p in option_positions if p.get("option_id")]
+        if opt_ids and (
+            time.time() - last_option_quote >= OPTION_QUOTE_MIN_SECONDS
+            or not option_quotes_cache
+        ):
+            try:
+                option_quotes_cache = fetch_option_quotes_mcp(opt_ids)
+                last_option_quote = time.time()
+                if not option_quotes_cache:
+                    log("OPTION QUOTE: empty (MCP auth / bridge issue?)")
+            except Exception as e:
+                log(f"OPTION QUOTE ERROR: {e}")
+        if opt_ids and option_quotes_cache:
+            o_alerts, o_snaps = check_option_positions(
+                state, option_quotes_cache, options_cfg
+            )
+            alerts.extend(o_alerts)
+            snapshots.extend(o_snaps)
+
         write_live_outputs(state, snapshots, alerts, poll, args.auto_exit)
         if args.tick_notify and snapshots:
             tick = " · ".join(
-                f"{s['symbol']} ${s['last']:.2f} ({s['pnl_pct']:+.2f}%)"
+                f"{s['symbol']} ${s['last']:.4f} ({s['pnl_pct']:+.2f}%)"
+                if s.get("asset") == "option"
+                else f"{s['symbol']} ${s['last']:.2f} ({s['pnl_pct']:+.2f}%)"
                 for s in snapshots
             )
             notify_mac("Scalper", tick)
@@ -632,6 +817,28 @@ def main() -> int:
                 log(f"*** {label} TRIGGERED: {sym} ***")
                 if args.notify:
                     notify_mac(f"Tech Scalper {label}", f"{sym} — auto-exit")
+                if args.auto_exit:
+                    exit_attempt_at[key] = now_ts
+                    run_auto_exit(state, a, repo_root, args.state)
+            elif a.startswith("OPT_TP_HIT:") or a.startswith("OPT_SL_HIT:") or a.startswith("OPT_FLAT:"):
+                oid = a.split(":")[1]
+                key = f"{a.split(':')[0]}:{oid}"
+                held = any(p.get("option_id") == oid for p in option_positions)
+                if not held:
+                    continue
+                now_ts = time.time()
+                last_try = exit_attempt_at.get(key, 0.0)
+                if now_ts - last_try < exit_retry_seconds:
+                    continue
+                if a.startswith("OPT_FLAT"):
+                    label = "OPTION TIME FLAT"
+                elif a.startswith("OPT_SL"):
+                    label = "OPTION STOP LOSS"
+                else:
+                    label = "OPTION TAKE PROFIT"
+                log(f"*** {label} TRIGGERED: {oid[:8]}… ***")
+                if args.notify:
+                    notify_mac(f"Options {label}", "auto-exit")
                 if args.auto_exit:
                     exit_attempt_at[key] = now_ts
                     run_auto_exit(state, a, repo_root, args.state)

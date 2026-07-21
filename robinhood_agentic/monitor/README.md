@@ -6,9 +6,10 @@ Runs **outside Cursor chat** so AAPL (and other open legs) are polled on a real 
 
 | Interval | Action |
 |----------|--------|
-| **Every 15s** (from `tech_scalper.yaml` `poll_seconds`) | Position check: last vs synthetic TP / synthetic SL |
+| **Every 15s** (from `tech_scalper.yaml` `poll_seconds`) | Equity position check: last vs synthetic TP / synthetic SL |
+| **Every ~30s** (when `option_positions` non-empty) | Option mark via MCP vs premium TP (+15%) / SL (−10%); time-flat 3:45 PM ET |
 | **Every 15 min** | Full 33-name watchlist rescan; optional **`--auto-entry`** places top pick if slot + BP |
-| **Startup + every rescan + every 60s while a buy is pending** | **Broker reconcile** — adopt untracked positions, finalize/drop pending buys, remove flat legs |
+| **Startup + every rescan + every 60s while a buy is pending** | **Broker reconcile** — adopt untracked equities **and** long options, finalize/drop pending buys |
 
 Quotes use Robinhood’s **public read-only API** (fast, no MCP). **Trades** use **direct MCP HTTP** when `.mcp_access_token` is set — see [`MCP_AUTH.md`](MCP_AUTH.md).
 
@@ -75,6 +76,7 @@ Edit `session_state.json` when you open/close legs:
 - **Fractional:** `synthetic_tp` + `synthetic_sl` both true — no resting broker exits
 - **`pending: true`** — buy order placed but not yet filled; monitor skips TP/SL checks and reconcile finalizes (fill) or drops (cancel/reject; stale >30m limit buys are cancelled)
 - **`adopted: true`** — position found at broker but missing from state; reconcile added it with default TP/SL from `tech_scalper.yaml`
+- **`option_positions`** — single-leg long options tracked by premium (entry/tp/sl per-share). TP/SL from `options_directional.yaml` (+15% / −10%). Quotes via MCP (public option marketdata is blocked). Auto-exit = market sell-to-close
 - Remove position from array when flat (reconcile also removes legs no longer at broker)
 - `cap_overrides` — symbols allowed above $100 notional in rescan
 

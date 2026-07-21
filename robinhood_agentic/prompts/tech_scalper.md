@@ -11,7 +11,7 @@ Strategy: [`docs/TECH_SCALPER_STRATEGY.md`](../docs/TECH_SCALPER_STRATEGY.md)
 Follow tech_scalper.yaml and TECH_SCALPER_STRATEGY.md. Robinhood MCP only.
 
 1. get_accounts → Agentic; get_portfolio (flag pending_deposits — subtract from usable BP).
-2. Confirm no other playbook ran today (one_playbook_per_day).
+2. Equity+options same day OK; skip only if leveraged ETF already ran today.
 3. get_equity_quotes: full watchlist 33 symbols (batch 20+13).
 4. Per symbol: mid, spread%, day%; cap = min(100, BP-reserve).
    entry_path = whole_share_limit if mid <= cap else (fractional_market if allow_fractional_live else SKIP).
@@ -31,7 +31,7 @@ No orders.
 Follow tech_scalper.yaml on Agentic (same account_number every call).
 
 PHASE A — Read-only setup
-- one_playbook_per_day check; portfolio minus pending_deposits
+- skip if leveraged ETF already live today; portfolio minus pending_deposits
 - Session: 9:45 AM–3:30 PM ET entries only
 - Scan (#1); select up to 2 symbols; track settled_cash_pool
 
