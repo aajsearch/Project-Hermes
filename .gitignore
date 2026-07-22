@@ -39,3 +39,4 @@ robinhood_agentic/app/ui/dist/
 # *.csv
 # *.txt
 # *.sql
+robinhood_agentic/monitor/.mcp_tokens.json
